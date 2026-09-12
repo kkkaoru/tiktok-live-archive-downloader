@@ -1,6 +1,10 @@
 # Local authentication, captures, device state and all investigation notes
 /private/
 /downloads/
+/captures/
+/screenshots/
+/browser-state/
+/backups/
 .env
 .env.*
 *.secret
@@ -35,6 +39,17 @@ web-session.json
 *.apk
 *.ipa
 *.xcresult/
+*.mobileprovision
+*.dSYM/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.zip
+*.tar
+*.tar.gz
 *.log
 *.sqlite*
 *.db

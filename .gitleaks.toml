@@ -1,0 +1,28 @@
+title = "Replay public-source secret checks"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "tiktok-session-assignment"
+description = "TikTok session cookie or environment assignment"
+regex = '''(?i)(?:sessionid(?:_ss)?|sid_tt|TIKTOK_SESSIONID)["']?\s*[:=,]\s*["']?([a-f0-9]{32})(?:[^a-f0-9]|$)'''
+secretGroup = 1
+
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)tests/''']
+regexTarget = "secret"
+regexes = ['''^(?:a{32}|b{32}|0{32})$''']
+
+[[rules]]
+id = "tiktok-credential-constructor"
+description = "Literal TikTok session in Credentials constructor"
+regex = '''Credentials\(\s*(?:session_id\s*=\s*)?["']([a-fA-F0-9]{32})["']'''
+secretGroup = 1
+
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)tests/''']
+regexTarget = "secret"
+regexes = ['''^(?:a{32}|b{32}|0{32})$''']
