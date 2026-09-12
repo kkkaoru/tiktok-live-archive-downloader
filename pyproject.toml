@@ -1,0 +1,39 @@
+[project]
+name = "tiktok-live-archive-downloader"
+version = "0.1.0"
+description = "Local downloader for authorized, observed replay media"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.28,<0.29"]
+
+[project.optional-dependencies]
+capture = ["mitmproxy>=11,<13"]
+device = [
+    "frida-tools>=14.10.4",
+    "pymobiledevice3>=11.12.1",
+]
+web = [
+    "playwright>=1.62.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-cov>=6", "ruff>=0.11", "mypy>=1.15"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/replay"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=replay --cov-report=term-missing"
