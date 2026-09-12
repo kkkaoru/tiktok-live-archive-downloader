@@ -23,6 +23,7 @@ from replay.core import (
 from replay.download import Downloader
 from replay.jobs import download_once
 from replay.session_refresh import refresh_session
+from replay.targets import target_id
 from replay.tiktok_api import Credentials, TikTokAPI
 from replay.web_auth import login
 
@@ -43,10 +44,19 @@ class Arguments(argparse.Namespace):
     log: Path
     session: Path
     login_timeout: int
-    anchor_id: str
+    anchor_id: str | None
+    target_user: str | None
     refresh_session: bool
     token_output: Path
     web_login: bool
+
+
+def add_target_arguments(command: argparse.ArgumentParser) -> None:
+    target = command.add_mutually_exclusive_group()
+    target.add_argument("--anchor-id", help="Verified numeric creator ID")
+    target.add_argument(
+        "--user", dest="target_user", help="Username, @handle, or HTTPS TikTok profile URL"
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -57,13 +67,13 @@ def parser() -> argparse.ArgumentParser:
     recordings = commands.add_parser(
         "recordings", help="Fetch a fresh recording list using TIKTOK_SESSIONID"
     )
-    recordings.add_argument("--anchor-id", required=True)
+    add_target_arguments(recordings)
     recordings.add_argument("--refresh-session", action="store_true")
     batch = commands.add_parser(
         "download-all", help="Download available recordings without Android"
     )
     batch.add_argument("output", type=Path)
-    batch.add_argument("--anchor-id", required=True)
+    add_target_arguments(batch)
     batch.add_argument("--host", action="append", default=[])
     batch.add_argument("--workers", type=int, default=6)
     batch.add_argument("--max-gib", type=float, default=20)
@@ -148,6 +158,7 @@ def run_capture(args: Arguments) -> int:
 
 def run_recordings(args: Arguments) -> int:
     credentials = Credentials.from_environment(os.environ)
+    anchor_id = target_id(anchor_id=args.anchor_id, user=args.target_user, environ=os.environ)
     if args.refresh_session:
         credentials = refresh_session(
             output=args.store.parent / "tiktok-sessionid.secret", credentials=credentials
@@ -155,7 +166,7 @@ def run_recordings(args: Arguments) -> int:
     with httpx.Client(timeout=httpx.Timeout(30, connect=15), trust_env=False) as client:
         api = TikTokAPI(client=client, credentials=credentials)
         if args.command == "recordings":
-            rows = recording_rows(api, anchor_id=args.anchor_id, jobs=args.store.parent / "jobs")
+            rows = recording_rows(api, anchor_id=anchor_id, jobs=args.store.parent / "jobs")
             print(json.dumps(rows, ensure_ascii=False, indent=2))
             return 0
         options = DownloadOptions(
@@ -165,7 +176,7 @@ def run_recordings(args: Arguments) -> int:
             workers=args.workers,
             max_bytes=int(args.max_gib * 1024**3),
         )
-        summary = acquire_all(api, anchor_id=args.anchor_id, options=options)
+        summary = acquire_all(api, anchor_id=anchor_id, options=options)
         print(
             f"Saved: {summary.saved}; complete/busy: {summary.skipped}; "
             f"unavailable: {summary.unavailable}"

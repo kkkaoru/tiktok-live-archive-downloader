@@ -56,6 +56,27 @@ def test_recordings_uses_refreshed_token(monkeypatch: pytest.MonkeyPatch) -> Non
     assert rows.call_args.args[0].credentials.session_id == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 
+@pytest.mark.parametrize("command", ["recordings", "download-all"])
+def test_runtime_user_target(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    monkeypatch.setenv("TIKTOK_SESSIONID", "a" * 32)
+    resolver = Mock(return_value="456")
+    rows = Mock(return_value=[])
+    acquire = Mock(return_value=DownloadSummary())
+    monkeypatch.setattr("replay.targets.resolve_user", resolver)
+    monkeypatch.setattr(cli, "recording_rows", rows)
+    monkeypatch.setattr(cli, "acquire_all", acquire)
+    argv = ["replay", command]
+    if command == "download-all":
+        argv.append("downloads")
+    monkeypatch.setattr("sys.argv", [*argv, "--user", "@second"])
+    assert cli.main() == 0
+    resolver.assert_called_once_with("@second")
+    if command == "recordings":
+        assert rows.call_args.kwargs["anchor_id"] == "456"
+    else:
+        assert acquire.call_args.kwargs["anchor_id"] == "456"
+
+
 def test_recordings_command(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
