@@ -5,7 +5,11 @@
 - `src/replay/`: CLI, runtime creator resolution, authenticated notice/replay API, session handling, finite HLS download and stable-ID jobs.
 - `tests/`: deterministic mocked-network tests and local FFmpeg integration tests.
 - `docs/`: generic technical documentation. Never include live account evidence or signed URLs.
-- `pyproject.toml`, `uv.lock`, `Makefile`: reproducible dependencies and quality checks.
+- `.python-version`, `pyproject.toml`, `uv.lock`, `Makefile`: fixed Python patch version, locked Python dependencies and quality checks.
+- `scripts/bootstrap.sh`: explicit Mac provisioning, without authentication or state migration.
+- `scripts/check-public.sh`, `.gitleaks.toml`: positive publication-path policy plus local index/history secret scanning.
+- `.github/workflows/ci.yml`: credential-free macOS verification with SHA-pinned actions.
+- `SECURITY.md`: publication, credential and migration limitations. Build archives have an explicit source include list, independent of private runtime directories.
 
 ## Local only (ignored)
 

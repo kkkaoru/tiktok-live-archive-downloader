@@ -4,13 +4,17 @@ Mac上で、アクセス権のある終了済みLIVE録画を直接ダウンロ�
 
 ## セットアップ
 
-Python 3.12以上、uv、ffmpeg / ffprobeが必要です。
+新しいMacでは、Homebrewを公式の https://brew.sh から導入してPATHを設定したあと、以下を実行します。Apple Silicon / IntelでHomebrewのインストール先を固定しない構成です。
 
 ```sh
-brew install ffmpeg
-uv sync
-uv run replay --help
+git clone https://github.com/kkkaoru/tiktok-live-archive-downloader.git
+cd tiktok-live-archive-downloader
+bash scripts/bootstrap.sh
 ```
+
+Python **3.12.13** を `.python-version`、Python依存関係を `uv.lock` で固定し、`uv sync --locked` で構築します。スクリプトはuv・FFmpeg・ChromeをHomebrewから導入します。既存の手動インストール済みChromeを使う場合や、数値IDだけを使う場合は `--no-browser` でChromeのインストールを省略できます。
+
+Homebrew自体のインストーラー、ログイン、動画取得は自動実行しません。HomebrewのFFmpeg・Chrome等のバージョンは実行時点のものなので、システム全体のビット単位の再現を保証する構成ではありません。認証情報はリポジトリに含まれず、別途設定が必要です。
 
 認証は環境変数 `TIKTOK_SESSIONID`（32桁のセッショントークン）。値をチャット、シェル履歴、Gitへ直接記載しないでください。秘密ファイルやシークレット管理ツールから設定します。
 
@@ -78,11 +82,15 @@ uv run replay refresh-session --login
 
 ## 保存先・安全性・開発
 
-[ディレクトリ構成と安全性](docs/architecture.md)を参照してください。ローカルの動画、認証、実アカウントの調査記録はGit管理しません。
+[ディレクトリ構成](docs/architecture.md)と[公開・移行時の安全性](SECURITY.md)を参照してください。ローカルの動画、認証、実アカウントの調査記録はGit管理しません。別Macへの動画移行では、既存の完了記録に絶対パスが含まれる点にも注意してください。
 
 ```sh
-uv sync --extra capture --extra web
+bash scripts/bootstrap.sh --dev --no-browser
 make check
+# 公開予定の変更だけを確認・ステージしたあと：
+make public-check
 ```
 
-Ruff format/lint、strict mypy、pytest、ファイル別カバレッジ90%以上を検証します。通常のテストは実アカウント・ネットワーク・Androidを必要としません。
+Ruff format/lint、strict mypy、pytest、ファイル別カバレッジ90%以上を検証します。追加のGitleaks検査はステージ内容と全参照履歴を対象とし、ローカルの秘密情報や動画をスキャン先へコピーしません。通常のテストは実アカウント・ネットワーク・Androidを必要としません。
+
+macOS CIも同じロックファイルで検証し、アカウントのシークレットを要求しません。GitHub ActionsはコミットSHA固定・読み取り権限のみです。wheel/sdistのビルド対象はソースと公開ドキュメント等に明示限定しています。
