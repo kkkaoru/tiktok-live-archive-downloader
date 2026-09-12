@@ -3,7 +3,7 @@
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
@@ -17,8 +17,8 @@ class ReplayError(Exception):
 
 @dataclass(frozen=True)
 class Candidate:
-    url: str
-    headers: dict[str, str]
+    url: str = field(repr=False)
+    headers: dict[str, str] = field(repr=False)
     kind: str
     source: str = "request"
 

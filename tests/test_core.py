@@ -16,6 +16,13 @@ from replay.core import (
 )
 
 
+def test_candidate_repr_redacts_credentials_and_signed_urls() -> None:
+    candidate = Candidate(
+        "https://cdn.test/video?signature=private", {"authorization": "Bearer private"}, "hls"
+    )
+    assert repr(candidate) == "Candidate(kind='hls', source='request')"
+
+
 def test_atomic_text_is_private(tmp_path: Path) -> None:
     output = tmp_path / "token"
     write_private_text(output, "credential")
