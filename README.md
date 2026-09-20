@@ -2,6 +2,16 @@
 
 Mac上で、アクセス権のある終了済みLIVE録画を直接ダウンロードするCLIです。画面録画・等倍再生での保存は行いません。非公式APIのため、TikTok側の変更やアカウント権限によって利用できない場合があります。
 
+## ドキュメント
+
+- [運用・トラブル対応・データ移行](docs/operations.md)
+- [開発・検証手順と検証範囲](docs/development.md)
+- [構成と通信境界](docs/architecture.md)
+- [公開時の安全性](SECURITY.md)
+- [AIエージェント向け作業指針](AGENTS.md)
+
+公開ドキュメントには認証値や実アカウントの調査情報を記載しません。
+
 ## セットアップ
 
 新しいMacでは、Homebrewを公式の https://brew.sh から導入してPATHを設定したあと、以下を実行します。Apple Silicon / IntelでHomebrewのインストール先を固定しない構成です。
@@ -53,7 +63,9 @@ uv run replay download-all downloads --workers 6 --max-gib 12 --refresh-session
 
 - 安定した配信IDで重複判定。完了済み・他プロセスが取得中の配信は再取得しません。
 - `private/jobs/` が完了記録です。削除しないでください。既存の出力や不整合を検出した場合、勝手に上書きせず検証を要求します。
-- 新規保存先は `downloads/replay-配信ID.mp4`。署名付きURL・認証値は一覧に出力しません。
+- `download-all` の新規保存先は `downloads/YYYY-MM-DD_HH-mm-ss_JST_replay-配信ID.mp4`。APIの配信開始時刻 `start_time` を日本標準時（UTC+09:00）に変換するため、ファイル名で配信日時順にソートできます。同じ秒の配信もIDで区別します。
+- 通知日時、ファイル作成日時、APIの `create_time` から開始時刻を推測しません。新規取得で開始時刻が不明・不正な場合は停止します。署名付きURL・認証値は一覧に出力しません。
+- 旧名の保存済みファイルもIDで重複判定します。改名する場合はファイルと完了記録を一緒に更新してください（[改名手順](docs/operations.md#rename-completed-recordings)）。低水準の `download` コマンドは明示的に指定された出力パスを使います。
 - HLSを並列取得し、再エンコードせずMP4に格納。HEVCはQuickTime向け `hvc1` タグとfaststartを使用します。
 - `--workers` は1〜16、`--max-gib` は1配信あたりの上限です。
 - `--store` はグローバル引数です。例：`replay --store private/candidates recordings --user @creator`。親ディレクトリを変えると完了記録と更新トークンの保存先も変わります。

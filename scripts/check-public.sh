@@ -11,7 +11,7 @@ fi
 
 check_path() {
     case "$1" in
-        .gitignore|.gitleaks.toml|.python-version|Makefile|pyproject.toml|uv.lock|README.md|SECURITY.md) ;;
+        .gitignore|.gitleaks.toml|.python-version|Makefile|pyproject.toml|uv.lock|README.md|SECURITY.md|AGENTS.md) ;;
         src/replay/*.py|src/replay/py.typed|tests/test_*.py|docs/*.md|scripts/*.sh|.github/workflows/*.yml) ;;
         '') ;;
         *) printf 'Unapproved public path: %s\n' "$1" >&2; return 1 ;;

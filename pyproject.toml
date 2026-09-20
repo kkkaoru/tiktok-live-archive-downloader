@@ -37,7 +37,7 @@ include = ["src/replay/*.py", "src/replay/py.typed"]
 include = [
     "/src/replay/*.py", "/src/replay/py.typed", "/tests/test_*.py",
     "/docs/*.md", "/scripts/*.sh", "/.github/workflows/*.yml",
-    "/README.md", "/SECURITY.md", "/pyproject.toml", "/uv.lock", "/Makefile",
+    "/README.md", "/SECURITY.md", "/AGENTS.md", "/pyproject.toml", "/uv.lock", "/Makefile",
     "/.python-version", "/.gitignore", "/.gitleaks.toml",
 ]
 

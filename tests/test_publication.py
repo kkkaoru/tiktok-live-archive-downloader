@@ -63,6 +63,31 @@ def test_public_scan_excludes_private_data(publication: tuple[Path, dict[str, st
     assert "Index and complete referenced history passed" in result.stdout
 
 
+def test_agent_guide_is_an_approved_public_path(
+    publication: tuple[Path, dict[str, str]],
+) -> None:
+    root, environment = publication
+    (root / "AGENTS.md").write_text("# Agent guide\nNever publish credentials.\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "AGENTS.md"],
+        cwd=root,
+        env=environment,
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    result = subprocess.run(
+        ["bash", "scripts/check-public.sh"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0
+    assert "Index and complete referenced history passed" in result.stdout
+
+
 def test_forced_private_path_is_rejected(publication: tuple[Path, dict[str, str]]) -> None:
     root, environment = publication
     (root / "private").mkdir()
