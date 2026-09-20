@@ -1,6 +1,7 @@
 # Local authentication, captures, device state and all investigation notes
 /private/
 /downloads/
+/edits/
 /captures/
 /screenshots/
 /browser-state/
