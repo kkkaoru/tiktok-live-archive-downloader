@@ -68,6 +68,15 @@ def download_once(
     *, root: Path, replay_id: str, output: Path, download: Callable[[], None]
 ) -> bool:
     """Skip completed/busy IDs; download must publish its output atomically."""
+    return prepared_download_once(
+        root=root, replay_id=replay_id, prepare=lambda: (output, download)
+    )
+
+
+def prepared_download_once(
+    *, root: Path, replay_id: str, prepare: Callable[[], tuple[Path, Callable[[], None]]]
+) -> bool:
+    """Resolve a metadata-derived output only after locking and checking completion."""
     path = record_path(root, replay_id)
     with path.with_suffix(".lock").open("a+b") as lock:
         os.fchmod(lock.fileno(), 0o600)
@@ -77,6 +86,7 @@ def download_once(
             return False
         if already_complete(path):
             return False
+        output, download = prepare()
         if output.exists():
             raise ReplayError("Output already exists and is not registered for this replay.")
         write_record(path, output, "running")
@@ -88,6 +98,35 @@ def download_once(
         except BaseException:
             write_record(path, output, "failed")
             raise
+        return True
+
+
+def rename_completed(*, root: Path, replay_id: str, destination: Path) -> bool:
+    """Rename a verified completed output without overwriting or invalidating its record.
+
+    Link first, publish the new job path, then remove the old name. On interruption,
+    at least one valid name remains; any leftover alias requires explicit review.
+    """
+    path = record_path(root, replay_id)
+    with path.with_suffix(".lock").open("a+b") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not already_complete(path):
+            raise ReplayError("Only a verified completed recording can be renamed.")
+        data: object = json.loads(path.read_text(encoding="utf-8"))
+        output: object = data.get("output") if isinstance(data, dict) else None
+        if not isinstance(output, str):
+            raise ReplayError("Invalid replay job record.")
+        source = Path(output)
+        destination = destination.parent.resolve() / destination.name
+        if source.is_symlink() or destination.parent != source.parent:
+            raise ReplayError("Rename requires a regular file in the same directory.")
+        if source == destination:
+            return False
+        # link() atomically refuses existing paths, including dangling symlinks.
+        os.link(source, destination)
+        write_record(path, destination, "complete")
+        source.unlink()
         return True
 
 

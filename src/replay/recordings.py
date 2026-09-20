@@ -3,10 +3,13 @@
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import TypeGuard
 from urllib.parse import parse_qs, urlsplit
 
 from replay.core import ReplayError, Scope
+
+JST = timezone(timedelta(hours=9), name="JST")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -23,6 +26,7 @@ class Recording:
     available: bool
     duration: float | None = None
     media_url: str | None = field(default=None, repr=False)
+    start_time: int | None = None
 
 
 class UnavailableReplay(ReplayError):
@@ -43,6 +47,22 @@ def numeric_id(value: object) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[0-9]{1,32}", value) is None:
         raise ReplayError("Invalid numeric recording or creator ID.")
     return value
+
+
+def broadcast_datetime(value: object) -> datetime:
+    """Validate API start_time as Unix seconds, independent of the machine timezone."""
+    if type(value) is not int or value <= 0:
+        raise ReplayError("Missing or invalid broadcast start time; refusing a guessed filename.")
+    try:
+        return datetime.fromtimestamp(value, tz=JST)
+    except (OverflowError, OSError, ValueError) as error:
+        raise ReplayError("Broadcast start time is outside the supported date range.") from error
+
+
+def recording_filename(recording: Recording) -> str:
+    replay_id = numeric_id(recording.replay_id)
+    start = broadcast_datetime(recording.start_time)
+    return f"{start:%Y-%m-%d_%H-%M-%S}_JST_replay-{replay_id}.mp4"
 
 
 def notice_from_json(value: object) -> Notice | None:
@@ -109,6 +129,13 @@ def recording_from_json(value: object, *, replay_id: str) -> Recording:
         raise ReplayError("Invalid replay duration.") from error
     if not math.isfinite(seconds) or seconds <= 0:
         raise ReplayError("Invalid replay duration.")
+    raw_start = item.get("start_time")
+    start_time = None if raw_start is None else int(broadcast_datetime(raw_start).timestamp())
     return Recording(
-        replay_id=replay_id, title=title, available=True, duration=seconds, media_url=url
+        replay_id=replay_id,
+        title=title,
+        available=True,
+        duration=seconds,
+        media_url=url,
+        start_time=start_time,
     )

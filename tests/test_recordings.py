@@ -1,7 +1,13 @@
 import pytest
 
 from replay.core import ReplayError
-from replay.recordings import Notice, notice_from_json, numeric_id, record, recording_from_json
+from replay.recordings import (
+    Notice,
+    notice_from_json,
+    numeric_id,
+    record,
+    recording_from_json,
+)
 
 
 def test_notice_identity() -> None:
@@ -63,6 +69,7 @@ def test_available_recording() -> None:
                     "available": True,
                     "m3u8_url": "https://v16m.tiktokcdn.com/a.m3u8?secret=1",
                     "hls_video_meta_info": {"duration": 120.5},
+                    "start_time": 1704067200,
                 }
             ]
         },
@@ -70,6 +77,7 @@ def test_available_recording() -> None:
     )
     assert result.title == "Example"
     assert result.duration == 120.5
+    assert result.start_time == 1704067200
     assert result.available is True
     assert "secret" not in repr(result)
 

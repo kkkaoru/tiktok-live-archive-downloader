@@ -108,6 +108,7 @@ def test_batch_and_credential_isolation(tmp_path: Path, monkeypatch: pytest.Monk
             available=True,
             duration=10,
             media_url="https://v16m.tiktokcdn.com/a.m3u8",
+            start_time=1704067200,
         ),
         Recording(replay_id="2", title="Expired", available=False),
     ]
@@ -120,7 +121,7 @@ def test_batch_and_credential_isolation(tmp_path: Path, monkeypatch: pytest.Monk
         options=DownloadOptions(store=tmp_path / "candidates", output=tmp_path / "output"),
     )
     assert summary == DownloadSummary(saved=1, skipped=1, unavailable=1)
-    assert (tmp_path / "output" / "replay-1.mp4").read_bytes() == b"video"
+    assert (tmp_path / "output" / "2024-01-01_09-00-00_JST_replay-1.mp4").read_bytes() == b"video"
     assert api.resolve.call_count == 2
     assert downloader.call_args.kwargs["candidate"].headers == {}
     assert "cookie" not in downloader.call_args.kwargs["client"].headers
