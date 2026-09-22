@@ -39,6 +39,7 @@ class CaptionPolicy:
     maximum_context_seconds: float = 2.8
     maximum_characters: int = 36
     maximum_lines: int = 2
+    enforce_focused_timing: bool = True
 
     def __post_init__(self) -> None:
         values = (self.hold_seconds, self.maximum_gap, self.maximum_context_seconds)
@@ -136,7 +137,10 @@ def make_captions(
     for index, token in enumerate(words):
         if len(token.text) > selected.maximum_characters:
             raise ValueError("Native token exceeds display budget; finer alignment is required")
-        if token.end - token.start > selected.maximum_context_seconds:
+        if (
+            selected.enforce_focused_timing
+            and token.end - token.start > selected.maximum_context_seconds
+        ):
             raise ValueError("Native token timing is too coarse for focused captions")
         if context and _reset_context(context, token, selected):
             context = []

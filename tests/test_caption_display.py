@@ -94,6 +94,16 @@ def test_word_outside_owned_cut() -> None:
         owned_captions((SpokenToken("話", 0.8, 1.01, "a:quiet-cuts-0-0"),), (CutSpan(0, 30, 0),))
 
 
+def test_accepted_display_violations_permit_one_punctuation_break() -> None:
+    token = SpokenToken("ン、テテ", 0.8, 0.99, "a:quiet-cuts-0-0")
+    cuts = (CutSpan(0, 30, 0),)
+    with pytest.raises(ValueError, match="punctuation line budget"):
+        owned_captions((token,), cuts)
+    assert owned_captions((token,), cuts, accept_coarse_timing=True) == (
+        CaptionCue("ン、\nテテ", 0.8, 1.0),
+    )
+
+
 def test_punctuation_is_not_a_new_owned_word() -> None:
     assert owned_captions(
         (

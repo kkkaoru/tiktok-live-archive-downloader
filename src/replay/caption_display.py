@@ -45,7 +45,10 @@ def native_interval(
 
 
 def owned_captions(
-    tokens: tuple[SpokenToken, ...], cuts: tuple[CutSpan, ...]
+    tokens: tuple[SpokenToken, ...],
+    cuts: tuple[CutSpan, ...],
+    *,
+    accept_coarse_timing: bool = False,
 ) -> tuple[CaptionCue, ...]:
     """Apply established focus policy and clip holds to explicitly owned cuts."""
     limits: dict[float, float] = {}
@@ -68,7 +71,12 @@ def owned_captions(
             raise ValueError("Word exceeds retained-cut ownership")
         limits[token.start] = limit
     result: list[CaptionCue] = []
-    for cue in make_captions(tokens, policy=CaptionPolicy(maximum_characters=18, maximum_lines=1)):
+    # Accepted display violations let a native token keep one internal
+    # punctuation break and a coarse clock; the focused width still applies.
+    policy = CaptionPolicy(maximum_characters=18, maximum_lines=1)
+    if accept_coarse_timing:
+        policy = CaptionPolicy(maximum_characters=18, maximum_lines=2, enforce_focused_timing=False)
+    for cue in make_captions(tokens, policy=policy):
         end = min(cue.end, limits[cue.start])
         if end <= cue.start:
             raise ValueError("Owned caption has no visible interval")
