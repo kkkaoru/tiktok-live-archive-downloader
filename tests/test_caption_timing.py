@@ -175,3 +175,29 @@ def test_policy_validates_budgets(
 def test_invalid_ownership_is_rejected(offset: float, start: float, end: float) -> None:
     with pytest.raises(ValueError):
         owned_tokens((), offset=offset, owner_start=start, owner_end=end)
+
+
+def test_held_note_run_is_not_captioned() -> None:
+    tokens = (
+        SpokenToken("こんにちは", 0.0, 0.8, "a:quiet-cuts-0-0"),
+        SpokenToken("ー" * 86, 1.0, 3.0, "a:quiet-cuts-0-0"),
+        SpokenToken("次です", 3.2, 4.0, "a:quiet-cuts-0-0"),
+    )
+
+    cues = make_captions(tokens)
+
+    assert [cue.text for cue in cues] == ["こんにちは", "次です"]
+    assert (cues[0].start, cues[1].start) == (0.0, 3.2)
+
+
+def test_prolonged_mark_inside_a_word_is_captioned() -> None:
+    tokens = (SpokenToken("コーヒー", 0.0, 0.7, "a:quiet-cuts-0-0"),)
+
+    assert [cue.text for cue in make_captions(tokens)] == ["コーヒー"]
+
+
+def test_word_widened_by_marks_beyond_the_budget_is_still_rejected() -> None:
+    tokens = (SpokenToken("あ" + "ー" * 30, 0.0, 0.7, "a:quiet-cuts-0-0"),)
+
+    with pytest.raises(ValueError, match="exceeds display budget"):
+        make_captions(tokens, policy=CaptionPolicy(maximum_characters=18, maximum_lines=1))

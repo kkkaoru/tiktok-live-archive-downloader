@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from math import isfinite
 
 PUNCTUATION = frozenset("、。！？!?.,;:…「」『』（）()\"' ")
+# A token made only of these is a held note or shouting artifact, not a
+# recognized word, and cannot fit the caption width.
+NON_LEXICAL_MARKS = frozenset("ー〜～")
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +99,10 @@ def _lexical_tokens(tokens: tuple[SpokenToken, ...]) -> list[SpokenToken]:
     for token in tokens:
         if result and token.start < result[-1].start:
             raise ValueError("Speech tokens are not ordered")
+        if all(character in NON_LEXICAL_MARKS for character in token.text):
+            # Never merge these into the previous word: a long run of marks would
+            # otherwise widen that caption past the display budget.
+            continue
         if all(character in PUNCTUATION for character in token.text):
             if result and token.utterance == result[-1].utterance:
                 previous = result.pop()
