@@ -2,6 +2,7 @@
 check:
 	bash -n scripts/bootstrap.sh
 	bash -n scripts/check-public.sh
+	bash -n scripts/verify-frame-count.sh
 	uv run ruff format --check .
 	uv run ruff check .
 	uv run mypy src tests
