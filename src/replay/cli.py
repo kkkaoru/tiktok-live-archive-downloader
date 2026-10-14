@@ -21,7 +21,7 @@ from replay.core import (
     save_candidate,
 )
 from replay.download import Downloader
-from replay.jobs import download_once
+from replay.jobs import download_once, relocate_completed
 from replay.session_refresh import refresh_session
 from replay.targets import target_id
 from replay.tiktok_api import Credentials, TikTokAPI
@@ -49,6 +49,7 @@ class Arguments(argparse.Namespace):
     refresh_session: bool
     token_output: Path
     web_login: bool
+    directory: Path
 
 
 def add_target_arguments(command: argparse.ArgumentParser) -> None:
@@ -78,6 +79,7 @@ def parser() -> argparse.ArgumentParser:
     batch.add_argument("--workers", type=int, default=6)
     batch.add_argument("--max-gib", type=float, default=20)
     batch.add_argument("--refresh-session", action="store_true")
+    batch.add_argument("--replay-id", help="Download only this observed replay for the creator")
     refresh = commands.add_parser(
         "refresh-session", help="Reissue and verify a session on Mac; no browser by default"
     )
@@ -89,6 +91,12 @@ def parser() -> argparse.ArgumentParser:
     web_login = commands.add_parser("web-login", help="Log in using an isolated Mac Chrome window")
     web_login.add_argument("--session", type=Path, default=Path("private/web-session.json"))
     web_login.add_argument("--timeout", type=int, default=600, dest="login_timeout")
+    relocate = commands.add_parser(
+        "relocate-completed",
+        help="Copy a completed recording into the download directory and update its job",
+    )
+    relocate.add_argument("replay_id", help="Stable replay ID with a completed job")
+    relocate.add_argument("directory", type=Path, help="Existing download directory")
     android = commands.add_parser(
         "import-android-log", help="Import observed room IDs and HLS URLs"
     )
@@ -176,7 +184,7 @@ def run_recordings(args: Arguments) -> int:
             workers=args.workers,
             max_bytes=int(args.max_gib * 1024**3),
         )
-        summary = acquire_all(api, anchor_id=anchor_id, options=options)
+        summary = acquire_all(api, anchor_id=anchor_id, options=options, replay_id=args.replay_id)
         print(
             f"Saved: {summary.saved}; complete/busy: {summary.skipped}; "
             f"unavailable: {summary.unavailable}"
@@ -202,6 +210,12 @@ def run(args: Arguments) -> int:
     if args.command == "web-login":
         login(session=args.session, timeout=args.login_timeout)
         print("Web session saved privately. Replay API access still requires verification.")
+        return 0
+    if args.command == "relocate-completed":
+        destination, digest = relocate_completed(
+            root=args.store.parent / "jobs", replay_id=str(args.replay_id), directory=args.directory
+        )
+        print(f"Relocated: {destination.name} sha256={digest}")
         return 0
     if args.command == "list":
         for path in sorted(args.store.glob("*.json")):

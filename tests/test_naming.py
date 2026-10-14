@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -6,9 +7,15 @@ from unittest.mock import Mock
 
 import pytest
 
+from replay import jobs
 from replay.acquire import DownloadOptions, acquire_one
 from replay.core import ReplayError
-from replay.jobs import already_complete, register_completed, rename_completed
+from replay.jobs import (
+    already_complete,
+    register_completed,
+    relocate_completed,
+    rename_completed,
+)
 from replay.recordings import (
     Notice,
     Recording,
@@ -236,3 +243,79 @@ def test_corrupted_record_after_validation_is_rejected(
     monkeypatch.setattr("replay.jobs.already_complete", lambda path: True)
     with pytest.raises(ReplayError, match="Invalid replay job"):
         rename_completed(root=tmp_path, replay_id="1", destination=tmp_path / "new.mp4")
+
+
+def test_relocate_copies_verified_original_and_updates_job(tmp_path: Path) -> None:
+    (tmp_path / "volume").mkdir()
+    (tmp_path / "downloads").mkdir()
+    source = tmp_path / "volume/2024-01-01_09-00-00_JST_replay-1.mp4"
+    source.write_bytes(b"video")
+    register_completed(root=tmp_path / "jobs", replay_id="1", output=source)
+    destination, digest = relocate_completed(
+        root=tmp_path / "jobs", replay_id="1", directory=tmp_path / "downloads", reserve_bytes=0
+    )
+    assert destination == (tmp_path / "downloads" / source.name).resolve()
+    assert destination.read_bytes() == b"video" == source.read_bytes()
+    assert digest == hashlib.sha256(b"video").hexdigest()
+    assert oct(destination.stat().st_mode & 0o777) == "0o600"
+    assert json.loads((tmp_path / "jobs/1.json").read_text())["output"] == str(destination)
+    assert already_complete(tmp_path / "jobs/1.json") is True
+    assert not list((tmp_path / "downloads").glob(".*partial"))
+    again = relocate_completed(
+        root=tmp_path / "jobs", replay_id="1", directory=tmp_path / "downloads", reserve_bytes=0
+    )
+    assert again == (destination, digest)
+
+
+def test_relocate_refuses_existing_destination_and_incomplete_jobs(tmp_path: Path) -> None:
+    (tmp_path / "volume").mkdir()
+    (tmp_path / "downloads").mkdir()
+    source = tmp_path / "volume/a.mp4"
+    source.write_bytes(b"video")
+    (tmp_path / "downloads/a.mp4").write_bytes(b"other")
+    register_completed(root=tmp_path / "jobs", replay_id="1", output=source)
+    with pytest.raises(ReplayError, match="already exists"):
+        relocate_completed(
+            root=tmp_path / "jobs", replay_id="1", directory=tmp_path / "downloads", reserve_bytes=0
+        )
+    assert (tmp_path / "downloads/a.mp4").read_bytes() == b"other"
+    assert json.loads((tmp_path / "jobs/1.json").read_text())["output"] == str(source.resolve())
+    with pytest.raises(ReplayError, match="Only a verified"):
+        relocate_completed(root=tmp_path / "jobs", replay_id="2", directory=tmp_path / "downloads")
+    with pytest.raises(ReplayError, match="room"):
+        relocate_completed(
+            root=tmp_path / "jobs",
+            replay_id="1",
+            directory=tmp_path / "volume" / "..",
+            reserve_bytes=2**62,
+        )
+
+
+def test_relocate_rejects_symlink_and_bad_records(tmp_path: Path) -> None:
+    (tmp_path / "downloads").mkdir()
+    real = tmp_path / "real.mp4"
+    real.write_bytes(b"video")
+    link = tmp_path / "link.mp4"
+    link.symlink_to(real)
+    register_completed(root=tmp_path / "jobs", replay_id="1", output=link)
+    (tmp_path / "jobs/1.json").write_text(
+        json.dumps({"status": "complete", "output": str(link), "size": 5})
+    )
+    with pytest.raises(ReplayError, match="regular file"):
+        relocate_completed(root=tmp_path / "jobs", replay_id="1", directory=tmp_path / "downloads")
+
+
+def test_relocate_discards_mismatched_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "volume").mkdir()
+    (tmp_path / "downloads").mkdir()
+    source = tmp_path / "volume/a.mp4"
+    source.write_bytes(b"video")
+    register_completed(root=tmp_path / "jobs", replay_id="1", output=source)
+    digests = iter(["a", "b", "a"])
+    monkeypatch.setattr(jobs, "file_sha256", lambda _path: next(digests))
+    with pytest.raises(ReplayError, match="does not match"):
+        relocate_completed(
+            root=tmp_path / "jobs", replay_id="1", directory=tmp_path / "downloads", reserve_bytes=0
+        )
+    assert list((tmp_path / "downloads").iterdir()) == []
+    assert json.loads((tmp_path / "jobs/1.json").read_text())["output"] == str(source.resolve())

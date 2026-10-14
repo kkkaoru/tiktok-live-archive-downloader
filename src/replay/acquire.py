@@ -10,7 +10,7 @@ import httpx
 from replay.core import Candidate, ReplayError, Scope, save_candidate
 from replay.download import Downloader
 from replay.jobs import already_complete, prepared_download_once
-from replay.recordings import Notice, UnavailableReplay, recording_filename
+from replay.recordings import Notice, UnavailableReplay, numeric_id, recording_filename
 from replay.tiktok_api import TikTokAPI
 
 DEFAULT_MEDIA_HOSTS = ("v16m.tiktokcdn.com", "sf16-videoarch-live-tos-sign.tiktokcdn.com")
@@ -18,10 +18,10 @@ DEFAULT_MEDIA_HOSTS = ("v16m.tiktokcdn.com", "sf16-videoarch-live-tos-sign.tikto
 
 class RecordingRow(TypedDict):
     replay_id: str
-    anchor_id: str
     title: str
     available: bool
     duration: float | None
+    start_time: int | None
     completed: bool
 
 
@@ -49,10 +49,10 @@ def recording_rows(api: TikTokAPI, *, anchor_id: str, jobs: Path) -> list[Record
         rows.append(
             {
                 "replay_id": notice.replay_id,
-                "anchor_id": notice.anchor_id,
                 "title": replay.title,
                 "available": replay.available,
                 "duration": replay.duration,
+                "start_time": replay.start_time,
                 "completed": already_complete(jobs / f"{notice.replay_id}.json"),
             }
         )
@@ -87,11 +87,23 @@ def acquire_one(api: TikTokAPI, *, notice: Notice, options: DownloadOptions) -> 
     )
 
 
-def acquire_all(api: TikTokAPI, *, anchor_id: str, options: DownloadOptions) -> DownloadSummary:
+def acquire_all(
+    api: TikTokAPI,
+    *,
+    anchor_id: str,
+    options: DownloadOptions,
+    replay_id: str | None = None,
+) -> DownloadSummary:
     if not 1 <= options.workers <= 16 or options.max_bytes <= 0:
         raise ReplayError("Invalid worker count or download byte limit.")
+    if replay_id is not None:
+        numeric_id(replay_id)
     # Finish pagination before any media transfer, so partial lists are not treated as complete.
     notices = tuple(api.notices(anchor_id=anchor_id))
+    if replay_id is not None:
+        notices = tuple(notice for notice in notices if notice.replay_id == replay_id)
+        if not notices:
+            raise ReplayError("Selected replay is not in the authorized creator's notices.")
     options.output.mkdir(parents=True, exist_ok=True)
     summary = DownloadSummary()
     for notice in notices:

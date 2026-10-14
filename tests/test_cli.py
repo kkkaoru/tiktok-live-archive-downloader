@@ -89,8 +89,35 @@ def test_recordings_command(
     assert rows.call_args.kwargs["anchor_id"] == "2"
 
 
-def test_download_all_command(
+def test_recordings_environment_numeric_target_is_not_printed(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TIKTOK_SESSIONID", "a" * 32)
+    monkeypatch.setenv("TIKTOK_TARGET_ANCHOR_ID", "98765")
+    monkeypatch.delenv("TIKTOK_TARGET_USER", raising=False)
+    rows = Mock(
+        return_value=[
+            {
+                "replay_id": "1",
+                "title": "Example",
+                "available": True,
+                "duration": 10,
+                "completed": False,
+            }
+        ]
+    )
+    monkeypatch.setattr(cli, "recording_rows", rows)
+    monkeypatch.setattr("sys.argv", ["replay", "recordings"])
+    assert cli.main() == 0
+    assert rows.call_args.kwargs["anchor_id"] == "98765"
+    assert "98765" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("replay_id", [None, "123"])
+def test_download_all_command(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    replay_id: str | None,
 ) -> None:
     monkeypatch.setenv("TIKTOK_SESSIONID", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     acquire = Mock(return_value=DownloadSummary(saved=1, skipped=5))
@@ -107,9 +134,14 @@ def test_download_all_command(
             "3",
             "--host",
             "extra.test",
+            *([] if replay_id is None else ["--replay-id", replay_id]),
         ],
     )
     assert cli.main() == 0
+    if replay_id is None:
+        assert acquire.call_args.kwargs["replay_id"] is None
+    else:
+        assert acquire.call_args.kwargs["replay_id"] == "123"
     assert capsys.readouterr().out == "Saved: 1; complete/busy: 5; unavailable: 0\n"
     assert acquire.call_args.kwargs["options"].workers == 3
     assert acquire.call_args.kwargs["options"].hosts == (
@@ -294,3 +326,21 @@ def test_missing_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("replay.cli.shutil.which", lambda name: None)
     monkeypatch.setattr("sys.argv", ["replay", "capture"])
     assert cli.main() == 1
+
+
+def test_relocate_completed_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    operation = Mock(return_value=(tmp_path / "a.mp4", "f" * 64))
+    monkeypatch.setattr(cli, "relocate_completed", operation)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["replay", "--store", str(tmp_path / "c"), "relocate-completed", "12", str(tmp_path)],
+    )
+    assert cli.main() == 0
+    assert operation.call_args.kwargs == {
+        "root": tmp_path / "jobs",
+        "replay_id": "12",
+        "directory": tmp_path,
+    }
+    assert "Relocated: a.mp4" in capsys.readouterr().out

@@ -141,7 +141,14 @@ def test_network_error_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_cli_id_overrides_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     resolver = Mock(side_effect=AssertionError("no lookup"))
     monkeypatch.setattr("replay.targets.resolve_user", resolver)
-    assert target_id(anchor_id="123", user=None, environ={"TIKTOK_TARGET_USER": "other"}) == "123"
+    assert (
+        target_id(
+            anchor_id="123",
+            user=None,
+            environ={"TIKTOK_TARGET_USER": "other", "TIKTOK_TARGET_ANCHOR_ID": "789"},
+        )
+        == "123"
+    )
     resolver.assert_not_called()
 
 
@@ -149,7 +156,12 @@ def test_cli_username_overrides_environment(monkeypatch: pytest.MonkeyPatch) -> 
     resolver = Mock(return_value="123")
     monkeypatch.setattr("replay.targets.resolve_user", resolver)
     assert (
-        target_id(anchor_id=None, user="@creator", environ={"TIKTOK_TARGET_USER": "other"}) == "123"
+        target_id(
+            anchor_id=None,
+            user="@creator",
+            environ={"TIKTOK_TARGET_USER": "other", "TIKTOK_TARGET_ANCHOR_ID": "789"},
+        )
+        == "123"
     )
     resolver.assert_called_once_with("@creator")
 
@@ -159,6 +171,28 @@ def test_environment_target(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("replay.targets.resolve_user", resolver)
     assert target_id(anchor_id=None, user=None, environ={"TIKTOK_TARGET_USER": "@second"}) == "456"
     resolver.assert_called_once_with("@second")
+
+
+def test_environment_numeric_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolver = Mock(side_effect=AssertionError("must not use profile lookup"))
+    monkeypatch.setattr("replay.targets.resolve_user", resolver)
+    assert target_id(anchor_id=None, user=None, environ={"TIKTOK_TARGET_ANCHOR_ID": "123"}) == "123"
+    resolver.assert_not_called()
+
+
+def test_environment_target_conflict() -> None:
+    with pytest.raises(ReplayError, match="not both"):
+        target_id(
+            anchor_id=None,
+            user=None,
+            environ={"TIKTOK_TARGET_ANCHOR_ID": "123", "TIKTOK_TARGET_USER": "@creator"},
+        )
+
+
+@pytest.mark.parametrize("invalid", ["", " ", "123 ", "not-a-number"])
+def test_invalid_environment_numeric_target(invalid: str) -> None:
+    with pytest.raises(ReplayError, match="Invalid numeric"):
+        target_id(anchor_id=None, user=None, environ={"TIKTOK_TARGET_ANCHOR_ID": invalid})
 
 
 @pytest.mark.parametrize("environment", [{}, {"TIKTOK_TARGET_USER": " "}])

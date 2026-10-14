@@ -171,7 +171,16 @@ def target_id(*, anchor_id: str | None, user: str | None, environ: Mapping[str, 
         raise ReplayError("Choose either --anchor-id or --user, not both.")
     if anchor_id is not None:
         return numeric_id(anchor_id)
-    selector = user if user is not None else environ.get("TIKTOK_TARGET_USER")
-    if selector is None or not selector.strip():
-        raise ReplayError("Specify --anchor-id, --user, or TIKTOK_TARGET_USER.")
-    return resolve_user(selector)
+    if user is not None:
+        return resolve_user(user)
+    saved_id = environ.get("TIKTOK_TARGET_ANCHOR_ID")
+    saved_user = environ.get("TIKTOK_TARGET_USER")
+    if saved_id is not None and saved_user is not None:
+        raise ReplayError("Choose one environment creator selector, not both.")
+    if saved_id is not None:
+        return numeric_id(saved_id)
+    if saved_user is None or not saved_user.strip():
+        raise ReplayError(
+            "Specify --anchor-id, --user, TIKTOK_TARGET_ANCHOR_ID, or TIKTOK_TARGET_USER."
+        )
+    return resolve_user(saved_user)
