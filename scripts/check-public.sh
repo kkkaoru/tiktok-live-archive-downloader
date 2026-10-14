@@ -18,6 +18,7 @@ check_path() {
         TranscriptViewer/Package.swift|TranscriptViewer/Package.resolved|TranscriptViewer/.swift-format|TranscriptViewer/build-app.sh) ;;
         TranscriptViewer/Sources/TranscriptCore/*.swift|TranscriptViewer/Sources/TranscriptViewer/*.swift|TranscriptViewer/Sources/TranscriptCheck/*.swift|TranscriptViewer/Sources/TranscriptSummaries/*.swift|TranscriptViewer/Sources/TranscriptSummaryCLI/*.swift) ;;
         TranscriptViewer/Tests/TranscriptCoreTests/*.swift) ;;
+        TranscriptViewer/DEFAULT_LIBRARIES.md) ;;
         TranscriptViewer/App/Info.plist|TranscriptViewer/App/generate-icon.py|TranscriptViewer/App/generate-icon.sh) ;;
         native/apple-pro-apps/Package.swift|native/apple-pro-apps/Package.resolved|native/apple-pro-apps/README.md) ;;
         native/apple-pro-apps/Sources/ProAppsCore/*.swift|native/apple-pro-apps/Sources/AppleProApps/*.swift) ;;
@@ -27,6 +28,9 @@ check_path() {
         web-viewer/cloudflare.config.ts|web-viewer/wrangler.config.ts|web-viewer/sync.config.example.json|web-viewer/public/index.html) ;;
         web-viewer/secrets.example.json|web-viewer/deploy.env.example) ;;
         web-viewer/src/*.js|web-viewer/src/*.ts|web-viewer/tools/*.py) ;;
+        native/apple-pro-apps/Sources/AudioClockProbe/*.swift|native/apple-pro-apps/Sources/AudioEncodingCapabilities/*.swift|native/apple-pro-apps/Sources/FontIdentityProbe/*.swift) ;;
+        native/apple-pro-apps/Tests/AudioClockProbeTests/*.swift|native/apple-pro-apps/Tests/AudioEncodingCapabilitiesTests/*.swift|native/apple-pro-apps/Tests/FontIdentityProbeTests/*.swift) ;;
+        tests/conftest.py) ;;
         '') ;;
         *) printf 'Unapproved public path: %s\n' "$1" >&2; return 1 ;;
     esac
