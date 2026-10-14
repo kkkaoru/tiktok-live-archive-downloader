@@ -68,8 +68,10 @@ bun run debug /api/me       # 管理者の読み取り専用セッションで�
 
 - ログインは X の OAuth 2.0（PKCE）。管理者は環境変数 `X_ADMIN_USERNAMES`、そのほかの閲覧許可は
   管理者が `/admin` で追加し、R2の `config/allowed-users.json` を正本、KVとCache APIを読み取り層にします。
-- 必要なWorkerの値は `secrets.json` に置きます: `X_CLIENT_ID`, `X_CLIENT_SECRET`,
-  `SESSION_SECRET`, `X_ADMIN_USERNAMES`。カスタムドメインは `deploy.env` の `VIEWER_DOMAIN`。
+- 必要なWorkerの値は `secrets.json` に置きます（雛形は `secrets.example.json`）:
+  `X_CLIENT_ID`, `X_CLIENT_SECRET`, `SESSION_SECRET`, `X_ADMIN_USERNAMES`。カスタムドメインは
+  `deploy.env` の `VIEWER_DOMAIN`（雛形は `deploy.env.example`）。どの値をどこに置くかは
+  リポジトリの `docs/secrets-and-environment.md` を参照。
 
 ## デバッグ用の管理者セッション（読み取り専用）
 
