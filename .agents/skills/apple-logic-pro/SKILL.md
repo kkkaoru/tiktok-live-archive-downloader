@@ -5,11 +5,19 @@ description: Integrate Logic Pro through Executor with native MIDI file generati
 
 # Logic Pro — MIDI / OSC / files first
 
-Load **apple-pro-apps** and discover native tools in `apple-pro-apps`. This Mac's
-Creator Studio edition uses **`com.apple.mobilelogic`**, not a guessed
-`com.apple.logic10App`. Pass `app: "logicPro"` to the native open tool.
+Load **apple-pro-apps** and discover native tools and installed editions in
+`apple-pro-apps`. Creator Studio uses **`com.apple.mobilelogic`**, not a guessed
+`com.apple.logic10App`. Pass `app: "logicPro"` and the selected edition when needed.
 
 ## Native musical content
+
+The audio-enabled `app_open_document` adapter also accepts `.wav`, `.aif`,
+`.aiff`, `.caf`, `.m4a` and `.mp3` for Logic Pro. Discover the deployed tool's
+description first: older deployments accept only projects and MIDI. Open Document
+can import audio into a project; it does not certify track placement or playback.
+Inspect the resulting audio track/region and dialogs, then use the observed
+transport controls and confirm the playhead advances. Do not rename audio as MIDI
+or edit `.logicx` package internals to work around an older adapter.
 
 Use `midi_file_create` to build a new standard MIDI type-0 file. Supply explicit
 `bpm`, optional `ticksPerQuarter` (default 480), and notes with `note` (0–127),
@@ -31,8 +39,8 @@ or Logic routing. Fades/offsets use output time; sources remain untouched.
 `audio_measure` decodes up to 30 seconds to temporary mono PCM16/16000 Hz and
 reports RMS/peak/zero crossings for whole clips and windows. This is not LUFS,
 a reliable voice/music pitch detector, per-channel verification or a Logic bounce.
-Keep viewing outputs under the Movies verification root; import separately into
-a disposable Logic project if actual editor integration is requested.
+Use the current task's authorized output/scratch root; import separately into a
+disposable Logic project if actual editor integration is requested.
 
 ## Assigned controls
 
@@ -63,8 +71,8 @@ Scripter is a MIDI-FX JavaScript environment; controller Lua profiles are anothe
 specialized integration. Neither is a general-purpose external project API.
 This MCP does not install either, create arbitrary tracks/plugins through a public
 API, guarantee sample-accurate performance or provide automatic bounce/export.
-For those UI-only tasks, identify the gap and then use `apple-pro-apps-ui` under
-shared rules. Read the actual current key-command set; don't remap it or assume
+For those UI-only tasks, use the native background `ui_*` tools first; identify any
+remaining gap and only then use `apple-pro-apps-ui` (Peekaboo) under shared rules. Read the actual current key-command set; don't remap it or assume
 factory shortcuts. Verify bounce range, sample rate, bit depth and output artifact.
 
 ## Apple references

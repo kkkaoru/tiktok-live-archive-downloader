@@ -8,8 +8,8 @@ description: >-
 
 Load **apple-pro-apps** and discover tools in Executor namespace `apple-pro-apps`.
 Do not run arbitrary shell command strings. Swift constructs argument arrays for
-the installed, explicitly selected Compressor executable. This Mac's default is
-`compressor` / `com.apple.CompressorApp` (Creator Studio 5.3).
+the installed, explicitly selected Compressor executable. Discover installed
+editions and versions first; Creator Studio uses `com.apple.CompressorApp`.
 
 ## Procedure
 
@@ -26,13 +26,15 @@ the installed, explicitly selected Compressor executable. This Mac's default is
    The server reserves a unique private `compressor-<UUID>` child directory and
    returns its output path. Existing exports and sources are never overwritten.
    For a short smoke test, pass `range: {startSeconds: 0, durationSeconds: 5}`.
-   This user's verification output root is `~/Movies/Apple-Pro-Apps-Verification/`.
-   Resolve it to an absolute path and ensure it exists before supplying
-   `outputDirectory`; never pass literal `~` to the MCP. Keep diagnostic logs
-   private and separate from the viewing copy.
+   Use the current task's authorized output root, resolve it to an absolute path
+   and ensure it exists before supplying `outputDirectory`; never pass literal
+   `~` to the MCP. Keep diagnostic logs private and policy-compliant.
    Start is bounded to 0–86399 seconds; duration to 1–600 seconds. These become
    source `-in`/`-out` timecodes before the output target; frame rounding belongs
    to Compressor. Verify the exported duration, do not assume trimming succeeded.
+   Ensure the selected edition is running via `app_launch` (`activate: false`)
+   before submitting. On a 0% `Processing` stall, check the app/controller and
+   existing job instead of resubmitting.
 4. Save the returned native submission result and exact job/batch ID. Exit zero
    is **not** encode completion. The response reports `completionVerified: false`.
    If submission fails/times out, retain its reserved output path and investigate
@@ -56,9 +58,9 @@ It is not a Compressor preset editor or Motion renderer. Prefer it when its exac
 schema covers the requested edit; use Compressor for the chosen trusted encoding
 preset and subsequent job management.
 
-The installed 5.3 CLI was inspected with `-help`; it supports submission JSON,
-`-monitor`, `-once`, `-timeout`, `-pause`, `-resume` and `-kill` by job/batch ID.
-These are version-specific observations; recheck capability on another version.
+The adapter documents CLI submission JSON, `-monitor`, `-once`, `-timeout`,
+`-pause`, `-resume` and `-kill` by job/batch ID. Verify these capabilities against
+the installed CLI version; do not assume a historical `-help` result still applies.
 The current typed submission covers one regular source and one preset; repeat
 explicitly for a bounded set of sources. Image-sequence URL parameters, multi-
 computer distribution, relabel-in-place and job-action XML are not exposed.

@@ -1,14 +1,14 @@
 ---
 name: apple-mainstage
-description: Operate MainStage through Executor using native concert/patch opening and explicitly routed CoreMIDI controls first. Covers patches, sets, assignments, layouts and safe live-performance boundaries; Peekaboo is UI-only fallback.
+description: Operate MainStage through Executor using native concert/patch opening and explicitly routed CoreMIDI controls first. Covers patches, sets, assignments, layouts and safe live-performance boundaries; native background `ui_*` tools before an auxiliary Peekaboo fallback.
 ---
 
 # MainStage — explicit MIDI mappings first
 
 Load **apple-pro-apps**. Use native Executor namespace `apple-pro-apps`; discover
-and describe every tool before calling it. This Mac has both Creator Studio
-`com.apple.MainStageApp` and standalone `com.apple.mainstage3`. Choose one edition
-explicitly and never open the same concert in both.
+and describe every tool before calling it. Discover installed editions: Creator
+Studio uses `com.apple.MainStageApp`, standalone uses `com.apple.mainstage3`.
+Choose one installed edition explicitly and never open the same concert in both.
 
 ## Machine integration
 
@@ -44,7 +44,9 @@ Loading/assigning prepared media still requires an explicitly scoped app workflo
 
 ## UI-only authoring fallback
 
-Use `apple-pro-apps-ui` only for an identified native gap, following shared rules.
+Use the native background `ui_*` tools first for windows, menus, buttons and values.
+Use `apple-pro-apps-ui` (Peekaboo) only for an explained remaining gap, following
+shared rules.
 MainStage modes have different meanings:
 
 - **Layout:** arrange screen controls and assign hardware inputs.
