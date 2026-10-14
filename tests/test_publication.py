@@ -63,6 +63,36 @@ def test_public_scan_excludes_private_data(publication: tuple[Path, dict[str, st
     assert "Index and complete referenced history passed" in result.stdout
 
 
+@pytest.mark.parametrize("filename", ["stateful_guard_fixture.py", "unapproved_fixture.py"])
+def test_static_guard_fixture_exception_is_narrow(
+    publication: tuple[Path, dict[str, str]], filename: str
+) -> None:
+    root, environment = publication
+    fixture = root / "tests" / filename
+    fixture.parent.mkdir()
+    shutil.copyfile(Path(__file__).with_name("stateful_guard_fixture.py"), fixture)
+    subprocess.run(
+        ["git", "add", str(fixture.relative_to(root))],
+        cwd=root,
+        env=environment,
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    result = subprocess.run(
+        ["bash", "scripts/check-public.sh"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert (filename, result.returncode) in {
+        ("stateful_guard_fixture.py", 0),
+        ("unapproved_fixture.py", 1),
+    }
+
+
 def test_agent_guide_is_an_approved_public_path(
     publication: tuple[Path, dict[str, str]],
 ) -> None:
@@ -113,6 +143,111 @@ def test_agent_skill_is_an_approved_public_path(
     )
     assert result.returncode == 0
     assert "Index and complete referenced history passed" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "native/apple-pro-apps/Package.swift",
+        "native/apple-pro-apps/Package.resolved",
+        "native/apple-pro-apps/Sources/ProAppsCore/Example.swift",
+        "native/apple-pro-apps/Tests/ProAppsNativeTests/Example.swift",
+    ],
+)
+def test_shared_native_source_is_approved(
+    publication: tuple[Path, dict[str, str]], path: str
+) -> None:
+    root, environment = publication
+    source = root / path
+    source.parent.mkdir(parents=True)
+    source.write_text("{}\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", path], cwd=root, env=environment, check=True, capture_output=True, timeout=10
+    )
+    result = subprocess.run(
+        ["bash", "scripts/check-public.sh"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        timeout=20,
+    )
+    assert result.returncode == 0
+
+
+@pytest.mark.parametrize("name", ["black.mp4", "quadrants-30.mp4"])
+def test_only_verified_synthetic_native_media_is_approved(
+    publication: tuple[Path, dict[str, str]], name: str
+) -> None:
+    root, environment = publication
+    relative = Path("native/apple-pro-apps/Tests/ProAppsNativeTests/Fixtures") / name
+    destination = root / relative
+    destination.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__).resolve().parents[1] / relative, destination)
+    subprocess.run(
+        ["git", "add", str(relative)],
+        cwd=root,
+        env=environment,
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    accepted = subprocess.run(
+        ["bash", "scripts/check-public.sh"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        timeout=20,
+    )
+    assert accepted.returncode == 0
+    destination.write_bytes(b"different media must not inherit the fixture exception")
+    subprocess.run(
+        ["git", "add", str(relative)],
+        cwd=root,
+        env=environment,
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    rejected = subprocess.run(
+        ["bash", "scripts/check-public.sh"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert rejected.returncode == 1
+    assert "Synthetic fixture hash differs:" in rejected.stderr
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "native/apple-pro-apps/.build/state.json",
+        "native/apple-pro-apps/model/weights.npz",
+        "native/apple-pro-apps/Tests/ProAppsNativeTests/Fixtures/recording.mp4",
+    ],
+)
+def test_native_build_models_and_other_media_remain_private(
+    publication: tuple[Path, dict[str, str]], path: str
+) -> None:
+    root, environment = publication
+    artifact = root / path
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("local artifact\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", path], cwd=root, env=environment, check=True, capture_output=True, timeout=10
+    )
+    result = subprocess.run(
+        ["bash", "scripts/check-public.sh"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 1
+    assert "Unapproved public path:" in result.stderr
 
 
 def test_forced_private_path_is_rejected(publication: tuple[Path, dict[str, str]]) -> None:
