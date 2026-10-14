@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from replay.stages import Stage, StageError, execute_command, file_digest, run_stage
+from replay.stages import Stage, StageError, execute_command, execution_lock, file_digest, run_stage
 
 
 @pytest.fixture
@@ -164,6 +164,42 @@ def test_cross_process_lock_refuses_duplicate(stage: Stage, tmp_path: Path) -> N
     with (state / "encode.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert run_stage(stage, state_directory=state) == "busy"
+    assert not stage.outputs[0].exists()
+
+
+@pytest.mark.parametrize("name", ["", "../escape", "a/b", ".", "..", "Upper", "x" * 65])
+def test_execution_lock_name_is_validated(tmp_path: Path, name: str) -> None:
+    with pytest.raises(StageError, match="lock name"), execution_lock(tmp_path / "state", name):
+        pytest.fail("invalid lock acquired")
+    assert not (tmp_path / "state").exists()
+
+
+def test_execution_lock_releases_after_exception(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with pytest.raises(StageError, match="synthetic"), execution_lock(state, ".workflow") as held:
+        assert held
+        with execution_lock(state, ".workflow") as duplicate:
+            assert duplicate is False
+        raise StageError("synthetic")
+    with execution_lock(state, ".workflow") as held:
+        assert held
+    assert (state / ".workflow.lock").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("kind", ["hardlink", "fifo"])
+def test_unsafe_lock_does_not_mutate_its_target(stage: Stage, tmp_path: Path, kind: str) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    target_mode = stage.inputs[0].stat().st_mode
+    lock = state / "encode.lock"
+    if kind == "hardlink":
+        lock.hardlink_to(stage.inputs[0])
+    else:
+        os.mkfifo(lock)
+    with pytest.raises(StageError, match="single-link regular file"):
+        run_stage(stage, state_directory=state)
+    assert stage.inputs[0].stat().st_mode == target_mode
+    assert stage.inputs[0].read_bytes() == b"source"
     assert not stage.outputs[0].exists()
 
 

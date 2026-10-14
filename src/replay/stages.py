@@ -9,12 +9,14 @@ import signal
 import stat
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from replay.core import write_private_text
+from replay.input_hash_cache import cached_digest
 
 MAX_RECEIPT_BYTES = 1_048_576
 
@@ -54,6 +56,11 @@ class Stage:
 
 
 def file_digest(path: Path) -> str:
+    """Use ordinary hashing unless one bounded immutable-input operation opts in."""
+    return cached_digest(path, _uncached_file_digest)
+
+
+def _uncached_file_digest(path: Path) -> str:
     """Reject links and files changed during hashing; never read directory trees."""
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode) or before.st_size == 0:
@@ -121,6 +128,33 @@ def _read_receipt(path: Path) -> object:
     return data
 
 
+@contextmanager
+def execution_lock(state_directory: Path, name: str) -> Iterator[bool]:
+    """Hold a cooperative, nonblocking lease; never unlink its persistent lock file."""
+    if re.fullmatch(r"[a-z0-9_.-]{1,64}", name) is None or name in {".", ".."}:
+        raise StageError("Invalid execution lock name")
+    if state_directory.is_symlink():
+        raise StageError("State directory must not be a symlink")
+    state_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_directory.chmod(0o700)
+    descriptor = os.open(
+        state_directory / f"{name}.lock",
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+    )
+    with os.fdopen(descriptor, "rb", buffering=0) as lock:
+        metadata = os.fstat(lock.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise StageError("Execution lock must be a single-link regular file")
+        os.fchmod(lock.fileno(), 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
 def run_stage(
     stage: Stage,
     *,
@@ -134,17 +168,8 @@ def run_stage(
     or interrupted mutations are not retried. Their outputs may be adopted only
     after the supplied domain verifier proves their input-bound provenance.
     """
-    if state_directory.is_symlink():
-        raise StageError("State directory must not be a symlink")
-    state_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    state_directory.chmod(0o700)
-    lock_path = state_directory / f"{stage.name}.lock"
-    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "a+b") as lock:
-        os.fchmod(lock.fileno(), 0o600)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with execution_lock(state_directory, stage.name) as acquired:
+        if not acquired:
             return "busy"
         return _run_locked(stage, state_directory=state_directory, execute=execute)
 
