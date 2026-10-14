@@ -5,8 +5,17 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
+from replay.subtitle_inpaint import Image
 from replay.subtitle_repair import repair_with_retries
 from replay.subtitle_retry import RepairEvidence, RepairMethod
+
+
+@pytest.fixture(autouse=True)
+def synthetic_detector(monkeypatch: pytest.MonkeyPatch) -> None:
+    def detect(image: Image) -> Image:
+        return np.asarray(image[:, :, 2] != image[:, :, 1], dtype=np.uint8) * 255
+
+    monkeypatch.setattr("replay.subtitle_repair.vision_text_mask", detect)
 
 
 def test_passing_frame_is_not_retried() -> None:
@@ -61,6 +70,21 @@ def test_rejects_outside_support_modification() -> None:
         pytest.raises(ValueError, match="outside allowed support"),
     ):
         repair_with_retries(image, measure=Mock(), softness=0.5)
+
+
+def test_native_guard_accepts_changes_only_inside_support() -> None:
+    source = np.zeros((32, 32, 3), dtype=np.uint8)
+    changed = source.copy()
+    changed[10, 10] = 255
+    support = np.zeros((32, 32), dtype=np.uint8)
+    support[10, 10] = 255
+    with patch("replay.subtitle_repair.repair_glyphs", return_value=(changed, support)):
+        result = repair_with_retries(
+            source, measure=Mock(return_value=RepairEvidence(True, 0, 0, False)), softness=0.5
+        )
+    np.testing.assert_array_equal(result.image, changed)
+    assert result.attempts[0].decision.accepted
+    assert np.count_nonzero(source) == 0
 
 
 def test_unavailable_quality_skips_work_without_changing_pixels() -> None:

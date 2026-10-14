@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from replay.caption_io import FrameObservation
@@ -12,6 +14,30 @@ from replay.subtitle_profile import (
 
 @pytest.fixture
 def observations() -> tuple[FrameObservation, ...]:
+    japanese = (
+        "春の花",
+        "遠い海",
+        "今日の天気",
+        "朝の挨拶",
+        "夕焼けの空",
+        "白い雲",
+        "青い鳥",
+        "静かな森",
+        "新しい本",
+        "明日の予定",
+    )
+    translations = (
+        "spring flowers",
+        "distant sea",
+        "today's weather",
+        "morning greeting",
+        "sunset sky",
+        "white clouds",
+        "blue bird",
+        "quiet forest",
+        "new book",
+        "tomorrow's plans",
+    )
     return tuple(
         map(
             lambda index: FrameObservation(
@@ -20,8 +46,8 @@ def observations() -> tuple[FrameObservation, ...]:
                 1080,
                 1920,
                 (
-                    TextDetection(f"字幕{index}", 1, TextRectangle(340, 1296, 400, 32)),
-                    TextDetection(f"translation{index}", 1, TextRectangle(340, 1408, 400, 24)),
+                    TextDetection(japanese[index], 1, TextRectangle(340, 1296, 400, 32)),
+                    TextDetection(translations[index], 1, TextRectangle(340, 1408, 400, 24)),
                     TextDetection("STATIC", 1, TextRectangle(400, 1200, 300, 24)),
                     TextDetection(f"shirt{index}", 1, TextRectangle(440, 1220, 200, 24)),
                 ),
@@ -42,9 +68,50 @@ def test_static_and_upper_roman_text_do_not_seed_a_blanket_mask(
 ) -> None:
     result = profiled_detections(observations[0], learn_subtitle_bands(observations))
     assert result == (
-        TextDetection("字幕0", 1, TextRectangle(340, 1296, 400, 32)),
-        TextDetection("translation0", 1, TextRectangle(340, 1408, 400, 24)),
+        TextDetection("春の花", 1, TextRectangle(340, 1296, 400, 32)),
+        TextDetection("spring flowers", 1, TextRectangle(340, 1408, 400, 24)),
     )
+
+
+def test_changing_counters_do_not_seed_primary_or_secondary_bands(
+    observations: tuple[FrameObservation, ...],
+) -> None:
+    frames = tuple(
+        map(
+            lambda frame: replace(
+                frame,
+                detections=(
+                    *frame.detections,
+                    TextDetection(
+                        f"参加者 {frame.actual_time} 人", 1, TextRectangle(340, 288, 400, 32)
+                    ),
+                    TextDetection(
+                        f"count {frame.actual_time}", 1, TextRectangle(340, 1472, 400, 24)
+                    ),
+                ),
+            ),
+            observations,
+        )
+    )
+    assert learn_subtitle_bands(frames) == SubtitleBands(1080, 1920, (41,), (44,))
+    assert frames[0].detections[-2].text == "参加者 0 人"
+
+
+def test_fullwidth_counter_changes_alone_refuse_a_blanket_mask() -> None:
+    frames = tuple(
+        map(
+            lambda digit: FrameObservation(
+                0,
+                0,
+                1080,
+                1920,
+                (TextDetection(f"参加者　{digit}　人", 1, TextRectangle(340, 1296, 400, 32)),),
+            ),
+            "０１２３４５６７８９",
+        )
+    )
+    with pytest.raises(ValueError, match="blanket mask"):
+        learn_subtitle_bands(frames)
 
 
 def test_isolated_upper_object_rejected_but_supported_wrapped_line_kept() -> None:

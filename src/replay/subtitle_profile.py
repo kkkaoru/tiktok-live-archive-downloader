@@ -45,8 +45,9 @@ def learn_subtitle_bands(frames: tuple[FrameObservation, ...]) -> SubtitleBands:
     """Seed variable centered Japanese lines and nearby lower translated lines.
 
     This is a geometry/script heuristic, not semantic or exhaustive subtitle
-    detection. An OCR search ROI is not itself a mask. Repeated static labels and
-    variable Roman text above the Japanese bands cannot seed subtitle masks.
+    detection. An OCR search ROI is not itself a mask. Repeated labels, including
+    changing decimal counters/spacing, cannot seed subtitle masks. Roman text
+    above the Japanese bands cannot seed them either; detected text is untouched.
     """
     if not frames or len(frames) > 50000:
         raise ValueError("Invalid subtitle profile observation budget")
@@ -71,13 +72,19 @@ def learn_subtitle_bands(frames: tuple[FrameObservation, ...]) -> SubtitleBands:
             ):
                 continue
             band = _band(line)
+            # Counters changing within a fixed label are not lexical subtitle variety.
+            text = "".join(
+                character
+                for character in line.text
+                if not character.isdecimal() and not character.isspace()
+            )
             counts[band] += 1
             if len(texts[band]) < 5:
-                texts[band].add(line.text)
+                texts[band].add(text)
             if japanese_letters(line.text):
                 jp_counts[band] += 1
                 if len(jp_texts[band]) < 5:
-                    jp_texts[band].add(line.text)
+                    jp_texts[band].add(text)
     primary = tuple(
         sorted(band for band in jp_counts if jp_counts[band] >= 10 and len(jp_texts[band]) >= 5)
     )
