@@ -20,7 +20,7 @@ The scan covers the index and history, not unrelated untracked working files. It
 - API authentication comes from `TIKTOK_SESSIONID`, validated before use. Fixed HTTPS endpoints, TLS verification and redirect refusal bound authenticated API traffic.
 - Creator lookup uses a separate unauthenticated HTTP client, with an optional fresh headless browser. It never imports existing browser profiles or passes the account session to profile lookup.
 - Media transfer uses a separate client and explicit HTTPS host scope. Credentials do not follow cross-origin media redirects. Capture helpers are explicitly opt-in.
-- Credential values and signed candidate URLs are hidden from normal CLI output and object representations. Errors from browser/network tools are sanitized. Do not enable third-party HTTP debug logging while using real credentials.
+- Credential values, creator IDs and signed candidate URLs are hidden from normal CLI output. Store a verified creator ID only in the ignored, 0600 `private/target-anchor-id`; `scripts/replay-authorized.sh` passes it privately through the child environment, never as an argument. Errors from browser/network tools are sanitized. Do not enable third-party HTTP debug logging while using real credentials.
 - Session reissuance checks account continuity and API access before atomic secret-file publication. Private storage uses 0700 directories and 0600 files. Cookie reissuance is not a promise of expiry extension or unattended recovery after revocation.
 - Browser authentication is explicit. Human security checks are not bypassed, and third-party identity-provider storage is not retained.
 
