@@ -147,6 +147,7 @@ def select_native_context(
     source_duration: float,
     required_text: tuple[str, ...] = (),
     policy: CaptionPolicy | None = None,
+    repair_target_onsets: bool = False,
 ) -> ContextSelection | None:
     """Choose complete native words between shared anchors, without editing clocks.
 
@@ -155,6 +156,9 @@ def select_native_context(
     protect original speech evidence independently. This does not prove accuracy
     or authorize cutting audio. Missing required lexical content, invalid clocks,
     coarse display timing or missing safe seams leave the review unresolved.
+    Explicit repair_target_onsets permits original reversals wholly inside the
+    replaced target only. Outside onsets and all alternative onsets stay ordered;
+    shared anchors, positive native intervals and safe outer seams remain required.
     """
     if (
         any(isinstance(value, bool) for value in (context_start, context_end, source_duration))
@@ -163,6 +167,7 @@ def select_native_context(
         or context_end - context_start > 60
         or type(target_start) is not int
         or type(target_end) is not int
+        or type(repair_target_onsets) is not bool
         or not 0 <= target_start < target_end <= len(original) <= 100_000
         or len(alternative) > 1000
         or sum(len(label.text) for label in alternative) > 32000
@@ -170,9 +175,14 @@ def select_native_context(
         or any(len(text) > 2048 for text in required_text)
     ):
         raise ValueError("Invalid native review bounds or budget")
+    for index, (left, right) in enumerate(pairwise(original)):
+        if right.start < left.start and not (
+            repair_target_onsets and target_start <= index < target_end - 1
+        ):
+            raise ValueError("Review onsets must be ordered outside the replaced target")
+    if any(right.start < left.start for left, right in pairwise(alternative)):
+        raise ValueError("Review alternative onsets must be ordered")
     for labels in (original, alternative):
-        if any(right.start < left.start for left, right in pairwise(labels)):
-            raise ValueError("Review onsets must be ordered")
         if any(label.end > source_duration for label in labels):
             raise ValueError("Review label exceeds source")
     if any(label.start < context_start or label.end > context_end for label in alternative):

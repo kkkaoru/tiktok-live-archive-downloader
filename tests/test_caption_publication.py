@@ -22,3 +22,26 @@ def test_edit_workspaces_are_ignored_including_nonmedia_evidence(tmp_path: Path)
         timeout=10,
     )
     assert result.stdout == paths
+
+
+def test_installed_agent_library_is_private_but_project_code_remains_checked(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    shutil.copyfile(root / ".gitignore", tmp_path / ".gitignore")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, timeout=10)
+    result = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--stdin"],
+        input=(
+            ".pi/skills/installed-library/tool.py\n"
+            ".pi/config.json\n"
+            "src/replay/example.py\n"
+            "tests/test_example.py\n"
+        ),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    assert result.stdout == ".pi/skills/installed-library/tool.py\n"

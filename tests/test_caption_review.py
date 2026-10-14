@@ -276,6 +276,112 @@ def test_context_overrun() -> None:
         )
 
 
+@pytest.fixture
+def reversed_original() -> tuple[ClockLabel, ...]:
+    return (
+        ClockLabel("導入", 0, 0.5, "old"),
+        ClockLabel("古い", 1.2, 1.4, "old"),
+        ClockLabel("ことば", 0.8, 1, "old"),
+        ClockLabel("末尾", 1.5, 1.8, "old"),
+        ClockLabel("別文", 2, 2.4, "old"),
+    )
+
+
+def test_explicit_target_repair_selects_ordered_native_words_without_sorting(
+    reversed_original: tuple[ClockLabel, ...], alternative: tuple[ClockLabel, ...]
+) -> None:
+    result = select_native_context(
+        reversed_original,
+        alternative,
+        target_start=1,
+        target_end=3,
+        context_start=0,
+        context_end=3,
+        source_duration=4,
+        required_text=("ことば",),
+        repair_target_onsets=True,
+    )
+    assert result is not None
+    assert (result.original_start, result.original_end) == (1, 3)
+    assert result.replacement == (
+        ClockLabel("新しい", 0.8, 1, "new"),
+        ClockLabel("ことば!", 1.1, 1.3, "new"),
+    )
+    assert reversed_original[1:3] == (
+        ClockLabel("古い", 1.2, 1.4, "old"),
+        ClockLabel("ことば", 0.8, 1, "old"),
+    )
+
+
+def test_original_reversal_still_fails_without_explicit_repair(
+    reversed_original: tuple[ClockLabel, ...], alternative: tuple[ClockLabel, ...]
+) -> None:
+    with pytest.raises(ValueError, match="ordered"):
+        select_native_context(
+            reversed_original,
+            alternative,
+            target_start=1,
+            target_end=3,
+            context_start=0,
+            context_end=3,
+            source_duration=4,
+        )
+
+
+@pytest.mark.parametrize("first,end", [(0, 1), (1, 2), (2, 3), (3, 5)])
+def test_repair_cannot_ignore_reversals_crossing_or_outside_target(
+    reversed_original: tuple[ClockLabel, ...],
+    alternative: tuple[ClockLabel, ...],
+    first: int,
+    end: int,
+) -> None:
+    with pytest.raises(ValueError, match="ordered"):
+        select_native_context(
+            reversed_original,
+            alternative,
+            target_start=first,
+            target_end=end,
+            context_start=0,
+            context_end=3,
+            source_duration=4,
+            repair_target_onsets=True,
+        )
+
+
+def test_repair_does_not_accept_an_unordered_alternative(
+    reversed_original: tuple[ClockLabel, ...],
+) -> None:
+    with pytest.raises(ValueError, match="alternative onsets must be ordered"):
+        select_native_context(
+            reversed_original,
+            reversed_original,
+            target_start=1,
+            target_end=3,
+            context_start=0,
+            context_end=3,
+            source_duration=4,
+            repair_target_onsets=True,
+        )
+
+
+def test_repair_without_shared_context_still_stays_unresolved(
+    reversed_original: tuple[ClockLabel, ...], alternative: tuple[ClockLabel, ...]
+) -> None:
+    assert (
+        select_native_context(
+            reversed_original,
+            alternative[1:3],
+            target_start=1,
+            target_end=3,
+            context_start=0.6,
+            context_end=1.45,
+            source_duration=4,
+            repair_target_onsets=True,
+        )
+        is None
+    )
+
+
 def test_anchor_search_budget() -> None:
     original = (ClockLabel("同じ", 0, 1, "old"),) * 70 + (ClockLabel("a", 1, 1, "old"),)
     with pytest.raises(ValueError, match="anchor budget"):

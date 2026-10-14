@@ -1,5 +1,6 @@
 """Strict boundaries for local Executor and MLX caption measurements."""
 
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from math import isfinite
@@ -83,7 +84,8 @@ def _string(value: object) -> str:
     return value
 
 
-def _measurement(value: object) -> object:
+def executor_measurement(value: object) -> object:
+    """Unwrap a successful read-only native measurement without trusting its payload."""
     response = _fields(value)
     if response.get("ok") is not True:
         raise ValueError("Executor measurement did not succeed")
@@ -99,7 +101,7 @@ def _measurement(value: object) -> object:
 
 def speech_tokens(value: object, *, utterance: str) -> tuple[SpokenToken, ...]:
     """Parse a final response to an explicitly wordTiming-enabled local request."""
-    measured = _fields(_measurement(value))
+    measured = _fields(executor_measurement(value))
     if measured.get("onDevice") is not True or measured.get("humanReviewed") is not False:
         raise ValueError("Expected local, automatically recognized speech")
     duration = _number(measured.get("durationSeconds"))
@@ -142,8 +144,17 @@ class SoundWindow:
 
 
 def sound_windows(value: object) -> tuple[SoundWindow, ...]:
-    """Validate raw local scores; low scores and empty results are not silence."""
-    measured = _fields(_measurement(value))
+    """Validate the Executor receipt before parsing its local sound scores."""
+    return native_sound_windows(executor_measurement(value))
+
+
+def native_sound_windows(value: object) -> tuple[SoundWindow, ...]:
+    """Parse raw CLI scores, not a source-immutability or process-success receipt.
+
+    The caller verifies those independently. Low scores and empty results are not
+    silence; raw CLI data is never wrapped in a fabricated Executor envelope.
+    """
+    measured = _fields(value)
     duration = _number(measured.get("durationSeconds"))
     if (
         not 0.5 <= duration <= 60
@@ -171,9 +182,18 @@ def sound_windows(value: object) -> tuple[SoundWindow, ...]:
 
 
 def ocr_frames(value: object) -> tuple[FrameObservation, ...]:
-    """Keep requested and actual frame times distinct, including held-frame cases."""
+    """Validate the Executor envelope before parsing its native measurement."""
+    return native_ocr_frames(executor_measurement(value))
+
+
+def native_ocr_frames(value: object) -> tuple[FrameObservation, ...]:
+    """Parse raw CLI measurements, not an Executor success/read-only receipt.
+
+    Keep requested and actual times distinct. Callers must separately verify
+    process success and source immutability; this parser proves neither.
+    """
     result: list[FrameObservation] = []
-    for item in _array(_measurement(value), 8):
+    for item in _array(value, 8):
         frame = _fields(item)
         width = _number(frame.get("width"))
         height = _number(frame.get("height"))
@@ -235,9 +255,27 @@ def mlx_groups(value: object, *, duration: float) -> tuple[MLXWordGroup, ...]:
         if result and word.start == result[-1].start:
             word = _merge_mlx_onset(result.pop(), word)
         result.append(word)
-    if "".join(text.split()) != "".join("".join(word.text for word in result).split()):
-        raise ValueError("MLX words do not conserve the transcript text")
+    segments = [_fields(segment) for segment in _array(measured.get("segments"), MAX_MLX_SEGMENTS)]
+    if "".join(text.split()) != "".join(
+        "".join(_string(segment.get("text")) for segment in segments).split()
+    ):
+        raise ValueError("MLX segments do not conserve the transcript text")
+    # Each segment's words already conserve its text (see _mlx_segment).
     return tuple(result)
+
+
+def _punctuation_only(segment: dict[str, object]) -> bool:
+    """A wordless segment of only punctuation carries no speech to align.
+
+    Whisper emits such segments (for example a lone "、") without word clocks.
+    Any segment with letters must still be fully covered by its words.
+    """
+    text = "".join(_string(segment.get("text")).split())
+    return (
+        segment.get("words") == []
+        and bool(text)
+        and all(unicodedata.category(character).startswith("P") for character in text)
+    )
 
 
 def mlx_native_pieces(value: object, *, duration: float) -> tuple[MLXWordGroup, ...]:
@@ -278,7 +316,7 @@ def _mlx_segment(value: object, *, index: int, duration: float) -> Iterator[MLXW
             raise ValueError("MLX word exceeds its measured audio clock")
         words.append(word.text)
         yield word
-    if "".join(text.split()) != "".join("".join(words).split()):
+    if not _punctuation_only(segment) and "".join(text.split()) != "".join("".join(words).split()):
         raise ValueError("MLX words do not conserve the segment text")
 
 

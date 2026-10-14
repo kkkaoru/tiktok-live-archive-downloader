@@ -30,6 +30,36 @@ def test_punctuation_breaks_without_dangling_prefix(text: str, expected: str) ->
     assert punctuation_lines(text) == expected
 
 
+def test_measured_policy_allows_three_lines_without_retiming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "replay.caption_linguistics._atomic_ends", lambda text: frozenset({len(text)})
+    )
+    monkeypatch.setattr(
+        "replay.caption_linguistics.semantic_break", lambda previous, following: False
+    )
+    monkeypatch.setattr(
+        "replay.caption_linguistics.boundaries", lambda text: ((len(text),), (len(text),))
+    )
+    words = (SpokenToken("abcdef", 0, 1, "one"), SpokenToken("gh", 1, 2, "two"))
+    result = make_captions(
+        words,
+        policy=CaptionPolicy(
+            maximum_lines=3,
+            linguistic_boundaries=True,
+            hold_seconds=0,
+            measured_layout=lambda text: "\n".join(
+                text[index : index + 2] for index in range(0, len(text), 2)
+            ),
+        ),
+    )
+    assert [(cue.text, cue.start, cue.end) for cue in result] == [
+        ("ab\ncd\nef", 0, 1),
+        ("gh", 1, 2),
+    ]
+
+
 def test_only_spoken_words_appear_and_new_utterance_is_clean() -> None:
     tokens = (
         SpokenToken("今日は、", 0.5, 1, "first"),
@@ -106,6 +136,155 @@ def test_context_budget_resets_without_using_future_words() -> None:
     ) == (CaptionCue("四文字語", 0, 0.2), CaptionCue("次", 0.2, 0.48000000000000004))
 
 
+def test_frame_budget_preserves_short_word_before_width_reset() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("ab", 0, 0.96, "a"),
+            SpokenToken("c", 0.96, 0.98, "a"),
+            SpokenToken("d", 0.98, 0.99, "a"),
+            SpokenToken("ef", 0.99, 1.1, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=4, frame_rate=30),
+    )
+    assert [cue.text for cue in cues] == ["ab", "abc", "d", "def"]
+    assert [cue.start for cue in cues] == [0, 0.96, 0.98, 0.99]
+    assert [cue.text for cue in cues if cue.start <= 1 < cue.end] == ["def"]
+
+
+def test_smooth_frame_horizon_preempts_a_one_frame_final_prefix() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("ab", 0, 0.94, "a"),
+            SpokenToken("c", 0.94, 0.99, "a"),
+            SpokenToken("de", 0.99, 1.1, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=4, frame_rate=30, reset_lookahead_frames=2),
+    )
+    assert [cue.text for cue in cues] == ["ab", "c", "cde"]
+    assert [cue.start for cue in cues] == [0, 0.94, 0.99]
+
+
+@pytest.mark.parametrize("third_onset", [0.95, 0.98])
+def test_anticipated_reset_does_not_hide_the_preceding_short_prefix(third_onset: float) -> None:
+    cues = make_captions(
+        (
+            SpokenToken("ab", 0, 0.94, "a"),
+            SpokenToken("c", 0.94, third_onset, "a"),
+            SpokenToken("d", third_onset, 0.99, "a"),
+            SpokenToken("e", 0.99, 1.1, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=4, frame_rate=30, reset_lookahead_frames=2),
+    )
+    assert [cue.text for cue in cues] == ["ab", "c", "cd", "cde"]
+    assert [cue.start for cue in cues] == [0, 0.94, third_onset, 0.99]
+
+
+def test_frame_horizon_uses_the_render_clock_not_decimal_float_noise() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("ab", 0, 109 / 150, "a"),
+            SpokenToken("c", 109 / 150, 23 / 30, "a"),
+            SpokenToken("de", 23 / 30, 0.9, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=4, frame_rate=30, reset_lookahead_frames=2),
+    )
+    assert [cue.text for cue in cues] == ["ab", "c", "cde"]
+    assert [cue.start for cue in cues] == [0, 0.7266666666666667, 0.7666666666666667]
+
+
+def test_rewind_does_not_count_float_noise_as_an_extra_visible_frame() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("ab", 0, 0.71, "a"),
+            SpokenToken("c", 0.71, 23 / 30, "a"),
+            SpokenToken("d", 23 / 30, 0.79, "a"),
+            SpokenToken("e", 0.79, 0.9, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=4, frame_rate=30, reset_lookahead_frames=2),
+    )
+    assert [cue.text for cue in cues] == ["ab", "c", "cd", "cde"]
+    assert [cue.start for cue in cues] == [0, 0.71, 0.7666666666666667, 0.79]
+
+
+def test_real_subframe_time_after_the_horizon_is_not_pulled_back() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("ab", 0, 109 / 150, "a"),
+            SpokenToken("c", 109 / 150, 0.7667, "a"),
+            SpokenToken("de", 0.7667, 0.9, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=4, frame_rate=30, reset_lookahead_frames=2),
+    )
+    assert [cue.text for cue in cues] == ["ab", "abc", "de"]
+
+
+def test_frame_rewind_cannot_expand_the_character_budget() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("aa", 0.94, 0.95, "a"),
+            SpokenToken("bb", 0.95, 0.99, "a"),
+            SpokenToken("cc", 0.99, 1.1, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=4, frame_rate=30, reset_lookahead_frames=2),
+    )
+    assert [cue.text for cue in cues] == ["aa", "aabb", "cc"]
+
+
+@pytest.mark.parametrize("lookahead", [0, 31, True])
+def test_reset_lookahead_is_bounded_integer(lookahead: int) -> None:
+    with pytest.raises(ValueError, match="Invalid caption reset lookahead"):
+        CaptionPolicy(frame_rate=30, reset_lookahead_frames=lookahead)
+
+
+def test_reset_lookahead_requires_a_frame_rate() -> None:
+    with pytest.raises(ValueError, match="Invalid caption reset lookahead"):
+        CaptionPolicy(reset_lookahead_frames=2)
+
+
+def test_frame_budget_preserves_short_word_before_lifetime_reset() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("A", 0.19, 1.973, "a"),
+            SpokenToken("B", 1.973, 1.993, "a"),
+            SpokenToken("C", 1.993, 2.1, "a"),
+        ),
+        policy=CaptionPolicy(maximum_context_seconds=1.8, frame_rate=30),
+    )
+    assert [cue.text for cue in cues] == ["A", "B", "BC"]
+    assert [cue.start for cue in cues] == [0.19, 1.973, 1.993]
+    assert [cue.text for cue in cues if cue.start <= 2 < cue.end] == ["BC"]
+
+
+@pytest.mark.parametrize(
+    "following", [SpokenToken("C", 0.99, 1.1, "b"), SpokenToken("CDEF", 0.99, 1.1, "a")]
+)
+def test_frame_budget_does_not_bridge_ownership_or_oversized_pair(following: SpokenToken) -> None:
+    cues = make_captions(
+        (SpokenToken("AA", 0, 0.98, "a"), SpokenToken("B", 0.98, 0.99, "a"), following),
+        policy=CaptionPolicy(maximum_characters=4, frame_rate=30),
+    )
+    assert [cue.text for cue in cues[:2]] == ["AA", "AAB"]
+    assert cues[-1].text == following.text
+
+
+def test_frame_budget_does_not_bridge_sentence_end() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("A", 0, 0.98, "a"),
+            SpokenToken("B!", 0.98, 0.99, "a"),
+            SpokenToken("C", 0.99, 1.1, "a"),
+        ),
+        policy=CaptionPolicy(frame_rate=30),
+    )
+    assert [cue.text for cue in cues] == ["A", "AB!", "C"]
+
+
+@pytest.mark.parametrize("frame_rate", [0, 121, True])
+def test_frame_rate_is_bounded_integer(frame_rate: int) -> None:
+    with pytest.raises(ValueError, match="Invalid caption frame rate"):
+        CaptionPolicy(frame_rate=frame_rate)
+
+
 def test_time_budget_resets_even_when_speech_is_continuous() -> None:
     assert make_captions(
         (SpokenToken("前", 0, 0.5, "a"), SpokenToken("次", 0.5, 1, "a")),
@@ -128,7 +307,14 @@ def test_overlap_chunk_ownership_is_half_open_not_global_text_deduplication() ->
         (SpokenToken("後", 1, 2, "a"), SpokenToken("前", 0, 0.5, "a")),
         (SpokenToken("重複", 0, 1, "a"), SpokenToken("曖昧", 0, 1, "a")),
         (SpokenToken("長すぎる未分割の文章", 0, 5, "a"),),
-        (SpokenToken("あ" * 37, 0, 1, "a"),),
+        (
+            SpokenToken(
+                "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆ",
+                0,
+                1,
+                "a",
+            ),
+        ),
         (SpokenToken("一、二、三。", 0, 1, "a"),),
     ],
 )
@@ -190,6 +376,25 @@ def test_held_note_run_is_not_captioned() -> None:
     assert (cues[0].start, cues[1].start) == (0.0, 3.2)
 
 
+def test_recognizer_repetition_loops_are_not_captioned() -> None:
+    tokens = (
+        SpokenToken("こんにちは", 0.0, 0.8, "a:quiet-cuts-0-0"),
+        SpokenToken("ッハ" * 19, 1.0, 1.02, "a:quiet-cuts-0-0"),
+        SpokenToken("F" * 54, 1.5, 1.9, "a:quiet-cuts-0-0"),
+        SpokenToken("次です", 3.2, 4.0, "a:quiet-cuts-0-0"),
+    )
+
+    cues = make_captions(tokens)
+
+    assert [cue.text for cue in cues] == ["こんにちは", "次です"]
+
+
+def test_short_repeated_laughter_is_still_captioned() -> None:
+    tokens = (SpokenToken("ハハハ", 0.0, 0.7, "a:quiet-cuts-0-0"),)
+
+    assert [cue.text for cue in make_captions(tokens)] == ["ハハハ"]
+
+
 def test_prolonged_mark_inside_a_word_is_captioned() -> None:
     tokens = (SpokenToken("コーヒー", 0.0, 0.7, "a:quiet-cuts-0-0"),)
 
@@ -201,3 +406,260 @@ def test_word_widened_by_marks_beyond_the_budget_is_still_rejected() -> None:
 
     with pytest.raises(ValueError, match="exceeds display budget"):
         make_captions(tokens, policy=CaptionPolicy(maximum_characters=18, maximum_lines=1))
+
+
+def test_rolling_width_keeps_recent_complete_words_instead_of_a_lone_particle() -> None:
+    tokens = (
+        SpokenToken("あさって", 0, 0.5, "owner"),
+        SpokenToken("あさって", 0.5, 1, "owner"),
+        SpokenToken("じゃない", 1, 1.2, "owner"),
+        SpokenToken("って", 1.2, 1.5, "owner"),
+    )
+    cues = make_captions(
+        tokens, policy=CaptionPolicy(maximum_characters=12, retain_recent_words=True)
+    )
+    assert tuple(cue.text for cue in cues) == (
+        "あさって",
+        "あさってあさって",
+        "あさってじゃない",
+        "あさってじゃないって",
+    )
+    assert cues[-1] == CaptionCue("あさってじゃないって", 1.2, 1.58)
+
+
+def test_rolling_context_discards_expired_words_without_clearing_recent_words() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("甲", 0, 0.25, "owner"),
+            SpokenToken("乙", 0.25, 0.5, "owner"),
+            SpokenToken("丙", 0.5, 0.75, "owner"),
+        ),
+        policy=CaptionPolicy(maximum_context_seconds=0.5, retain_recent_words=True),
+    )
+    assert tuple(cue.text for cue in cues) == ("甲", "甲乙", "乙丙")
+
+
+def test_rolling_context_respects_line_budget_and_hard_ownership_boundary() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("第一、", 0, 0.2, "owner"),
+            SpokenToken("第二、", 0.2, 0.4, "owner"),
+            SpokenToken("第三", 0.4, 0.6, "owner"),
+            SpokenToken("新しい話", 0.6, 0.8, "next-owner"),
+        ),
+        policy=CaptionPolicy(retain_recent_words=True),
+    )
+    assert tuple(cue.text for cue in cues) == (
+        "第一、",
+        "第一、\n第二、",
+        "第二、\n第三",
+        "新しい話",
+    )
+
+
+def test_uncertain_region_is_blank_without_placeholder_or_context_carry() -> None:
+    tokens = (
+        SpokenToken("前", 0, 0.5, "same"),
+        SpokenToken("不確かな認識", 0.51, 0.55, "same"),
+        SpokenToken("後", 0.56, 0.9, "same"),
+    )
+    assert make_captions(tokens, excluded_regions=((0.5, 0.56),)) == (
+        CaptionCue("前", 0, 0.5),
+        CaptionCue("後", 0.56, 0.98),
+    )
+    assert tokens[1] == SpokenToken("不確かな認識", 0.51, 0.55, "same")
+
+
+def test_uncertain_coarse_interval_is_not_split_into_invented_words() -> None:
+    assert make_captions((SpokenToken("不確か", 1, 7, "owner"),), excluded_regions=((1, 7),)) == ()
+    with pytest.raises(ValueError, match="too coarse"):
+        make_captions((SpokenToken("不確か", 1, 7, "owner"),))
+
+
+def test_exclusion_does_not_clip_a_partially_supported_recognized_word() -> None:
+    assert make_captions(
+        (SpokenToken("重なる語", 0, 1, "owner"), SpokenToken("次", 2, 2.5, "owner")),
+        excluded_regions=((0.5, 1.5),),
+    ) == (CaptionCue("次", 2, 2.58),)
+
+
+def test_multiple_excluded_regions_preserve_boundary_ownership_and_tail() -> None:
+    assert make_captions(
+        (
+            SpokenToken("甲", 0, 0.25, "owner"),
+            SpokenToken("乙", 0.5, 0.75, "owner"),
+            SpokenToken("丙", 1, 1.25, "owner"),
+        ),
+        excluded_regions=((0.25, 0.5), (0.75, 1)),
+    ) == (
+        CaptionCue("甲", 0, 0.25),
+        CaptionCue("乙", 0.5, 0.75),
+        CaptionCue("丙", 1, 1.33),
+    )
+
+
+@pytest.mark.parametrize(
+    "regions",
+    [
+        ((-1.0, 1.0),),
+        ((0.0, 0.0),),
+        ((0.0, math.inf),),
+        ((math.nan, 1.0),),
+        ((False, 1.0),),
+        ((0.0, True),),
+        ((0.0, 86401.0),),
+        ((0.0, 2.0), (1.0, 3.0)),
+        ((2.0, 3.0), (0.0, 1.0)),
+    ],
+)
+def test_excluded_regions_validate_evidence_bounds(
+    regions: tuple[tuple[float, float], ...],
+) -> None:
+    with pytest.raises(ValueError, match="excluded caption regions"):
+        make_captions((), excluded_regions=regions)
+
+
+def test_exclusion_budget_and_unsorted_tokens_still_fail() -> None:
+    with pytest.raises(ValueError, match="region budget"):
+        make_captions((), excluded_regions=((0.0, 1.0),) * 100001)
+    with pytest.raises(ValueError, match="not ordered"):
+        make_captions(
+            (SpokenToken("後", 2, 3, "a"), SpokenToken("前", 0, 1, "a")),
+            excluded_regions=((0, 1),),
+        )
+
+
+def test_trailing_particle_stays_with_its_words_instead_of_switching_alone() -> None:
+    cues = make_captions(
+        (
+            SpokenToken("今日は", 0, 0.3, "a"),
+            SpokenToken("楽しかった", 0.3, 0.8, "a"),
+            SpokenToken("よ", 0.95, 1.1, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=8),
+    )
+    assert cues == (
+        CaptionCue("今日は", 0, 0.3),
+        CaptionCue("楽しかった", 0.3, 0.95),
+        CaptionCue("楽しかったよ", 0.95, 1.1800000000000002),
+    )
+
+
+def test_particle_tail_bridges_a_short_pause_but_not_a_long_one() -> None:
+    assert make_captions(
+        (SpokenToken("そうだ", 0, 0.3, "a"), SpokenToken("よね", 0.5, 0.7, "a"))
+    ) == (CaptionCue("そうだ", 0, 0.5), CaptionCue("そうだよね", 0.5, 0.7799999999999999))
+    assert make_captions(
+        (SpokenToken("そうだ", 0, 0.3, "a"), SpokenToken("よね", 0.6, 0.8, "a"))
+    ) == (CaptionCue("そうだ", 0, 0.38), CaptionCue("よね", 0.6, 0.88))
+
+
+def test_fragmented_word_attaches_only_its_end_and_sentence_end_is_not_a_tail() -> None:
+    fragments = make_captions(
+        (
+            SpokenToken("今日", 0, 0.2, "a"),
+            SpokenToken("あり", 0.2, 0.3, "a"),
+            SpokenToken("がと", 0.3, 0.4, "a"),
+        ),
+        policy=CaptionPolicy(maximum_characters=4),
+    )
+    assert tuple(cue.text for cue in fragments) == ("今日", "あり", "ありがと")
+    sentence = make_captions(
+        (SpokenToken("終わり。", 0, 0.3, "a"), SpokenToken("ね", 0.3, 0.4, "a"))
+    )
+    assert tuple(cue.text for cue in sentence) == ("終わり。", "ね")
+    other_speaker = make_captions(
+        (SpokenToken("本当", 0, 0.3, "a"), SpokenToken("よ", 0.3, 0.4, "b"))
+    )
+    assert tuple(cue.text for cue in other_speaker) == ("本当", "よ")
+
+
+def test_tail_overrun_is_opt_in_for_renderers_that_wrap_evenly() -> None:
+    tokens = (
+        SpokenToken("気づいたんじゃないの", 0, 0.8, "a"),
+        SpokenToken("かな?", 0.8, 1.1, "a"),
+    )
+    assert tuple(
+        cue.text for cue in make_captions(tokens, policy=CaptionPolicy(maximum_characters=12))
+    ) == ("気づいたんじゃないの", "かな?")
+    assert tuple(
+        cue.text
+        for cue in make_captions(
+            tokens, policy=CaptionPolicy(maximum_characters=12, tail_overrun=True)
+        )
+    ) == ("気づいたんじゃないの", "気づいたんじゃないのかな?")
+    split_tail = (
+        SpokenToken("気づいたんじゃない", 0, 0.6, "a"),
+        SpokenToken("の", 0.6, 0.8, "a"),
+        SpokenToken("かな?", 0.8, 1.1, "a"),
+    )
+    assert tuple(
+        cue.text
+        for cue in make_captions(
+            split_tail, policy=CaptionPolicy(maximum_characters=12, tail_overrun=True)
+        )
+    ) == ("気づいたんじゃない", "気づいたんじゃないの", "気づいたんじゃないのかな?")
+
+
+def test_particle_after_a_comma_starts_the_next_caption() -> None:
+    assert tuple(
+        cue.text
+        for cue in make_captions(
+            (SpokenToken("そうだ、", 0, 0.3, "a"), SpokenToken("ね", 0.3, 0.4, "a")),
+            policy=CaptionPolicy(maximum_characters=4, tail_overrun=True),
+        )
+    ) == ("そうだ、", "ね")
+
+
+def test_scoped_policy_requires_complete_callback_contract() -> None:
+    with pytest.raises(ValueError, match="Scoped caption fitting"):
+        CaptionPolicy(scoped_layout=lambda text, context: text)
+
+
+def test_lexical_provenance_retains_following_punctuation_without_retiming() -> None:
+    from replay.caption_timing import lexical_token_sources
+
+    words, indices = lexical_token_sources(
+        (
+            SpokenToken("珍", 0, 0.2, "u"),
+            SpokenToken("しい", 0.2, 0.4, "u"),
+            SpokenToken("…", 0.4, 0.5, "u"),
+            SpokenToken("ー", 1, 1.2, "other"),
+            SpokenToken("次", 2, 2.2, "other"),
+        ),
+        word_mark_gap=0.25,
+    )
+    assert words == [
+        SpokenToken("珍", 0, 0.2, "u"),
+        SpokenToken("しい…", 0.2, 0.4, "u"),
+        SpokenToken("次", 2, 2.2, "other"),
+    ]
+    assert indices == [(0,), (1, 2), (4,)]
+
+
+def test_scoped_final_layout_receives_each_real_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "replay.caption_linguistics._atomic_ends", lambda text: frozenset({len(text)})
+    )
+    calls: list[tuple[str, tuple[SpokenToken, ...]]] = []
+
+    def scoped(text: str, context: tuple[SpokenToken, ...]) -> str:
+        calls.append((text, context))
+        return text
+
+    cues = make_captions(
+        (SpokenToken("語", 0, 0.2, "one"), SpokenToken("語", 2, 2.3, "two")),
+        policy=CaptionPolicy(
+            linguistic_boundaries=True,
+            measured_layout=lambda text: text,
+            scoped_layout=scoped,
+            scoped_indivisible=lambda text, context: False,
+        ),
+    )
+    assert tuple(cue.start for cue in cues) == (0, 2)
+    assert calls[-2:] == [
+        ("語", (SpokenToken("語", 0, 0.2, "one"),)),
+        ("語", (SpokenToken("語", 2, 2.3, "two"),)),
+    ]

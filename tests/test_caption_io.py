@@ -70,6 +70,23 @@ def test_speech_boundary_types_and_budgets_are_validated(measurement: object) ->
         speech_tokens(response(measurement), utterance="one")
 
 
+def test_raw_native_ocr_is_not_an_executor_success_receipt() -> None:
+    raw = [
+        {
+            "width": 64,
+            "height": 64,
+            "requestedTimeSeconds": 1,
+            "actualTimeSeconds": 0.9,
+            "lines": [],
+        }
+    ]
+    assert caption_io.native_ocr_frames(raw) == (caption_io.FrameObservation(1, 0.9, 64, 64, ()),)
+    with pytest.raises(ValueError):
+        ocr_frames(raw)
+    with pytest.raises(ValueError):
+        caption_io.native_ocr_frames(response(raw))
+
+
 def test_ocr_retains_actual_and_requested_times_and_global_coordinates() -> None:
     result = ocr_frames(
         response(
@@ -361,6 +378,39 @@ def test_mlx_preserves_finer_word_clocks_without_clamping_to_coarse_segments() -
         duration=2,
     )
     assert groups[0].spoken_token() == SpokenToken("次", 0.9, 1.2, "mlx:0")
+
+
+def test_mlx_wordless_punctuation_segment_is_not_speech() -> None:
+    groups = mlx_groups(
+        {
+            "language": "ja",
+            "text": "次、",
+            "segments": [
+                {
+                    "start": 0,
+                    "end": 1,
+                    "text": "次",
+                    "words": [{"word": "次", "start": 0.1, "end": 0.5, "probability": 0.8}],
+                },
+                {"start": 1, "end": 1.2, "text": "、", "words": []},
+            ],
+        },
+        duration=2,
+    )
+    assert groups[0].spoken_token() == SpokenToken("次", 0.1, 0.5, "mlx:0")
+    assert len(groups) == 1
+
+
+def test_mlx_transcript_text_must_match_its_segments() -> None:
+    with pytest.raises(ValueError, match="segments do not conserve"):
+        mlx_groups(
+            {
+                "language": "ja",
+                "text": "次と",
+                "segments": [{"start": 1, "end": 1.2, "text": "、", "words": []}],
+            },
+            duration=2,
+        )
 
 
 def test_mlx_text_budget_is_not_truncated() -> None:
