@@ -1,0 +1,27 @@
+{
+  "name": "transcript-viewer-web",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "tsc": "tsc",
+    "lint": "biome check",
+    "format": "biome format --write",
+    "test": "vitest run --coverage",
+    "sync": "bun src/bin/sync.ts",
+    "deploy": "bun src/bin/deploy.ts",
+    "debug": "bun src/bin/debug.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "26.6.5",
+    "@vitest/coverage-v8": "5.0.4",
+    "cf": "1.0.0-beta.16",
+    "typescript": "7.0.2",
+    "vitest": "5.0.4",
+    "wrangler": "4.150.0"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  },
+  "type": "module"
+}

@@ -1,0 +1,29 @@
+# Secrets and credentials (never commit)
+secrets.json
+credentials.txt
+deploy.env
+.debug-cookies
+sync.config.json
+
+# Private data generated from recordings and local state
+data/
+data.next/
+proxies/
+sync-state.json
+upload-state.json
+*.log
+*.launch
+*.status
+tmux.sock
+
+# Tooling, caches and temporary deploy directories
+node_modules/
+.cloudflare/
+.wrangler/
+cache/
+tmp/
+uploader/
+coverage/
+
+# The repository ignores MPEG-TS video (*.ts); this directory holds TypeScript sources.
+!*.ts

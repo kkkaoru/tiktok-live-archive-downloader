@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2064%2064%22%3E%3Ccircle%20cx=%2232%22%20cy=%2232%22%20r=%2231%22%20fill=%22%23bfe6fb%22/%3E%3Cellipse%20cx=%2214%22%20cy=%2246%22%20rx=%227%22%20ry=%224%22%20fill=%22%23cfd8e0%22%20transform=%22rotate%28-25%2014%2046%29%22/%3E%3Cellipse%20cx=%2250%22%20cy=%2246%22%20rx=%227%22%20ry=%224%22%20fill=%22%23cfd8e0%22%20transform=%22rotate%2825%2050%2046%29%22/%3E%3Cellipse%20cx=%2232%22%20cy=%2238%22%20rx=%2222%22%20ry=%2219%22%20fill=%22%23eef2f6%22/%3E%3Ccircle%20cx=%2223%22%20cy=%2233%22%20r=%223.2%22%20fill=%22%231d2430%22/%3E%3Ccircle%20cx=%2241%22%20cy=%2233%22%20r=%223.2%22%20fill=%22%231d2430%22/%3E%3Ccircle%20cx=%2224%22%20cy=%2232%22%20r=%221%22%20fill=%22%23fff%22/%3E%3Ccircle%20cx=%2242%22%20cy=%2232%22%20r=%221%22%20fill=%22%23fff%22/%3E%3Cellipse%20cx=%2232%22%20cy=%2240%22%20rx=%224.5%22%20ry=%223.2%22%20fill=%22%231d2430%22/%3E%3Cellipse%20cx=%2218%22%20cy=%2241%22%20rx=%223%22%20ry=%222%22%20fill=%22%23f7b6c4%22/%3E%3Cellipse%20cx=%2246%22%20cy=%2241%22%20rx=%223%22%20ry=%222%22%20fill=%22%23f7b6c4%22/%3E%3Cg%20stroke=%22%238b97a6%22%20stroke-width=%221%22%20stroke-linecap=%22round%22%3E%3Cpath%20d=%22M24%2043%20L14%2041%22/%3E%3Cpath%20d=%22M24%2045%20L14%2046%22/%3E%3Cpath%20d=%22M40%2043%20L50%2041%22/%3E%3Cpath%20d=%22M40%2045%20L50%2046%22/%3E%3C/g%3E%3Cpath%20d=%22M28%2044%20Q32%2048%2036%2044%22%20stroke=%22%231d2430%22%20stroke-width=%221.4%22%20fill=%22none%22%20stroke-linecap=%22round%22/%3E%3C/svg%3E">
+<meta name="color-scheme" content="dark">
+<title>TranscriptViewer Web</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@100..900&display=swap">
+<script>try { const t = localStorage.getItem("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
+<script>window.__catalog = fetch("/api/catalog").then(r => r.json());</script>
+<style>
+  :root { color-scheme: dark; --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --line:#2a2f3a; --text:#e8eaed; --muted:#9aa3b2; --accent:#6ea8ff; --accent-bg:#1f3a63; --on-accent:#fff; --bar:#4a5468; --playhead:#fff; --radius:10px;
+    --tk:#ff7aa8; --tk-line:#6b2a44; --tk-bg:#2a141d; --yt:#ff8a80; --yt-line:#6b2a2a; --yt-bg:#2a1515; --sm:#8ee6a8; --sm-line:#27573a; --sm-bg:#13251a; --err:#ff8a8a; }
+  :root[data-theme="light"] { color-scheme: light; --bg:#e4f2fb; --panel:#f4fafe; --panel2:#dcecf7; --line:#bcd6e8; --text:#1b1f27; --muted:#5b6575; --accent:#1a5fd0; --accent-bg:#dbe7fb; --on-accent:#0b1f45; --bar:#9aa6bb; --playhead:#1b1f27;
+    --tk:#b3194f; --tk-line:#f0b5c9; --tk-bg:#fdeaf1; --yt:#b3261e; --yt-line:#f0bdb8; --yt-bg:#fdecea; --sm:#1b6b3a; --sm-line:#b4dfc3; --sm-bg:#e7f6ed; --err:#b3261e; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme]) { color-scheme: light; --bg:#e4f2fb; --panel:#f4fafe; --panel2:#dcecf7; --line:#bcd6e8; --text:#1b1f27; --muted:#5b6575; --accent:#1a5fd0; --accent-bg:#dbe7fb; --on-accent:#0b1f45; --bar:#9aa6bb; --playhead:#1b1f27;
+    --tk:#b3194f; --tk-line:#f0b5c9; --tk-bg:#fdeaf1; --yt:#b3261e; --yt-line:#f0bdb8; --yt-bg:#fdecea; --sm:#1b6b3a; --sm-line:#b4dfc3; --sm-bg:#e7f6ed; --err:#b3261e; } }
+  * { box-sizing:border-box; }
+  body { margin:0;  font:15px/2 "Noto Sans JP",system-ui,-apple-system,"Hiragino Sans",sans-serif; background:var(--bg); color:var(--text); }
+  header { height:56px; padding:0 16px; border-bottom:1px solid var(--line); background:var(--panel); display:flex; gap:12px; align-items:center; }
+  #hsearch { flex:1; display:flex; gap:8px; min-width:0; }
+  #hsearch input { flex:1; min-width:0; max-width:none; padding-left:1em; }
+  .mobile-only { display:none; }
+  header a { color:var(--muted); font-size:13px; text-decoration:none; white-space:nowrap; }
+  header a:hover { color:var(--text); }
+  main { display:flex; height:calc(100dvh - 56px); }
+  #list { width:340px; min-width:260px; overflow-y:auto; border-right:1px solid var(--line); background:var(--panel); overscroll-behavior:contain; }
+  .vitem { padding:10px 14px; cursor:pointer; border-bottom:1px solid var(--line); border-left:3px solid transparent; content-visibility:auto; contain-intrinsic-size:auto 64px; }
+  .vitem:hover { background:var(--panel2); }
+  .vitem.sel { background:var(--accent-bg); border-left-color:var(--accent); }
+  .vitem .d { font-variant-numeric:tabular-nums; font-size:13px; color:var(--accent); }
+  .vitem .t { color:var(--text); font-size:13px; overflow-wrap:anywhere; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .tag { display:inline-block; font-size:11px; line-height:2; padding:0 8px; border-radius:999px; margin-right:6px; font-weight:600; vertical-align:middle; border:1px solid transparent; }
+  .tag.tiktok { color:var(--tk); border-color:var(--tk-line); background:var(--tk-bg); }
+  .tag.youtube { color:var(--yt); border-color:var(--yt-line); background:var(--yt-bg); }
+  .tag .ico { width:1.1em; height:1.1em; vertical-align:-0.2em; margin-right:.35em; }
+  .tag.other { color:var(--muted); border-color:var(--line); }
+  .tag.sum { color:var(--sm); border-color:var(--sm-line); background:var(--sm-bg); }
+  #streamersPage { padding:20px 16px; max-width:960px; margin:0 auto; }
+  #streamerGrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px; }
+  a.scard { display:block; padding:14px 16px; border:1px solid var(--line); border-radius:var(--radius); background:var(--panel); color:var(--text); text-decoration:none; }
+  a.scard:hover { border-color:var(--accent); }
+  a.scard:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  a.scard .name { font-weight:700; font-size:17px; }
+  a.scard .meta { color:var(--muted); font-size:13px; }
+  body[data-page="streamers"] main, body[data-page="streamers"] #backBtn { display:none; }
+  body:not([data-page="streamers"]) #streamersPage { display:none; }
+  #crumbs { padding:6px 14px; border-bottom:1px solid var(--line); font-size:13px; color:var(--muted); }
+  #crumbs a { color:var(--accent); text-decoration:none; }
+  .tag.streamer { color:var(--accent); border-color:var(--accent); background:var(--accent-bg); }
+  #calendar { padding:8px 12px 10px; border-bottom:1px solid var(--line); }
+  .cal-head { display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:4px; font-weight:700; }
+  .cal-head button { padding:0 10px; min-height:32px; }
+  .cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:2px; text-align:center; }
+  .cal-dow { font-size:11px; color:var(--muted); line-height:1.6; }
+  .cal-grid .cal-day { padding:0; min-height:34px; line-height:34px; border:1px solid transparent; background:transparent; color:var(--muted); font-size:13px; font-variant-numeric:tabular-nums; position:relative; }
+  .cal-grid .cal-day:disabled { opacity:.45; cursor:default; }
+  .cal-grid .cal-day.has { color:var(--text); font-weight:700; background:var(--accent-bg); border-color:var(--accent); }
+  .cal-grid .cal-day.sel { background:var(--accent); color:#fff; }
+  .cal-grid .cal-day.today { outline:1px dashed var(--muted); outline-offset:-3px; }
+  .cal-note { font-size:12px; color:var(--muted); margin-top:4px; display:flex; justify-content:space-between; gap:8px; align-items:center; }
+  .cal-note button { padding:0 10px; min-height:28px; font-size:12px; }
+  #filters { display:flex; gap:6px; padding:10px 12px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--panel); z-index:1; }
+  #filters button { padding:4px 10px; border-radius:999px; font-size:13px; }
+  #filters button .ico { width:1em; height:1em; vertical-align:-0.15em; }
+  #filters button.on { background:var(--accent-bg); border-color:var(--accent); color:var(--on-accent); }
+  .hit { display:flex !important; gap:12px; align-items:flex-start; content-visibility:auto; contain-intrinsic-size:auto 96px; }
+  .hit .thumb { flex:none; width:160px; height:96px; background:#0b0d12; border-radius:6px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
+  .hit .thumb canvas { max-width:100%; max-height:100%; width:auto; height:auto; border-radius:0; cursor:inherit; background:none; }
+  .hit .meta { min-width:0; }
+  .hit .meta .when { color:var(--accent); font-size:12px; font-variant-numeric:tabular-nums; }
+  #detail { flex:1; overflow-y:auto; padding:20px; min-width:0; }
+  #detail > * { max-width:960px; margin-inline:auto; }
+  #empty { color:var(--muted); text-align:center; margin-top:20vh; }
+  h2 { font-size:18px; margin:0 0 12px; }
+  h3 { font-size:14px; color:var(--muted); margin:22px 0 8px; font-weight:600; }
+  video { display:block; width:100%; aspect-ratio:16/9; max-height:56dvh; background:#000; border-radius:var(--radius); }
+  button, input { line-height:inherit; }
+  button, input[type=text], input[type=search] { font:inherit; line-height:inherit; font-size:14px; padding:7px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel2); color:var(--text); cursor:pointer; }
+  button:hover { border-color:#3b4252; }
+  button:focus-visible, input:focus-visible, .vitem:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  input[type=text], input[type=search] { cursor:text; }
+  .seg { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:12px; color:var(--muted); font-size:13px; }
+  .seg button.on { background:var(--accent-bg); border-color:var(--accent); color:var(--on-accent); }
+  #cur { font-size:24px; min-height:68px; margin:8px 0 2px; }
+  #curTime { color:var(--muted); font-variant-numeric:tabular-nums; min-height:22px; }
+  input[type=range] { width:100%; height:32px; accent-color:var(--accent); }
+  #nearby { display:flex; gap:8px; overflow-x:auto; padding:6px 0; min-height:96px; }
+  .near { min-width:280px; max-width:360px; text-align:left; white-space:normal; flex:none; }
+  .near.sel { border-color:var(--accent); background:var(--accent-bg); }
+  #utts { border:1px solid var(--line); border-radius:var(--radius); overflow:hidden; }
+  .utt { display:flex; gap:14px; padding:9px 12px; cursor:pointer; width:100%; text-align:left; background:none; border:none; border-bottom:1px solid var(--line); border-radius:0; color:var(--text); content-visibility:auto; contain-intrinsic-size:auto 44px; }
+  .utt:hover { background:var(--panel2); } .utt.sel { background:var(--accent-bg); }
+  .utt .ts { font-variant-numeric:tabular-nums; color:var(--accent); white-space:nowrap; }
+  .tab { display:none; } .tab.on { display:block; }
+  dialog { background:var(--panel); color:var(--text); width:min(760px,92vw); max-height:84dvh; border:1px solid var(--line); border-radius:14px; }
+  dialog::backdrop { background:rgba(0,0,0,.6); }
+  .hit { display:block; width:100%; text-align:left; margin:4px 0; white-space:normal; }
+  .sect { margin:14px 0; padding:12px 14px; border:1px solid var(--line); border-radius:var(--radius); background:var(--panel); }
+  .sect p { margin:8px 0 0; } .sect button { font-variant-numeric:tabular-nums; }
+  canvas { width:100%; height:28px; display:block; background:var(--panel2); border-radius:6px; cursor:pointer; }
+  .note { color:var(--muted); font-size:13px; }
+  @media (max-width: 760px) {
+    header { padding:0 12px; gap:8px; } header a { display:none; }
+    .mobile-only { display:inline-block; } body[data-view="list"] #backBtn { display:none; }
+    main { flex-direction:column; height:calc(100dvh - 56px); }
+    body[data-view="player"] #list, body:not([data-view="player"]) #detail { display:none; }
+    #list { width:auto; min-width:0; flex:1; border-right:none; }
+    #detail { overflow-y:auto; padding:12px; }
+    #cur { font-size:19px; min-height:54px; }
+    .near { min-width:230px; }
+    button, input[type=text] { min-height:44px; }
+    video { max-height:40dvh; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior:auto !important; } }
+</style>
+</head>
+<body data-view="list">
+<header>
+  <button id="backBtn" class="mobile-only" aria-label="一覧へ戻る">←</button>
+  <form id="hsearch" role="search"><input id="q" type="search" placeholder="文字起こし・要約を検索（すべての動画）" autocomplete="off" aria-label="検索"><button>検索</button></form>
+  <a id="adminLink" href="/admin" hidden>許可管理</a>
+  <button id="settingsBtn" aria-label="設定">設定</button>
+  <a href="/auth/logout">ログアウト</a>
+</header>
+<section id="streamersPage" aria-label="配信者一覧"><h2>配信者</h2><div id="streamerGrid"></div></section>
+<main>
+  <div id="listWrap" style="display:contents">
+  <nav id="list" aria-label="動画一覧"><div id="crumbs"><a href="/streamers" id="crumbHome">配信者一覧</a><span aria-hidden="true"> / </span><span id="crumbName"></span></div><div id="calendar" aria-label="日付で絞り込み"></div><div id="filters" role="group" aria-label="種別で絞り込み"></div><div id="items"></div></nav>
+  </div>
+  <section id="detail">
+    <p id="empty">左の一覧から動画を選んでください</p>
+    <div id="player" hidden>
+      <h2 id="title"></h2><div id="titleTags"></div>
+      <video id="video" controls preload="metadata" playsinline></video>
+      <div class="seg" role="group" aria-label="素材の切り替え">
+        素材:
+        <button id="srcEdited" class="on">編集済み</button><button id="srcOriginal">元動画</button>
+        <span class="note" id="srcNote"></span>
+      </div>
+      <h3>タイムライン</h3>
+      <div id="cur">発話なし</div><div id="curTime"></div>
+      <input id="seek" type="range" min="0" max="0" step="0.1" value="0" aria-label="再生位置">
+      <canvas id="bar" width="1200" height="28"></canvas>
+      <div id="nearby" aria-label="付近の発話"></div>
+      <div class="seg" role="group" aria-label="表示内容">
+        <button id="tabSumBtn">要約</button><button id="tabUttBtn" class="on">認識結果</button>
+      </div>
+      <div id="tabSummary" class="tab"></div>
+      <div id="tabUtter" class="tab on"><div id="utts"></div></div>
+    </div>
+  </section>
+</main>
+<dialog id="searchDlg">
+  <form method="dialog"><button style="float:right">閉じる</button></form>
+  <h3 id="searchHeading">検索</h3>
+  <div class="seg" role="group" aria-label="検索対象">
+    検索対象:
+    <label><input type="radio" name="mode" value="transcript" checked> 文字起こし</label>
+    <label><input type="radio" name="mode" value="summary"> 要約</label>
+    <label><input type="radio" name="mode" value="both"> 文字起こしと要約</label>
+  </div>
+  <div class="seg" role="group" aria-label="検索範囲">
+    範囲:
+    <label><input type="radio" name="scope" value="current"> この動画</label>
+    <label><input type="radio" name="scope" value="all" checked> すべての動画</label>
+  </div>
+  <p id="searchStatus" class="note"></p>
+  <div id="hits"></div>
+</dialog>
+<dialog id="settingsDlg">
+  <form method="dialog"><button style="float:right">閉じる</button></form>
+  <h3>設定</h3>
+  <fieldset style="border:1px solid var(--line);border-radius:8px">
+    <legend class="note">テーマ</legend>
+    <label><input type="radio" name="theme" value="auto" checked> 自動（端末の設定に従う）</label><br>
+    <label><input type="radio" name="theme" value="light"> ノーマル（ライト）</label><br>
+    <label><input type="radio" name="theme" value="dark"> ダークモード</label>
+  </fieldset>
+</dialog>
+<script>
+const $ = s => document.querySelector(s);
+const state = { date: "", month: null, navs: 0, streamer: "", filter: "all", videos: [], current: null, data: new Map(), utterances: [], curIdx: -2, source: "edited" };
+const fmt = s => { s = Math.max(0, Math.floor(s)); const h = s/3600|0, m = s%3600/60|0, r = s%60;
+  return `${h}時間${m}分${r}秒`; };
+
+// Same merge as CueTimeline.utterances: cumulative captions collapse to the final text.
+function utterancesFrom(cues) {
+  const out = [];
+  for (const cue of cues) {
+    const last = out[out.length - 1];
+    if (last && cue.start <= last.end + 1.5 && last.text && cue.text.startsWith(last.text)) {
+      out[out.length - 1] = { ...last, end: Math.max(last.end, cue.end), endLabel: cue.endLabel, text: cue.text };
+    } else out.push({ ...cue });
+  }
+  return out;
+}
+// Same lookup as CueTimeline.index.
+function indexAt(sec, cues) {
+  if (!cues.length || sec < cues[0].start) return -1;
+  let lo = 0, hi = cues.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (cues[mid].start <= sec) lo = mid + 1; else hi = mid; }
+  const i = lo - 1, cue = cues[i];
+  return (sec < cue.end || (i === cues.length - 1 && sec === cue.end)) ? i : -1;
+}
+async function getData(id) {
+  if (!state.data.has(id)) state.data.set(id, fetch(`/api/videos/${id}.json`).then(r => r.json()));
+  return state.data.get(id);
+}
+const streamerOf = v => v.streamer;
+const videosOf = name => state.videos.filter(v => streamerOf(v) === name);
+const dateOf = v => (v.broadcastStartJST ?? "").slice(0, 10);
+const inDate = v => !state.date || dateOf(v) === state.date;
+const pad = n => String(n).padStart(2, "0");
+const PLATFORMS = [["tiktok", "TikTok"], ["youtube", "YouTube"]];
+const platformOf = v => v.id.includes("_replay-") ? "tiktok" : v.id.includes("_youtube-") ? "youtube" : "other";
+const platformLabel = key => (PLATFORMS.find(p => p[0] === key) || [key, "その他"])[1];
+const ICONS = {
+  tiktok: '<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.63.41-1.11 1.04-1.36 1.75-.21.51-.15 1.07-.14 1.61.24 1.64 1.82 3.02 3.5 2.87 1.12-.01 2.19-.66 2.77-1.61.19-.33.4-.67.41-1.06.1-1.79.06-3.57.07-5.36.01-4.03-.01-8.05.02-12.07z"/></svg>',
+  youtube: '<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>',
+};
+function tagEl(text, cls) {
+  const t = document.createElement("span"); t.className = `tag ${cls}`;
+  if (ICONS[cls]) t.innerHTML = ICONS[cls];
+  t.append(text); t.title = text; return t;
+}
+function tagsFor(v) {
+  const out = [tagEl(streamerOf(v), "streamer"), tagEl(platformLabel(platformOf(v)), platformOf(v))];
+  return out;
+}
+function renderFilters() {
+  const box = $("#filters"), frag = document.createDocumentFragment();
+  const pool = videosOf(state.streamer).filter(inDate);
+  const count = k => k === "all" ? pool.length : pool.filter(v => platformOf(v) === k).length;
+  for (const [key, label] of [["all", "すべて"], ...PLATFORMS]) {
+    const b = document.createElement("button");
+    if (ICONS[key]) { b.innerHTML = ICONS[key]; b.append(` ${label} ${count(key)}`); } else b.textContent = `${label} ${count(key)}`; b.className = state.filter === key ? "on" : "";
+    b.onclick = () => { state.filter = key; renderFilters(); loadList(); };
+    frag.appendChild(b);
+  }
+  box.replaceChildren(frag);
+}
+function loadList() {
+  const nav = $("#items"), frag = document.createDocumentFragment();
+  for (const v of videosOf(state.streamer).filter(inDate).filter(v => state.filter === "all" || platformOf(v) === state.filter)) {
+    const d = document.createElement("div");
+    d.tabIndex = 0;
+    d.onkeydown = e => { if (e.key === "Enter") go(v); };
+    d.className = "vitem" + (state.current?.id === v.id ? " sel" : "");
+    d.innerHTML = `<div class="d"></div><div class="t"></div>`;
+    d.prepend(...tagsFor(v));
+    d.querySelector(".d").textContent = v.broadcastStartJST ?? "配信日時不明";
+    d.querySelector(".t").textContent = v.title;
+    d.onclick = () => go(v);
+    frag.appendChild(d);
+  }
+  nav.replaceChildren(frag);
+}
+async function select(v, seekTo = 0) {
+  state.current = v; state.source = "edited"; syncSourceButtons(); loadList();
+  const data = await getData(v.id);
+  if (state.current !== v) return;
+  state.utterances = utterancesFrom(data.cues);
+  $("#empty").hidden = true; $("#player").hidden = false;
+  $("#title").textContent = `${v.broadcastStartJST ?? ""} ${v.title}`;
+  $("#titleTags").replaceChildren(...tagsFor(v));
+  const video = $("#video");
+  video.src = `/media/${v.movie}`;
+  $("#srcOriginal").disabled = !v.original;
+  video.onloadedmetadata = () => { $("#seek").max = video.duration || v.duration || 0; drawBar(); if (seekTo) video.currentTime = seekTo; };
+  renderUtterances(); renderSummary(data.summary); state.curIdx = -2; updateCurrent();
+}
+function seek(sec) { const v = $("#video"); v.currentTime = sec; v.play().catch(() => {}); }
+function renderUtterances() {
+  const box = $("#utts"), frag = document.createDocumentFragment();
+  for (const u of state.utterances) {
+    const b = document.createElement("button");
+    b.className = "utt"; b.dataset.id = u.id;
+    b.innerHTML = `<span class="ts"></span><span></span>`;
+    b.children[0].textContent = u.startLabel; b.children[1].textContent = u.text;
+    b.onclick = () => seek(u.start);
+    frag.appendChild(b);
+  }
+  box.replaceChildren(frag);
+}
+function renderSummary(summary) {
+  const box = $("#tabSummary"); box.textContent = "";
+  if (!summary) { box.innerHTML = `<p class="note">保存済み要約がありません。Web版はApple Intelligence要約を新規生成しません。Mac版TranscriptViewerで生成すると表示されます。</p>`; return; }
+  const h = document.createElement("h3"); h.textContent = "動画全体の要約"; box.appendChild(h);
+  const p = document.createElement("p"); p.textContent = summary.overview; box.appendChild(p);
+  const h2 = document.createElement("h3"); h2.textContent = "10分ごとの要約"; box.appendChild(h2);
+  for (const s of summary.sections) {
+    const div = document.createElement("div"); div.className = "sect";
+    const b = document.createElement("button");
+    b.textContent = `▶ ${fmt(s.start)} – ${fmt(s.end)}`;
+    b.onclick = () => seek(s.start);
+    const t = document.createElement("p"); t.textContent = s.text;
+    div.append(b, t); box.appendChild(div);
+  }
+}
+// The utterance track is static per video; paint it once and only redraw the playhead.
+let barLayer = null, barKey = "";
+function drawBar() {
+  const c = $("#bar"), ctx = c.getContext("2d"), v = $("#video");
+  const dur = v.duration || state.current?.duration || 0; if (!dur) return;
+  const key = `${state.current?.id}|${dur}|${state.utterances.length}`;
+  if (key !== barKey) {
+    barLayer = new OffscreenCanvas(c.width, c.height);
+    const l = barLayer.getContext("2d"); l.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--bar").trim();
+    for (const u of state.utterances) l.fillRect(u.start / dur * c.width, 4, Math.max((u.end - u.start) / dur * c.width, 2), 20);
+    barKey = key;
+  }
+  ctx.clearRect(0, 0, c.width, c.height); ctx.drawImage(barLayer, 0, 0);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--playhead").trim(); ctx.fillRect((v.currentTime || 0) / dur * c.width, 0, 2, 28);
+}
+function updateCurrent() {
+  const v = $("#video"); if (!state.current) return;
+  $("#seek").value = v.currentTime || 0;
+  const idx = indexAt(v.currentTime || 0, state.utterances);
+  if (idx === state.curIdx) { drawBar(); return; }
+  state.curIdx = idx;
+  const u = state.utterances[idx];
+  $("#cur").textContent = u ? u.text : "発話なし";
+  $("#curTime").textContent = u ? `${u.startLabel} – ${u.endLabel}` : "";
+  document.querySelectorAll(".utt").forEach(el => el.classList.toggle("sel", u && +el.dataset.id === u.id));
+  const near = $("#nearby"); near.textContent = "";
+  const center = idx >= 0 ? idx : 0;
+  for (const n of state.utterances.slice(Math.max(0, center - 8), center + 9)) {
+    const b = document.createElement("button");
+    b.className = "near" + (u && n.id === u.id ? " sel" : "");
+    b.textContent = `${n.startLabel} ${n.text}`;
+    b.onclick = () => seek(n.start);
+    near.appendChild(b);
+  }
+  drawBar();
+}
+$("#video").addEventListener("timeupdate", updateCurrent);
+$("#seek").addEventListener("input", e => { $("#video").currentTime = +e.target.value; updateCurrent(); });
+$("#bar").addEventListener("click", e => {
+  const r = e.target.getBoundingClientRect(), v = $("#video");
+  if (v.duration) seek((e.clientX - r.left) / r.width * v.duration);
+});
+// Speed is chosen in the player's built-in menu; remember it as the default so it survives
+// switching videos or edited/original sources (a new src resets to defaultPlaybackRate).
+$("#video").addEventListener("ratechange", e => { e.target.defaultPlaybackRate = e.target.playbackRate; });
+// Edited/Original share the player; transcripts and summaries follow the
+// edited clock, so warn that cue times can drift on the original.
+function syncSourceButtons() {
+  $("#srcEdited").classList.toggle("on", state.source !== "original");
+  $("#srcOriginal").classList.toggle("on", state.source === "original");
+  $("#srcNote").textContent = state.source === "original"
+    ? "元動画を表示中。字幕・要約の時刻は編集済み基準のため、元動画とはずれる場合があります。元動画はHEVC等のため端末によっては再生できません。" : "";
+}
+function setSource(kind) {
+  const v = state.current; if (!v || (kind === "original" && !v.original)) return;
+  const video = $("#video"), t = video.currentTime || 0, wasPlaying = !video.paused;
+  state.source = kind; syncSourceButtons();
+  video.src = kind === "original" ? `/media-original/${v.original.movie}` : `/media/${v.movie}`;
+  video.onloadedmetadata = () => { video.currentTime = t; if (wasPlaying) video.play().catch(() => {}); };
+}
+$("#srcEdited").onclick = () => setSource("edited");
+$("#srcOriginal").onclick = () => setSource("original");
+const showTab = sum => {
+  $("#tabSummary").classList.toggle("on", sum); $("#tabUtter").classList.toggle("on", !sum);
+  $("#tabSumBtn").classList.toggle("on", sum); $("#tabUttBtn").classList.toggle("on", !sum);
+};
+$("#tabSumBtn").onclick = () => showTab(true);
+$("#tabUttBtn").onclick = () => showTab(false);
+// Lazy thumbnails: a hidden <video> seeks to the hit time once its row is near the
+// viewport; two at a time so ranged fetches do not starve the main player.
+const thumbQueue = []; let thumbActive = 0;
+const thumbObserver = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) { thumbObserver.unobserve(e.target); thumbQueue.push(e.target); }
+  pumpThumbs();
+}, { root: null, rootMargin: "200px" });
+function pumpThumbs() {
+  while (thumbActive < 2 && thumbQueue.length) { thumbActive++; makeThumb(thumbQueue.shift()).finally(() => { thumbActive--; pumpThumbs(); }); }
+}
+function makeThumb(box) {
+  return new Promise(resolve => {
+    const vid = document.createElement("video");
+    vid.muted = true; vid.preload = "auto"; vid.playsInline = true;
+    const done = () => { vid.removeAttribute("src"); vid.load(); resolve(); };
+    const timer = setTimeout(done, 15000);
+    vid.onloadedmetadata = () => { vid.currentTime = Math.min(+box.dataset.t, Math.max((vid.duration || 0) - 0.1, 0)); };
+    vid.onseeked = () => {
+      // Keep the video's real aspect ratio (TikTok replays can be 9:16); the box letterboxes it.
+      const scale = 320 / Math.max(vid.videoWidth || 320, vid.videoHeight || 180);
+      const c = document.createElement("canvas");
+      c.width = Math.round((vid.videoWidth || 320) * scale); c.height = Math.round((vid.videoHeight || 180) * scale);
+      c.getContext("2d").drawImage(vid, 0, 0, c.width, c.height);
+      box.replaceChildren(c); clearTimeout(timer); done();
+    };
+    vid.onerror = () => { clearTimeout(timer); done(); };
+    vid.src = `/media/${box.dataset.movie}`;
+  });
+}
+const HIT_LIMIT = 200;
+function applyTheme(mode) {
+  const root = document.documentElement;
+  if (mode === "light" || mode === "dark") root.dataset.theme = mode; else delete root.dataset.theme;
+  try { localStorage.setItem("theme", mode); } catch {}
+  document.querySelectorAll("input[name=theme]").forEach(r => r.checked = r.value === mode);
+  barKey = ""; drawBar();
+}
+{ let saved = "auto"; try { saved = localStorage.getItem("theme") || "auto"; } catch {} document.querySelectorAll("input[name=theme]").forEach(r => { r.checked = r.value === saved; r.onchange = () => applyTheme(r.value); }); }
+matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { barKey = ""; drawBar(); });
+$("#settingsBtn").onclick = () => $("#settingsDlg").showModal();
+
+// Calendar: highlights days (JST broadcast date) that have videos; a day filters the list.
+function renderCalendar() {
+  const box = $("#calendar"), pool = videosOf(state.streamer), counts = new Map();
+  for (const v of pool) { const d = dateOf(v); if (d) counts.set(d, (counts.get(d) || 0) + 1); }
+  if (!state.month) {
+    const base = state.date || [...counts.keys()].sort().pop() || new Date().toISOString().slice(0, 10);
+    state.month = { y: +base.slice(0, 4), m: +base.slice(5, 7) };
+  }
+  const { y, m } = state.month;
+  const head = document.createElement("div"); head.className = "cal-head";
+  const mk = (label, aria, delta) => { const b = document.createElement("button"); b.textContent = label; b.setAttribute("aria-label", aria); b.onclick = () => shiftMonth(delta); return b; };
+  const title = document.createElement("span"); title.textContent = `${y}年${m}月`;
+  head.append(mk("‹", "前の月", -1), title, mk("›", "次の月", 1));
+  const grid = document.createElement("div"); grid.className = "cal-grid";
+  for (const w of ["日", "月", "火", "水", "木", "金", "土"]) { const c = document.createElement("div"); c.className = "cal-dow"; c.textContent = w; grid.appendChild(c); }
+  const lead = new Date(Date.UTC(y, m - 1, 1)).getUTCDay(), days = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  for (let i = 0; i < lead; i++) grid.appendChild(document.createElement("div"));
+  for (let d = 1; d <= days; d++) {
+    const ymd = `${y}-${pad(m)}-${pad(d)}`, n = counts.get(ymd) || 0, b = document.createElement("button");
+    b.className = "cal-day" + (n ? " has" : "") + (state.date === ymd ? " sel" : "") + (ymd === today ? " today" : "");
+    b.textContent = d; b.disabled = !n;
+    b.setAttribute("aria-label", `${m}月${d}日 ${n ? "動画あり" : "動画なし"}`);
+    b.setAttribute("aria-pressed", state.date === ymd ? "true" : "false");
+    b.onclick = () => setDate(state.date === ymd ? "" : ymd);
+    grid.appendChild(b);
+  }
+  box.replaceChildren(head, grid);
+  if (!state.date) return;
+  const note = document.createElement("div"); note.className = "cal-note";
+  const text = document.createElement("span"); text.textContent = state.date;
+  const clear = document.createElement("button"); clear.textContent = "解除"; clear.onclick = () => setDate("");
+  note.append(text, clear); box.appendChild(note);
+}
+function shiftMonth(delta) {
+  const t = new Date(Date.UTC(state.month.y, state.month.m - 1 + delta, 1));
+  state.month = { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1 }; renderCalendar();
+}
+function setDate(ymd) {
+  state.date = ymd;
+  if (ymd) state.month = { y: +ymd.slice(0, 4), m: +ymd.slice(5, 7) };
+  const url = new URL(location.href);
+  if (ymd) url.searchParams.set("date", ymd); else url.searchParams.delete("date");
+  history.replaceState(null, "", url);
+  renderCalendar(); renderFilters(); loadList();
+}
+const dateQuery = () => (state.date ? `?date=${state.date}` : "");
+
+// Routing: /streamers, /streamers/<name>, /streamers/<name>/videos/<id> (History API; the worker
+// serves this page for all three). On phones the list and player are separate pages
+// (body[data-view]); on desktop both stay visible.
+const STREAMERS = "/streamers";
+const streamerPath = name => `${STREAMERS}/${encodeURIComponent(name)}`;
+const pathFor = v => `${streamerPath(streamerOf(v))}/videos/${encodeURIComponent(v.id)}`;
+function navigate(path, { replace = false } = {}) {
+  if (location.pathname + location.search !== path) { history[replace ? "replaceState" : "pushState"](null, "", path); state.navs++; }
+  route();
+}
+function link(a, path) {
+  a.href = path;
+  a.onclick = e => { if (e.button || e.metaKey || e.ctrlKey || e.shiftKey) return; e.preventDefault(); navigate(path); };
+}
+function go(v, seekTo = 0) {
+  state.pendingSeek = seekTo;
+  if (state.date && dateOf(v) !== state.date) state.date = ""; // a search hit may fall outside the filtered day
+  navigate(pathFor(v) + dateQuery());
+}
+function showStreamers() {
+  document.body.dataset.page = "streamers"; document.title = "配信者一覧";
+  const names = [...new Set(state.videos.map(streamerOf))].sort();
+  const grid = document.createDocumentFragment();
+  for (const name of names) {
+    const pool = videosOf(name), a = document.createElement("a");
+    a.className = "scard";
+    a.innerHTML = `<div class="name"></div><div class="meta"></div>`;
+    a.querySelector(".name").textContent = name;
+    const latest = pool.map(v => v.broadcastStartJST ?? "").sort().pop();
+    a.querySelector(".meta").textContent = latest ? `最新 ${latest}` : "";
+    link(a, streamerPath(name)); grid.appendChild(a);
+  }
+  $("#streamerGrid").replaceChildren(grid);
+}
+function route() {
+  const parts = location.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  if (parts[0] !== "streamers") { navigate(STREAMERS, { replace: true }); return; }
+  if (parts.length === 1) { showStreamers(); return; }
+  document.body.dataset.page = "videos";
+  if (state.streamer !== parts[1]) state.month = null;
+  state.streamer = parts[1]; $("#crumbName").textContent = state.streamer; link($("#crumbHome"), STREAMERS);
+  const wanted = new URLSearchParams(location.search).get("date") || "";
+  state.date = /^\d{4}-\d{2}-\d{2}$/.test(wanted) ? wanted : "";
+  if (state.date) state.month = { y: +state.date.slice(0, 4), m: +state.date.slice(5, 7) };
+  renderCalendar(); renderFilters(); loadList();
+  const v = parts[2] === "videos" ? videosOf(state.streamer).find(x => x.id === parts[3]) : undefined;
+  if (v) {
+    document.body.dataset.view = "player"; document.title = `${v.broadcastStartJST ?? ""} ${state.streamer}`;
+    const t = state.pendingSeek || 0; state.pendingSeek = 0;
+    if (state.current !== v) select(v, t); else if (t) seek(t);
+  } else {
+    document.body.dataset.view = "list"; document.title = state.streamer;
+    if (matchMedia("(max-width: 760px)").matches) $("#video").pause();
+  }
+}
+addEventListener("popstate", route);
+$("#backBtn").onclick = () => { if (state.navs > 0) history.back(); else navigate(streamerPath(state.streamer) + dateQuery()); };
+$("#hsearch").onsubmit = e => { e.preventDefault(); if ($("#q").value.trim()) { $("#searchDlg").showModal(); runSearch(); } };
+document.querySelectorAll("input[name=scope], input[name=mode]").forEach(r => r.onchange = () => runSearch());
+{ let saved = "transcript"; try { saved = localStorage.getItem("searchMode") || saved; } catch {}
+  const r = document.querySelector(`input[name=mode][value="${saved}"]`); if (r) r.checked = true; }
+
+// One hit per matching utterance and per matching summary part. Summary hits jump to the
+// section start (the overview jumps to the beginning) and show text around the match.
+const SNIPPET = 40;
+function snippet(text, q) {
+  const i = text.indexOf(q), from = Math.max(0, i - SNIPPET), to = Math.min(text.length, i + q.length + SNIPPET);
+  return (from > 0 ? "…" : "") + text.slice(from, to).replace(/\s+/g, " ") + (to < text.length ? "…" : "");
+}
+function hitsFor(data, q, mode) {
+  const out = [];
+  // Summary parts come first so they are not crowded out by the many transcript hits.
+  if (mode !== "transcript" && data.summary) {
+    if (data.summary.overview.includes(q)) out.push({ start: 0, label: "全体", text: snippet(data.summary.overview, q), kind: "要約" });
+    for (const sec of data.summary.sections) if (sec.text.includes(q)) out.push({ start: sec.start, label: fmt(sec.start), text: snippet(sec.text, q), kind: "要約" });
+  }
+  if (mode !== "summary") {
+    for (const u of utterancesFrom(data.cues)) if (u.text.includes(q)) out.push({ start: u.start, label: u.startLabel, text: u.text, kind: "文字起こし" });
+  }
+  return out;
+}
+async function runSearch() {
+  const q = $("#q").value.trim(); if (!q) return;
+  const all = document.querySelector("input[name=scope]:checked").value === "all";
+  const targets = all ? state.videos : (state.current ? [state.current] : []);
+  const token = state.searchToken = (state.searchToken || 0) + 1;
+  const hits = $("#hits"); hits.textContent = "";
+  $("#searchStatus").textContent = "検索中…";
+  let count = 0;
+  // Fetch in parallel batches so a cross-video search is not N sequential round trips.
+  for (let i = 0; i < targets.length; i += 6) await Promise.all(targets.slice(i, i + 6).map(v => getData(v.id)));
+  const mode = document.querySelector("input[name=mode]:checked").value;
+  try { localStorage.setItem("searchMode", mode); } catch {}
+  const frag = document.createDocumentFragment();
+  for (const v of targets) {
+    const data = await getData(v.id);
+    for (const h of hitsFor(data, q, mode)) {
+      count++;
+      if (count > HIT_LIMIT) continue;
+      const b = document.createElement("button");
+      b.className = "hit";
+      const thumb = document.createElement("span"); thumb.className = "thumb"; thumb.dataset.t = h.start; thumb.dataset.movie = v.movie;
+      const meta = document.createElement("span"); meta.className = "meta";
+      const when = document.createElement("span"); when.className = "when"; when.textContent = `${v.broadcastStartJST ?? ""} ${h.label}`;
+      const text = document.createElement("span"); text.style.display = "block"; text.textContent = h.text;
+      meta.append(tagEl(h.kind, h.kind === "要約" ? "sum" : "other"), when, text);
+      b.append(thumb, meta);
+      b.onclick = () => { $("#searchDlg").close(); go(v, h.start); };
+      frag.appendChild(b); thumbObserver.observe(thumb);
+    }
+  }
+  if (token !== state.searchToken) return;
+  hits.replaceChildren(frag);
+  $("#searchStatus").textContent = count > HIT_LIMIT ? `${count}件（先頭${HIT_LIMIT}件を表示）` : `${count}件`;
+}
+fetch("/api/me").then(r => r.json()).then(m => { $("#adminLink").hidden = !m.admin; }).catch(() => {});
+window.__catalog.then(c => { state.videos = c.videos; route(); });
+</script>
+</body>
+</html>

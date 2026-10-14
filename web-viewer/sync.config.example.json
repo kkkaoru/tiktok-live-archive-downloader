@@ -1,0 +1,7 @@
+{
+  "streamer": "かしすみるく",
+  "roots": ["../edits", "/path/to/another/library"],
+  "youtubeOriginals": "../youtube-originals",
+  "bucket": "transcript-viewer-media",
+  "uploaderWorker": "transcript-viewer-uploader"
+}
