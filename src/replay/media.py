@@ -6,6 +6,10 @@ from pathlib import Path
 
 from replay.core import ReplayError
 
+# mov_text extradata already carries its source btrt atom. The MP4 muxer's
+# automatic addition duplicates it on stream copy, changing subtitle config.
+MP4_STREAM_COPY_OPTIONS: tuple[str, ...] = ("-movflags", "+faststart", "-write_btrt", "0")
+
 
 def quicktime_video_tags(path: Path) -> list[str]:
     try:

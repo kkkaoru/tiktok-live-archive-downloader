@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 
-from replay.caption_io import SoundWindow, sound_windows
+from replay.caption_io import SoundWindow, native_sound_windows, sound_windows
 
 
 @pytest.fixture
@@ -36,6 +36,28 @@ def envelope(measurement: object) -> dict[str, object]:
         "ok": True,
         "data": {"structuredContent": {"sourceModified": False, "measurement": measurement}},
     }
+
+
+def test_explicit_native_cli_parser_preserves_raw_scores(measurement: dict[str, object]) -> None:
+    assert native_sound_windows(measurement) == (
+        SoundWindow(0, 0.5, 0.2, 0.9),
+        SoundWindow(0.25, 0.75, 0.7, 0.4),
+    )
+
+
+def test_raw_cli_cannot_impersonate_an_executor_receipt(measurement: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        sound_windows(measurement)
+
+
+def test_executor_envelope_is_not_raw_cli_data(measurement: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        native_sound_windows(envelope(measurement))
+
+
+def test_native_empty_scores_are_not_silence(measurement: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="cannot infer silence"):
+        native_sound_windows(measurement | {"windows": []})
 
 
 def test_raw_overlapping_scores_are_preserved(measurement: dict[str, object]) -> None:
