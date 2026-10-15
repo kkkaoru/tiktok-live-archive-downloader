@@ -62,9 +62,9 @@ def test_all_zero_input_is_one_run_and_empty_input_has_none() -> None:
 
 
 def test_invalid_rates_and_minimums_are_refused() -> None:
-    with pytest.raises(ReplayError, match="Invalid rate or minimum silence"):
+    with pytest.raises(ReplayError, match="Invalid rate, minimum silence or amplitude"):
         silence.zero_runs([], rate=0, minimum_seconds=2)
-    with pytest.raises(ReplayError, match="Invalid rate or minimum silence"):
+    with pytest.raises(ReplayError, match="Invalid rate, minimum silence or amplitude"):
         silence.zero_runs([], rate=RATE, minimum_seconds=0)
 
 
@@ -177,7 +177,7 @@ def test_a_label_that_starts_inside_a_run_and_ends_after_it_starts_at_the_run_en
         "spanStartSeconds": 8.0,
         "spanEndSeconds": 20.0,
         "droppedSeconds": 10.0,
-        "rule": "label time inside exactly-zero input is not delivered speech",
+        "rule": "label time inside digital silence is not delivered speech",
     }
     assert clamps == [{"index": 0, "text": "聴", "side": "start"}]
     assert slivers == []
@@ -262,3 +262,90 @@ def test_clamping_every_label_away_is_refused() -> None:
             [label("聴", 10.0, 25.0)], [Span(80, 200, RATE), Span(201, 300, RATE)],
             minimum_kept=Fraction(1, 5),
         )  # fmt: skip
+
+
+def test_a_quiet_tail_and_isolated_samples_do_not_split_one_silence() -> None:
+    samples = block(500, *zeros(3), 6, 8, *zeros(3), 1, *zeros(2), 400)
+    assert silence.zero_runs([samples], rate=RATE, minimum_seconds=5) == []
+    assert silence.zero_runs([samples], rate=RATE, minimum_seconds=5, maximum_amplitude=8) == [
+        Span(1, 84, RATE, 8)
+    ]
+
+
+def test_a_sample_louder_than_the_amplitude_still_ends_the_run() -> None:
+    samples = block(500, *zeros(3), 9, *zeros(3), 400)
+    assert silence.zero_runs([samples], rate=RATE, minimum_seconds=3, maximum_amplitude=8) == [
+        Span(1, 31, RATE, 8),
+        Span(32, 62, RATE, 8),
+    ]
+
+
+def test_negative_samples_are_measured_by_magnitude() -> None:
+    samples = block(500, *zeros(2), -8, -9, *zeros(2), 400)
+    assert silence.zero_runs([samples], rate=RATE, minimum_seconds=2, maximum_amplitude=8) == [
+        Span(1, 22, RATE, 8),
+        Span(23, 43, RATE, 8),
+    ]
+
+
+def test_the_most_negative_sample_does_not_overflow() -> None:
+    samples = block(-32768, *zeros(3), 400)
+    assert silence.zero_runs([samples], rate=RATE, minimum_seconds=3, maximum_amplitude=8) == [
+        Span(1, 31, RATE, 8)
+    ]
+
+
+def test_an_amplitude_outside_the_supported_range_is_refused() -> None:
+    with pytest.raises(ReplayError):
+        silence.zero_runs([], rate=RATE, minimum_seconds=2, maximum_amplitude=-1)
+    with pytest.raises(ReplayError):
+        silence.zero_runs([], rate=RATE, minimum_seconds=2, maximum_amplitude=65)
+
+
+def test_the_span_rule_names_the_amplitude_when_it_is_not_zero() -> None:
+    labels = [{"text": "a", "start": 0.0, "end": 1.0}, {"text": "b", "start": 5.0, "end": 6.0}]
+    kept, excluded = silence.exclude(labels, [Span(0, 40, RATE, 8)])
+    assert [item["text"] for item in kept] == ["b"]
+    assert excluded[0]["span"] == {
+        "startSeconds": 0.0,
+        "endSeconds": 4.0,
+        "rule": "every input sample in the span has magnitude at most 8 LSB",
+    }
+
+
+def test_the_command_line_records_the_amplitude(tmp_path: Path) -> None:
+    pcm = tmp_path / "a.wav"
+    with wave.open(str(pcm), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(RATE)
+        stream.writeframes(block(500, *zeros(3), 6, *zeros(3), 400).tobytes())
+    labels = tmp_path / "labels.json"
+    labels.write_text(
+        json.dumps(
+            {
+                "labels": [
+                    {"text": "a", "start": 0.0, "end": 0.1},
+                    {"text": "x", "start": 0.5, "end": 0.9},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        silence.main(
+            [
+                str(labels),
+                str(pcm),
+                str(tmp_path / "o.json"),
+                "--minimum-seconds",
+                "5",
+                "--maximum-amplitude",
+                "8",
+            ]
+        )
+        == 0
+    )
+    document = json.loads((tmp_path / "o.json").read_text(encoding="utf-8"))
+    assert document["maximumSilenceAmplitude"] == 8
+    assert [item["label"]["text"] for item in document["excludedAsDigitalSilence"]] == ["x"]

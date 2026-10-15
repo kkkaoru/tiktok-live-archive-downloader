@@ -24,6 +24,7 @@ from replay.core import ReplayError
 
 BLOCK_SAMPLES = 1 << 20
 MAX_LABELS = 1_000_000
+MAX_AMPLITUDE = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,29 +34,37 @@ class Span:
     start: int
     end: int
     rate: int
+    amplitude: int = 0
 
 
-def zero_runs(blocks: Iterable[np.ndarray], *, rate: int, minimum_seconds: int) -> list[Span]:
-    """Runs of exactly-zero samples lasting at least `minimum_seconds`."""
-    if rate < 1 or minimum_seconds < 1:
-        raise ReplayError("Invalid rate or minimum silence")
+def zero_runs(
+    blocks: Iterable[np.ndarray], *, rate: int, minimum_seconds: int, maximum_amplitude: int = 0
+) -> list[Span]:
+    """Runs of samples no louder than `maximum_amplitude` (0 = exactly zero) of at least
+    `minimum_seconds`. A positive amplitude treats decay tails and isolated dither samples
+    below that magnitude as silence, so one inaudible stretch is not split into two."""
+    if rate < 1 or minimum_seconds < 1 or not 0 <= maximum_amplitude <= MAX_AMPLITUDE:
+        raise ReplayError("Invalid rate, minimum silence or amplitude")
     minimum = rate * minimum_seconds
     spans: list[Span] = []
     run_start: int | None = None
     offset = 0
     for block in blocks:
         previous = 0
-        for index in [*np.flatnonzero(block).tolist(), len(block)]:
+        for index in [
+            *np.flatnonzero(np.abs(block.astype(np.int32)) > maximum_amplitude).tolist(),
+            len(block),
+        ]:
             if index > previous and run_start is None:
                 run_start = offset + previous
             if index < len(block) and run_start is not None:
                 if offset + index - run_start >= minimum:
-                    spans.append(Span(run_start, offset + index, rate))
+                    spans.append(Span(run_start, offset + index, rate, maximum_amplitude))
                 run_start = None
             previous = index + 1
         offset += len(block)
     if run_start is not None and offset - run_start >= minimum:
-        spans.append(Span(run_start, offset, rate))
+        spans.append(Span(run_start, offset, rate, maximum_amplitude))
     return spans
 
 
@@ -102,13 +111,19 @@ def exclude(
                 "span": {
                     "startSeconds": float(Fraction(home.start, home.rate)),
                     "endSeconds": float(Fraction(home.end, home.rate)),
-                    "rule": "every input sample in the span is exactly zero",
+                    "rule": _span_rule(home),
                 },
             }
         )
     if not kept:
         raise ReplayError("Every label lies in digital silence")
     return kept, excluded
+
+
+def _span_rule(span: Span) -> str:
+    if span.amplitude == 0:
+        return "every input sample in the span is exactly zero"
+    return f"every input sample in the span has magnitude at most {span.amplitude} LSB"
 
 
 def _rounded(value: Fraction, mode: str) -> float:
@@ -156,7 +171,7 @@ def clamp_partial(
                 "spanStartSeconds": float(low),
                 "spanEndSeconds": float(high),
                 "droppedSeconds": float(dropped),
-                "rule": "label time inside exactly-zero input is not delivered speech",
+                "rule": "label time inside digital silence is not delivered speech",
             }
             clamps.append({"index": index, "text": label["text"], "side": side})
         if "silenceClamp" in changed and end - start < minimum_kept:
@@ -176,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("pcm", type=Path, help="mono PCM16 WAV the labels were recognized from")
     parser.add_argument("output", type=Path)
     parser.add_argument("--minimum-seconds", type=int, required=True)
+    parser.add_argument("--maximum-amplitude", type=int, default=0)
     parser.add_argument("--clamp-partial", action="store_true")
     parser.add_argument("--fps", type=int, default=30)
     args = parser.parse_args(argv)
@@ -183,7 +199,12 @@ def main(argv: list[str] | None = None) -> int:
         raise ReplayError("Refusing to overwrite the output")
     document = json.loads(args.labels.read_text(encoding="utf-8"))
     rate = wav_rate(args.pcm)
-    spans = zero_runs(wav_blocks(args.pcm), rate=rate, minimum_seconds=args.minimum_seconds)
+    spans = zero_runs(
+        wav_blocks(args.pcm),
+        rate=rate,
+        minimum_seconds=args.minimum_seconds,
+        maximum_amplitude=args.maximum_amplitude,
+    )
     kept, excluded = exclude(document["labels"], spans)
     clamps: list[dict[str, object]] = []
     slivers: list[dict[str, object]] = []
@@ -200,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         "parentLabelsFile": str(args.labels),
         "silenceSourcePcm": str(args.pcm),
         "minimumSilenceSeconds": args.minimum_seconds,
+        "maximumSilenceAmplitude": args.maximum_amplitude,
     }
     args.output.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
     summary = {"spans": len(spans), "excluded": len(excluded), "kept": len(kept)}
