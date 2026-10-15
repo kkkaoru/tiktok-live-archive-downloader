@@ -29,6 +29,7 @@ from replay.vertical_captions import Box
 
 COORDINATE_SYSTEM = "top-left canvas; calibrated text origin"
 MAX_LINES_TOP_READER = 2
+NO_INDEX = Path("-")
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +188,42 @@ def load_observed(window_index: Path) -> list[TrackingPosition]:
     return observed_only(samples)
 
 
+def load_yolo(track: Path, *, rate: int, minimum_confidence: float) -> list[TrackingPosition]:
+    """Face-top samples from a `yolo_track` evidence file; frames with 0 or 2+ faces are skipped.
+
+    A frame with several faces is ambiguous, exactly as Vision's ambiguous frames are, and is not
+    guessed. The sample position is the face box's horizontal centre and its top edge.
+    """
+    data = json.loads(track.read_text(encoding="utf-8"))
+    if data.get("protocol") != "yolo-face-caption-track-v1" or data.get("provenance") != "yolo":
+        raise ReplayError("Not a YOLO face track")
+    if data.get("rate") != rate:
+        raise ReplayError("The YOLO track was made at a different frame rate")
+    samples: list[TrackingPosition] = []
+    for row in data["frames"]:
+        box = row["face"]
+        if box is None or row["faceCount"] != 1 or box[4] < minimum_confidence:
+            continue
+        samples.append(
+            TrackingPosition(Fraction(int(row["frame"]), rate), (box[0] + box[2]) / 2, box[1])
+        )
+    return sorted(samples, key=lambda sample: sample.time)
+
+
+def merge_observed(
+    vision: Sequence[TrackingPosition], yolo: Sequence[TrackingPosition], *, gap: Fraction
+) -> list[TrackingPosition]:
+    """Vision samples, plus YOLO samples that have no Vision sample within `gap` seconds."""
+    times = [sample.time for sample in vision]
+    added = []
+    for sample in yolo:
+        index = bisect_right(times, sample.time)
+        near = [times[i] for i in (index - 1, index) if 0 <= i < len(times)]
+        if all(abs(sample.time - time) > gap for time in near):
+            added.append(sample)
+    return sorted([*vision, *added], key=lambda sample: sample.time)
+
+
 def candidate_for(
     placed: Sequence[fixed.FixedCue],
     *,
@@ -221,7 +258,9 @@ def line_sizes(paging: Path) -> dict[str, tuple[float, float]]:
 def parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paging", type=Path, help="paging directory with reflow.json and metrics-*")
-    parser.add_argument("window_index", type=Path, help="verified raw face windows index")
+    parser.add_argument(
+        "window_index", type=Path, help="verified raw face windows index, or - for none"
+    )
     parser.add_argument("cuts", type=Path, help="supported-cuts.json (output to source frames)")
     parser.add_argument("calibration", type=Path)
     parser.add_argument("output", type=Path)
@@ -234,6 +273,9 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--clearance", type=float, required=True)
     parser.add_argument("--maximum-drift", type=float, required=True)
     parser.add_argument("--rebase", action="store_true")
+    parser.add_argument("--yolo-track", type=Path, help="yolo_track evidence for unobserved frames")
+    parser.add_argument("--yolo-minimum-confidence", type=float, default=0.5)
+    parser.add_argument("--yolo-gap-seconds", type=Fraction, default=Fraction(1, 2))
     return parser.parse_args(argv)
 
 
@@ -273,7 +315,12 @@ def run_plan(args: argparse.Namespace, observed: Sequence[TrackingPosition]) -> 
         canvas=(int(width), int(height)),
         rate=args.rate,
         calibration=args.calibration,
-        inputs=[reflow, args.window_index, args.cuts],
+        inputs=[
+            reflow,
+            *([args.window_index] if args.window_index != NO_INDEX else []),
+            args.cuts,
+            *([args.yolo_track] if args.yolo_track is not None else []),
+        ],
     )
     document["plannedRuns"] = {"placedCues": len(placed), "failedRuns": failures}
     args.output.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -284,7 +331,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parse(argv)
     if args.output.exists() or args.output.is_symlink():
         raise ReplayError("Refusing to overwrite the output")
-    print(json.dumps(run_plan(args, load_observed(args.window_index))))
+    vision = [] if args.window_index == NO_INDEX else load_observed(args.window_index)
+    if args.yolo_track is None:
+        observed = vision
+    else:
+        yolo = load_yolo(
+            args.yolo_track, rate=args.rate, minimum_confidence=args.yolo_minimum_confidence
+        )
+        observed = merge_observed(vision, yolo, gap=args.yolo_gap_seconds)
+    print(json.dumps(run_plan(args, observed)))
     return 0
 
 

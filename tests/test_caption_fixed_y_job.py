@@ -290,3 +290,84 @@ def test_a_second_plan_into_the_same_output_is_refused(tmp_path: Path) -> None:
     job.run_plan(job.parse(arguments), series)
     with pytest.raises(ReplayError, match="Refusing to overwrite the output"):
         job.run_plan(job.parse(arguments), series)
+
+
+def track_file(path: Path, rows: list[dict[str, object]], *, rate: int = 30) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "protocol": "yolo-face-caption-track-v1",
+                "provenance": "yolo",
+                "rate": rate,
+                "frames": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_yolo_samples_are_the_box_centre_and_top_of_single_confident_faces(tmp_path: Path) -> None:
+    rows: list[dict[str, object]] = [
+        {"frame": 60, "face": [100.0, 800.0, 300.0, 1000.0, 0.9], "faceCount": 1, "captions": 0},
+        {"frame": 0, "face": [110.0, 810.0, 310.0, 1010.0, 0.8], "faceCount": 1, "captions": 0},
+        {"frame": 30, "face": None, "faceCount": 0, "captions": 0},
+        {"frame": 90, "face": [0.0, 1.0, 2.0, 3.0, 0.9], "faceCount": 2, "captions": 0},
+        {"frame": 120, "face": [0.0, 1.0, 2.0, 3.0, 0.3], "faceCount": 1, "captions": 0},
+    ]
+    found = job.load_yolo(track_file(tmp_path / "t.json", rows), rate=30, minimum_confidence=0.5)
+    assert found == [
+        TrackingPosition(Fraction(0), 210.0, 810.0),
+        TrackingPosition(Fraction(2), 200.0, 800.0),
+    ]
+
+
+def test_a_track_of_another_protocol_or_rate_is_refused(tmp_path: Path) -> None:
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"protocol": "x", "provenance": "yolo"}), encoding="utf-8")
+    with pytest.raises(ReplayError, match="Not a YOLO face track"):
+        job.load_yolo(other, rate=30, minimum_confidence=0.5)
+    slow = track_file(tmp_path / "slow.json", [], rate=24)
+    with pytest.raises(ReplayError, match="different frame rate"):
+        job.load_yolo(slow, rate=30, minimum_confidence=0.5)
+
+
+def test_yolo_fills_only_the_gaps_between_vision_samples() -> None:
+    vision = [TrackingPosition(Fraction(0), 1.0, 10.0), TrackingPosition(Fraction(10), 1.0, 12.0)]
+    yolo = [
+        TrackingPosition(Fraction(1, 4), 2.0, 20.0),
+        TrackingPosition(Fraction(5), 2.0, 21.0),
+        TrackingPosition(Fraction(10) - Fraction(1, 5), 2.0, 22.0),
+        TrackingPosition(Fraction(20), 2.0, 23.0),
+    ]
+    merged = job.merge_observed(vision, yolo, gap=Fraction(1, 2))
+    assert [(sample.time, sample.y) for sample in merged] == [
+        (Fraction(0), 10.0),
+        (Fraction(5), 21.0),
+        (Fraction(10), 12.0),
+        (Fraction(20), 23.0),
+    ]
+
+
+def test_without_vision_every_yolo_sample_is_kept() -> None:
+    yolo = [TrackingPosition(Fraction(1), 2.0, 20.0), TrackingPosition(Fraction(2), 2.0, 21.0)]
+    assert job.merge_observed([], yolo, gap=Fraction(1, 2)) == yolo
+
+
+def test_the_command_line_plans_from_a_yolo_track_without_a_vision_index(tmp_path: Path) -> None:
+    arguments = build_inputs(tmp_path)
+    arguments[1] = "-"
+    rows: list[dict[str, object]] = [
+        {"frame": n, "face": [100.0, 1000.0, 300.0, 1200.0, 0.9], "faceCount": 1, "captions": 0}
+        for n in range(0, 300, 10)
+    ]
+    track = track_file(tmp_path / "track.json", rows)
+    assert job.main([*arguments, "--yolo-track", str(track)]) == 0
+    document = json.loads((tmp_path / "out.json").read_text())
+    assert [c["y"] for c in document["candidates"]] == [1050.0, 1050.0, 1050.0]
+    assert set(document["inputs"]) == {
+        str(tmp_path / "cal.json"),
+        str(tmp_path / "paging" / "reflow.json"),
+        str(tmp_path / "cuts.json"),
+        str(track),
+    }
