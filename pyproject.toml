@@ -18,6 +18,13 @@ dialogue-separation = ["mlx-audio[sts]==0.5.7", "numpy>=2.2,<3", "scipy>=1.12,<2
 ja-alignment = ["nagisa==0.3.0", "pykakasi==2.3.0"]
 ctc-alignment = ["torch==2.6.0", "transformers==5.17.0", "numpy>=1.26,<3", "scipy>=1.12,<2"]
 coreml-extraction = ["coremltools>=9,<10; sys_platform == 'darwin'"]
+yolo = [
+    "ultralytics==8.4.177",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "numpy>=2.2,<3",
+    "opencv-python-headless>=4.10,<5",
+]
 usef-extraction = ["torch==2.6.0", "numpy>=1.26,<2", "scipy>=1.12,<2"]
 speaker-extraction = [
     "torch==2.2.2", "torchaudio==2.2.2", "numpy>=1.26,<2",
@@ -58,6 +65,8 @@ requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.uv]
+# Ultralytics only needs cv2; the GUI wheel would shadow the headless one used everywhere else.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
 conflicts = [
     [{ extra = "separation" }, { group = "dev" }],
     [{ extra = "separation" }, { extra = "editing" }],
@@ -76,6 +85,9 @@ conflicts = [
     [{ extra = "usef-extraction" }, { group = "dev" }],
     [{ extra = "ctc-alignment" }, { extra = "speaker-extraction" }],
     [{ extra = "ctc-alignment" }, { extra = "separation" }],
+    [{ extra = "yolo" }, { extra = "separation" }],
+    [{ extra = "yolo" }, { extra = "speaker-extraction" }],
+    [{ extra = "yolo" }, { extra = "usef-extraction" }],
 ]
 
 [tool.hatch.build]
