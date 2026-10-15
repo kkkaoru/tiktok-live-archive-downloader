@@ -409,6 +409,7 @@ Markdownを含めて使用禁止です。** 引き継ぎ文書、調査メモ、
 | WhisperKit ASR（別経路） | コンパイル済みCore ML、`edits/models/whisperkit-coreml/<revision>/<model>/` | 全22ファイルを取得・ハッシュ検証済み。合成音声の推論成功。全nativeゲートは未合格で、今回の字幕ASRには使わない。 |
 | Whisper tokenizer | ローカルJSON、`edits/models/whisper-tokenizer/<revision>/` | 既存資産で日本語往復変換テスト成功。リポジトリ内にも3ファイルを取得・ハッシュ検証済み。 |
 | 音声分離 | Core ML、`edits/models/htdemucs-coreml/compiled/HTDemucs_SourceSeparation_F32.mlmodelc` | 既存native検証で使用。ファイル名のF32に反し実入出力はFloat16なので実契約を検証する。 |
+| アバター顔・元字幕の検出 | PyTorch（Ultralytics YOLO11n）、`edits/models/yolo/avatar-face-caption-v1.pt`（sha256 `f486fd49a0f9c47efe18a01d8d7aa662e91be9f90ce1a4a8705a1327bee80925`、`.sha256` ファイル併置）。初期重みは公式 `yolo11n.pt` を1回だけ取得して固定。 | MPSで推論。10-04のみで学習・検証（検証 mAP50 0.833、avatar_face 0.968、source_caption 0.698で再現率は低い）。`replay.yolo_track` が顔の上端を出力するが、字幕マスクの網羅検出には使わない。別収録での精度は検証中。 |
 
 ### 使用するMLX Whisper large-v3（非Turbo）
 
