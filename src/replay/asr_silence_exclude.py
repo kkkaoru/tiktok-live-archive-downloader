@@ -14,6 +14,7 @@ import sys
 import wave
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from fractions import Fraction
 from pathlib import Path
 
@@ -110,12 +111,73 @@ def exclude(
     return kept, excluded
 
 
+def _rounded(value: Fraction, mode: str) -> float:
+    """A 9-digit decimal that never lies on the wrong side of `value` (ceiling or floor)."""
+    exact = Decimal(value.numerator) / Decimal(value.denominator)
+    return float(exact.quantize(Decimal("0.000000001"), rounding=mode))
+
+
+def clamp_partial(
+    labels: Sequence[dict[str, object]],
+    spans: Sequence[Span],
+    *,
+    minimum_kept: Fraction,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    """Keep the part of a label outside digital silence when it only partly overlaps a run.
+
+    A label that starts inside a run and ends after it starts at the run's end; one that starts
+    before a run and ends inside it ends at the run's start. A label with signal on both sides of
+    a run is untouched. Changed labels carry the original time, the run and the dropped length. A
+    label whose kept part is shorter than `minimum_kept` has almost no acoustic support and is
+    returned among the dropped records instead of as a sliver.
+    """
+    result: list[dict[str, object]] = []
+    clamps: list[dict[str, object]] = []
+    dropped_labels: list[dict[str, object]] = []
+    for index, label in enumerate(labels):
+        start, end = Fraction(str(label["start"])), Fraction(str(label["end"]))
+        changed = dict(label)
+        for span in spans:
+            low, high = Fraction(span.start, span.rate), Fraction(span.end, span.rate)
+            if low <= start < high < end:
+                changed["start"] = _rounded(high, ROUND_CEILING)
+                start = Fraction(str(changed["start"]))
+                side, dropped = "start", high - Fraction(str(label["start"]))
+            elif start < low < end <= high:
+                changed["end"] = _rounded(low, ROUND_FLOOR)
+                end = Fraction(str(changed["end"]))
+                side, dropped = "end", Fraction(str(label["end"])) - low
+            else:
+                continue
+            changed["silenceClamp"] = {
+                "side": side,
+                "originalStart": label["start"],
+                "originalEnd": label["end"],
+                "spanStartSeconds": float(low),
+                "spanEndSeconds": float(high),
+                "droppedSeconds": float(dropped),
+                "rule": "label time inside exactly-zero input is not delivered speech",
+            }
+            clamps.append({"index": index, "text": label["text"], "side": side})
+        if "silenceClamp" in changed and end - start < minimum_kept:
+            dropped_labels.append(
+                {"index": index, "label": dict(label), "kept": float(end - start)}
+            )
+            continue
+        result.append(changed)
+    if not result:
+        raise ReplayError("Every label lies in digital silence")
+    return result, clamps, dropped_labels
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("labels", type=Path)
     parser.add_argument("pcm", type=Path, help="mono PCM16 WAV the labels were recognized from")
     parser.add_argument("output", type=Path)
     parser.add_argument("--minimum-seconds", type=int, required=True)
+    parser.add_argument("--clamp-partial", action="store_true")
+    parser.add_argument("--fps", type=int, default=30)
     args = parser.parse_args(argv)
     if args.output.exists() or args.output.is_symlink():
         raise ReplayError("Refusing to overwrite the output")
@@ -123,8 +185,14 @@ def main(argv: list[str] | None = None) -> int:
     rate = wav_rate(args.pcm)
     spans = zero_runs(wav_blocks(args.pcm), rate=rate, minimum_seconds=args.minimum_seconds)
     kept, excluded = exclude(document["labels"], spans)
+    clamps: list[dict[str, object]] = []
+    slivers: list[dict[str, object]] = []
+    if args.clamp_partial:
+        kept, clamps, slivers = clamp_partial(kept, spans, minimum_kept=Fraction(1, args.fps))
     document = dict(document) | {
         "labels": kept,
+        "silenceClamps": clamps,
+        "droppedAsSlivers": slivers,
         "excludedAsDigitalSilence": excluded,
         "digitalSilenceSpans": [
             {"startSeconds": s.start / s.rate, "endSeconds": s.end / s.rate} for s in spans
@@ -134,7 +202,8 @@ def main(argv: list[str] | None = None) -> int:
         "minimumSilenceSeconds": args.minimum_seconds,
     }
     args.output.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(json.dumps({"spans": len(spans), "excluded": len(excluded), "kept": len(kept)}))
+    summary = {"spans": len(spans), "excluded": len(excluded), "kept": len(kept)}
+    print(json.dumps(summary | {"clamped": len(clamps)}))
     return 0
 
 

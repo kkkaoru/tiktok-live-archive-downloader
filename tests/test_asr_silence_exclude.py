@@ -2,6 +2,7 @@
 
 import json
 import wave
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -158,3 +159,106 @@ def test_the_command_line_refuses_stereo_input_and_overwriting(tmp_path: Path) -
     existing.write_text("x", encoding="utf-8")
     with pytest.raises(ReplayError, match="Refusing to overwrite"):
         silence.main([str(labels), str(stereo), str(existing), "--minimum-seconds", "1"])
+
+
+SPAN = [Span(80, 200, RATE)]
+FRAME = Fraction(1, 30)
+
+
+def test_a_label_that_starts_inside_a_run_and_ends_after_it_starts_at_the_run_end() -> None:
+    result, clamps, slivers = silence.clamp_partial(
+        [label("聴", 10.0, 25.0)], SPAN, minimum_kept=FRAME
+    )
+    assert result[0]["start"] == 20.0 and result[0]["end"] == 25.0
+    assert result[0]["silenceClamp"] == {
+        "side": "start",
+        "originalStart": 10.0,
+        "originalEnd": 25.0,
+        "spanStartSeconds": 8.0,
+        "spanEndSeconds": 20.0,
+        "droppedSeconds": 10.0,
+        "rule": "label time inside exactly-zero input is not delivered speech",
+    }
+    assert clamps == [{"index": 0, "text": "聴", "side": "start"}]
+    assert slivers == []
+
+
+def test_a_label_that_starts_before_a_run_and_ends_inside_it_ends_at_the_run_start() -> None:
+    result, clamps, slivers = silence.clamp_partial(
+        [label("あ", 5.0, 15.0)], SPAN, minimum_kept=FRAME
+    )
+    assert result[0]["start"] == 5.0 and result[0]["end"] == 8.0
+    silence_clamp = result[0]["silenceClamp"]
+    assert isinstance(silence_clamp, dict)
+    assert silence_clamp["side"] == "end" and silence_clamp["droppedSeconds"] == 7.0
+    assert clamps == [{"index": 0, "text": "あ", "side": "end"}]
+
+
+def test_a_label_starting_exactly_at_the_run_start_is_moved_to_the_run_end() -> None:
+    result, _, _ = silence.clamp_partial([label("い", 8.0, 25.0)], SPAN, minimum_kept=FRAME)
+    assert result[0]["start"] == 20.0
+
+
+def test_labels_with_signal_on_both_sides_or_outside_every_run_are_untouched() -> None:
+    labels = [label("う", 5.0, 25.0), label("え", 1.0, 3.0), label("お", 20.0, 22.0)]
+    result, clamps, slivers = silence.clamp_partial(labels, SPAN, minimum_kept=FRAME)
+    assert result == labels
+    assert clamps == []
+
+
+def test_the_clamped_boundaries_never_fall_inside_the_run_after_rounding() -> None:
+    third = [Span(1, 3, 3)]
+    start_case, _, _ = silence.clamp_partial([label("あ", 0.4, 2.0)], third, minimum_kept=FRAME)
+    end_case, _, _ = silence.clamp_partial(
+        [label("い", 0.1, 0.9)], [Span(1, 4, 3)], minimum_kept=FRAME
+    )
+    assert Fraction(str(start_case[0]["start"])) >= Fraction(1, 1)
+    assert Fraction(str(end_case[0]["end"])) <= Fraction(1, 3)
+
+
+def test_clamping_does_not_modify_its_input() -> None:
+    labels = [label("聴", 10.0, 25.0)]
+    silence.clamp_partial(labels, SPAN, minimum_kept=FRAME)
+    assert labels == [label("聴", 10.0, 25.0)]
+
+
+def test_the_command_line_can_clamp_partial_overlaps(tmp_path: Path) -> None:
+    pcm = tmp_path / "mono.wav"
+    write_wav(pcm, block(7, *zeros(5), 7, 7, 7))
+    labels = tmp_path / "labels.json"
+    parent = {
+        "version": 1,
+        "labels": [label("あ", 0.0, 0.1), label("聴", 2.0, 8.0), label("ご視聴", 2.2, 4.0)],
+    }
+    labels.write_text(json.dumps(parent), encoding="utf-8")
+    output = tmp_path / "out.json"
+    arguments = [str(labels), str(pcm), str(output), "--minimum-seconds", "3", "--clamp-partial"]
+    assert silence.main(arguments) == 0
+    document = json.loads(output.read_text())
+    assert [item["text"] for item in document["labels"]] == ["あ", "聴"]
+    assert document["labels"][1]["start"] == 5.1
+    assert document["silenceClamps"] == [{"index": 1, "text": "聴", "side": "start"}]
+    assert json.loads(labels.read_text()) == parent
+
+
+def test_a_label_between_two_runs_keeps_only_the_gap_and_a_sliver_is_set_aside() -> None:
+    two_runs = [Span(80, 200, RATE), Span(201, 300, RATE)]
+    kept, clamps, slivers = silence.clamp_partial(
+        [label("聴", 10.0, 25.0), label("い", 40.0, 41.0)], two_runs, minimum_kept=Fraction(1, 5)
+    )
+    assert [item["text"] for item in kept] == ["い"]
+    assert [item["side"] for item in clamps] == ["start", "end"]
+    assert slivers == [{"index": 0, "label": label("聴", 10.0, 25.0), "kept": pytest.approx(0.1)}]
+    long_enough, _, none = silence.clamp_partial(
+        [label("聴", 10.0, 25.0)], two_runs, minimum_kept=Fraction(1, 30)
+    )
+    assert long_enough[0]["start"] == 20.0 and long_enough[0]["end"] == 20.1
+    assert none == []
+
+
+def test_clamping_every_label_away_is_refused() -> None:
+    with pytest.raises(ReplayError, match="Every label lies in digital silence"):
+        silence.clamp_partial(
+            [label("聴", 10.0, 25.0)], [Span(80, 200, RATE), Span(201, 300, RATE)],
+            minimum_kept=Fraction(1, 5),
+        )  # fmt: skip
