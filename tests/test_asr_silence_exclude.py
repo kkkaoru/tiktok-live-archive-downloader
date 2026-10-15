@@ -200,10 +200,11 @@ def test_a_label_starting_exactly_at_the_run_start_is_moved_to_the_run_end() -> 
 
 
 def test_labels_with_signal_on_both_sides_or_outside_every_run_are_untouched() -> None:
-    labels = [label("う", 5.0, 25.0), label("え", 1.0, 3.0), label("お", 20.0, 22.0)]
+    labels = [label("え", 1.0, 3.0), label("お", 20.0, 22.0), label("あ", 2.0, 8.0)]
     result, clamps, slivers = silence.clamp_partial(labels, SPAN, minimum_kept=FRAME)
     assert result == labels
     assert clamps == []
+    assert slivers == []
 
 
 def test_the_clamped_boundaries_never_fall_inside_the_run_after_rounding() -> None:
@@ -349,3 +350,60 @@ def test_the_command_line_records_the_amplitude(tmp_path: Path) -> None:
     document = json.loads((tmp_path / "o.json").read_text(encoding="utf-8"))
     assert document["maximumSilenceAmplitude"] == 8
     assert [item["label"]["text"] for item in document["excludedAsDigitalSilence"]] == ["x"]
+
+
+def test_a_label_that_contains_a_whole_run_ends_where_the_run_starts() -> None:
+    result, clamps, slivers = silence.clamp_partial(
+        [label("ける", 5.0, 25.0)], SPAN, minimum_kept=FRAME
+    )
+    assert result[0]["start"] == 5.0
+    assert result[0]["end"] == 8.0
+    assert result[0]["silenceClamp"] == {
+        "side": "interior",
+        "originalStart": 5.0,
+        "originalEnd": 25.0,
+        "spanStartSeconds": 8.0,
+        "spanEndSeconds": 20.0,
+        "droppedSeconds": 17.0,
+        "rule": "label time inside digital silence is not delivered speech",
+        "droppedTail": {"startSeconds": 20.0, "endSeconds": 25.0},
+    }
+    assert clamps == [{"index": 0, "text": "ける", "side": "interior"}]
+    assert slivers == []
+
+
+def test_a_label_that_contains_a_run_but_has_no_speech_before_it_is_set_aside() -> None:
+    kept, clamps, slivers = silence.clamp_partial(
+        [label("ける", 7.99, 25.0), label("あ", 0.0, 1.0)], SPAN, minimum_kept=FRAME
+    )
+    assert [item["text"] for item in kept] == ["あ"]
+    assert [item["text"] for item in clamps] == ["ける"]
+    assert slivers[0]["label"] == label("ける", 7.99, 25.0)
+    assert slivers[0]["kept"] == pytest.approx(0.01)
+
+
+def test_only_the_first_of_two_runs_inside_a_label_matters() -> None:
+    two = [Span(80, 200, RATE), Span(250, 300, RATE)]
+    result, clamps, _ = silence.clamp_partial([label("ける", 5.0, 40.0)], two, minimum_kept=FRAME)
+    assert result[0]["end"] == 8.0
+    assert len(clamps) == 1
+
+
+def test_the_command_line_ends_a_label_at_a_silence_inside_it(tmp_path: Path) -> None:
+    pcm = tmp_path / "a.wav"
+    write_wav(pcm, block(400, *zeros(6), 500))
+    labels = tmp_path / "labels.json"
+    labels.write_text(
+        json.dumps({"labels": [label("ける", 0.0, 7.0), label("あ", 0.0, 0.05)]}), encoding="utf-8"
+    )
+    code = silence.main(
+        [str(labels), str(pcm), str(tmp_path / "o.json"), "--minimum-seconds", "3",
+         "--clamp-partial", "--fps", "10"]
+    )  # fmt: skip
+    document = json.loads((tmp_path / "o.json").read_text(encoding="utf-8"))
+    assert code == 0
+    assert [(item["text"], item["end"]) for item in document["labels"]] == [
+        ("ける", 0.1),
+        ("あ", 0.05),
+    ]
+    assert document["silenceClamps"][0]["side"] == "interior"

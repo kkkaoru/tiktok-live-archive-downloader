@@ -141,10 +141,12 @@ def clamp_partial(
     """Keep the part of a label outside digital silence when it only partly overlaps a run.
 
     A label that starts inside a run and ends after it starts at the run's end; one that starts
-    before a run and ends inside it ends at the run's start. A label with signal on both sides of
-    a run is untouched. Changed labels carry the original time, the run and the dropped length. A
-    label whose kept part is shorter than `minimum_kept` has almost no acoustic support and is
-    returned among the dropped records instead of as a sliver.
+    before a run and ends inside it ends at the run's start. A label that contains a whole run
+    ends where the run starts (the speech before the silence stays; the tail after it is recorded
+    as `droppedTail`, never delivered as speech). A label with signal on both sides of
+    a run and no run inside it is untouched. Changed labels carry the original time, the run and
+    the dropped length. A label whose kept part is shorter than `minimum_kept` has almost no
+    acoustic support and is returned among the dropped records instead of as a sliver.
     """
     result: list[dict[str, object]] = []
     clamps: list[dict[str, object]] = []
@@ -162,9 +164,14 @@ def clamp_partial(
                 changed["end"] = _rounded(low, ROUND_FLOOR)
                 end = Fraction(str(changed["end"]))
                 side, dropped = "end", Fraction(str(label["end"])) - low
+            elif start < low and high < end:
+                interior_tail = {"startSeconds": float(high), "endSeconds": float(end)}
+                changed["end"] = _rounded(low, ROUND_FLOOR)
+                side, dropped = "interior", end - low
+                end = Fraction(str(changed["end"]))
             else:
                 continue
-            changed["silenceClamp"] = {
+            record: dict[str, object] = {
                 "side": side,
                 "originalStart": label["start"],
                 "originalEnd": label["end"],
@@ -173,6 +180,9 @@ def clamp_partial(
                 "droppedSeconds": float(dropped),
                 "rule": "label time inside digital silence is not delivered speech",
             }
+            if side == "interior":
+                record["droppedTail"] = interior_tail
+            changed["silenceClamp"] = record
             clamps.append({"index": index, "text": label["text"], "side": side})
         if "silenceClamp" in changed and end - start < minimum_kept:
             dropped_labels.append(
