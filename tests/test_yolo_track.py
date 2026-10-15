@@ -193,7 +193,7 @@ def test_the_decoded_stream_samples_the_requested_frames_at_the_training_width(
     )  # fmt: skip
     got = list(
         tracking.video_frames(
-            video, width=320, height=480, start=4, end=25, step=5, ffmpeg="ffmpeg"
+            video, width=320, height=480, start=4, end=25, step=5, rate=10, ffmpeg="ffmpeg"
         )
     )
     assert [number for number, _ in got] == [4, 9, 14, 19, 24]
@@ -205,13 +205,13 @@ def test_an_invalid_range_or_step_is_refused() -> None:
     with pytest.raises(ReplayError, match="Invalid frame range or step"):
         next(
             tracking.video_frames(
-                Path("x.mp4"), width=10, height=10, start=5, end=5, step=1, ffmpeg="ffmpeg"
+                Path("x.mp4"), width=10, height=10, start=5, end=5, step=1, rate=10, ffmpeg="ffmpeg"
             )
         )
     with pytest.raises(ReplayError, match="Invalid frame range or step"):
         next(
             tracking.video_frames(
-                Path("x.mp4"), width=10, height=10, start=0, end=5, step=0, ffmpeg="ffmpeg"
+                Path("x.mp4"), width=10, height=10, start=0, end=5, step=0, rate=10, ffmpeg="ffmpeg"
             )
         )
 
@@ -226,6 +226,7 @@ def test_a_failing_decoder_is_reported(tmp_path: Path) -> None:
                 start=0,
                 end=5,
                 step=1,
+                rate=10,
                 ffmpeg="ffmpeg",
             )
         )

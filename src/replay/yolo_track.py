@@ -146,16 +146,29 @@ def track(
 
 
 def video_frames(
-    source: Path, *, width: int, height: int, start: int, end: int, step: int, ffmpeg: str
+    source: Path,
+    *,
+    width: int,
+    height: int,
+    start: int,
+    end: int,
+    step: int,
+    rate: int,
+    ffmpeg: str,
 ) -> Iterator[tuple[int, NDArray[np.uint8]]]:
-    """Decode frames start, start+step, ... below `end`, scaled to the training width (BGR)."""
-    if not 0 <= start < end or step < 1:
+    """Decode frames start, start+step, ... below `end`, scaled to the training width (BGR).
+
+    The input is sought to `start / rate` and the output is limited to the wanted frame count, so
+    ffmpeg stops reading when the range is done instead of decoding to the end of the file.
+    """
+    if not 0 <= start < end or step < 1 or rate < 1:
         raise ReplayError("Invalid frame range or step")
     scaled = scaled_height(width, height)
-    select = f"select='gte(n,{start})*lt(n,{end})*not(mod(n-{start},{step}))'"
+    count = (end - start + step - 1) // step
     command = [
-        ffmpeg, "-v", "error", "-nostdin", "-i", str(source),
-        "-vf", f"{select},scale={TRAIN_WIDTH}:{scaled}", "-fps_mode", "passthrough",
+        ffmpeg, "-v", "error", "-nostdin", "-ss", f"{start / rate:.6f}", "-i", str(source),
+        "-vf", f"select='not(mod(n,{step}))',scale={TRAIN_WIDTH}:{scaled}",
+        "-frames:v", str(count), "-fps_mode", "passthrough",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]  # fmt: skip
     size = TRAIN_WIDTH * scaled * 3
@@ -258,7 +271,7 @@ def run(args: argparse.Namespace, model: ModelLike) -> dict[str, object]:
     rows, inference = track(
         video_frames(
             args.source, width=width, height=height, start=args.start, end=args.end,
-            step=args.step, ffmpeg=args.ffmpeg,
+            step=args.step, rate=rate, ffmpeg=args.ffmpeg,
         ),
         model, scale=width / TRAIN_WIDTH, batch=args.batch, device=args.device, imgsz=args.imgsz,
     )  # fmt: skip
