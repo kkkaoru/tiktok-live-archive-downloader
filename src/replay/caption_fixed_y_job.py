@@ -1,0 +1,292 @@
+"""Plan one fixed origin per caption run for a time range of a paged recording.
+
+Inputs are verified evidence only: the paging output (text, display interval and line breaks), the
+cached glyph measurements it used, the style calibration, the cut plan mapping the output clock to
+the source clock, and the person's top edge over source time. Each run (see ``caption_fixed_y``)
+gets one top origin that keeps its tallest page above the person; a run that cannot is recorded as
+a failure rather than moved, shrunk or guessed. The result is a candidate-only measured-caption
+document bound to the calibration and to every input it used.
+"""
+
+import argparse
+import hashlib
+import json
+import sys
+from bisect import bisect_right
+from collections.abc import Sequence
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+
+from replay import caption_fixed_y as fixed
+from replay.core import ReplayError
+from replay.fcp_tracking_caption import (
+    FaceObservation,
+    TrackingPosition,
+    read_verified_face_observations,
+)
+from replay.vertical_captions import Box
+
+COORDINATE_SYSTEM = "top-left canvas; calibrated text origin"
+MAX_LINES_TOP_READER = 2
+
+
+@dataclass(frozen=True, slots=True)
+class CutMap:
+    """Output frame to source frame, from a cut plan's rows."""
+
+    starts: tuple[int, ...]
+    rows: tuple[tuple[int, int, int], ...]
+
+    def source_frame(self, frame: int) -> int:
+        index = bisect_right(self.starts, frame) - 1
+        if index < 0:
+            raise ReplayError("Output frame precedes the cut plan")
+        output_start, length, source_start = self.rows[index]
+        return source_start + min(frame - output_start, length - 1)
+
+
+def cut_map(cuts: Sequence[dict[str, int]]) -> CutMap:
+    """Build the output-to-source frame map from `output_start_frame`/`source_*_frame` rows."""
+    rows = tuple(
+        (
+            c["output_start_frame"],
+            c["source_end_frame"] - c["source_start_frame"],
+            c["source_start_frame"],
+        )
+        for c in cuts
+    )
+    if not rows or any(b[0] <= a[0] for a, b in zip(rows, rows[1:], strict=False)):
+        raise ReplayError("Cut plan rows must be ordered by output frame")
+    return CutMap(tuple(row[0] for row in rows), rows)
+
+
+def top_envelope(
+    sizes: dict[str, tuple[float, float]], *, padding: float, ascent: float, line_advance: float
+) -> fixed.Envelope:
+    """The top-origin glyph envelope of a page, from cached per-line sizes and the calibration."""
+
+    def envelope(text: str) -> Box:
+        lines = text.split("\n")
+        measured = [sizes[line] for line in lines]
+        width = max(size[0] for size in measured)
+        height = max(size[1] for size in measured) + (len(lines) - 1) * line_advance
+        top = -padding - ascent
+        return Box(-width / 2, top, width / 2, top + height)
+
+    return envelope
+
+
+def select_cues(
+    pages: Sequence[dict[str, object]], *, start: Fraction, end: Fraction, max_lines: int
+) -> list[fixed.RunCue]:
+    """Pages inside [start, end) with at most `max_lines` lines, as ordered run cues."""
+    if not 1 <= max_lines <= 3 or start >= end:
+        raise ReplayError("Invalid cue selection")
+    selected: list[fixed.RunCue] = []
+    for page in pages:
+        text = str(page["text"])
+        first = Fraction(str(page["start"])).limit_denominator(100000)
+        last = Fraction(str(page["end"])).limit_denominator(100000)
+        if first >= start and last <= end and len(text.split("\n")) <= max_lines:
+            selected.append(fixed.RunCue(text, first, last))
+    if not selected:
+        raise ReplayError("No page matches the time range and line limit")
+    return selected
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def person_top_from(
+    observed: Sequence[TrackingPosition], mapping: CutMap, *, rate: int, maximum_drift: float
+) -> fixed.PersonTop:
+    """A person-top function over output seconds; observed samples live in source time."""
+
+    def person_top(start: Fraction, end: Fraction) -> float:
+        first = int(start * rate)
+        last = max(first + 1, int(end * rate)) - 1
+        source_first, source_last = mapping.source_frame(first), mapping.source_frame(last)
+        estimate = fixed.person_top_with_hold(
+            observed,
+            Fraction(source_first, rate),
+            Fraction(max(source_last, source_first) + 1, rate),
+            maximum_drift=maximum_drift,
+        )
+        return estimate.top
+
+    return person_top
+
+
+def plan_runs(
+    cues: Sequence[fixed.RunCue],
+    *,
+    rate: int,
+    region: Box,
+    center_x: float,
+    clearance: float,
+    envelope: fixed.Envelope,
+    person_top: fixed.PersonTop,
+) -> tuple[list[fixed.FixedCue], list[dict[str, object]]]:
+    """Fixed origins for every run that fits; the others are returned as recorded failures."""
+    placed: list[fixed.FixedCue] = []
+    failures: list[dict[str, object]] = []
+    for number, run in enumerate(fixed.split_runs(cues, rate=rate)):
+        members = [cues[i] for i in run]
+        try:
+            placed.extend(
+                fixed.fixed_origins(
+                    members, rate=rate, region=region, center_x=center_x, clearance=clearance,
+                    envelope=envelope, person_top=person_top,
+                )
+            )  # fmt: skip
+        except ReplayError as error:
+            failures.append(
+                {
+                    "run": number,
+                    "cues": len(members),
+                    "start": float(members[0].start),
+                    "error": str(error),
+                }
+            )
+    return placed, failures
+
+
+def rebased(cues: Sequence[fixed.FixedCue], *, offset: Fraction) -> list[fixed.FixedCue]:
+    """The same cues with their times moved so the range starts at zero."""
+    return [
+        fixed.FixedCue(
+            fixed.RunCue(item.cue.text, item.cue.start - offset, item.cue.end - offset),
+            item.run,
+            item.x,
+            item.y,
+        )
+        for item in cues
+    ]
+
+
+def observed_only(samples: Sequence[FaceObservation]) -> list[TrackingPosition]:
+    """The observed face-top samples in time order; frames without a face are not invented."""
+    ordered = sorted(samples, key=lambda sample: sample.time)
+    return [
+        TrackingPosition(item.time, item.position.x, item.position.y)
+        for item in ordered
+        if item.position is not None
+    ]
+
+
+def load_observed(window_index: Path) -> list[TrackingPosition]:
+    """Observed face-top samples (source time) from every verified raw face window."""
+    samples: list[FaceObservation] = []
+    for window in json.loads(window_index.read_text(encoding="utf-8"))["windows"]:
+        series = read_verified_face_observations(
+            Path(window["config"]), Path(window["evidence"]), anchor="top"
+        )
+        samples.extend(series.samples)
+    return observed_only(samples)
+
+
+def candidate_for(
+    placed: Sequence[fixed.FixedCue],
+    *,
+    canvas: tuple[int, int],
+    rate: int,
+    calibration: Path,
+    inputs: Sequence[Path],
+) -> dict[str, object]:
+    """The candidate document bound to the calibration and to every input file it used."""
+    digests = {str(path): sha256(path) for path in (calibration, *inputs)}
+    return fixed.candidate_document(
+        placed,
+        canvas=canvas,
+        rate=rate,
+        coordinate_system=COORDINATE_SYSTEM,
+        inputs=digests,
+        calibration=(str(calibration), digests[str(calibration)]),
+    )
+
+
+def line_sizes(paging: Path) -> dict[str, tuple[float, float]]:
+    """Cached single-line (width, height) from the paging run's native measurement responses."""
+    sizes: dict[str, tuple[float, float]] = {}
+    for response in sorted(paging.glob("metrics-*/batch-*.response.json")):
+        for item in json.loads(response.read_text(encoding="utf-8"))["bounds"]:
+            sizes[item["text"]] = (float(item["width"]), float(item["height"]))
+    if not sizes:
+        raise ReplayError("The paging directory holds no cached line measurements")
+    return sizes
+
+
+def parse(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("paging", type=Path, help="paging directory with reflow.json and metrics-*")
+    parser.add_argument("window_index", type=Path, help="verified raw face windows index")
+    parser.add_argument("cuts", type=Path, help="supported-cuts.json (output to source frames)")
+    parser.add_argument("calibration", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--start-seconds", type=Fraction, required=True)
+    parser.add_argument("--end-seconds", type=Fraction, required=True)
+    parser.add_argument("--max-lines", type=int, default=MAX_LINES_TOP_READER)
+    parser.add_argument("--rate", type=int, default=30)
+    parser.add_argument("--region-top", type=float, required=True)
+    parser.add_argument("--region-bottom", type=float, required=True)
+    parser.add_argument("--clearance", type=float, required=True)
+    parser.add_argument("--maximum-drift", type=float, required=True)
+    parser.add_argument("--rebase", action="store_true")
+    return parser.parse_args(argv)
+
+
+def run_plan(args: argparse.Namespace, observed: Sequence[TrackingPosition]) -> dict[str, object]:
+    """Plan the range from the arguments and observed samples; write the candidate document."""
+    if args.output.exists() or args.output.is_symlink():
+        raise ReplayError("Refusing to overwrite the output")
+    calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+    width, height = calibration["canvas"]
+    reflow = args.paging / "reflow.json"
+    cues = select_cues(
+        json.loads(reflow.read_text(encoding="utf-8"))["captions"],
+        start=args.start_seconds,
+        end=args.end_seconds,
+        max_lines=args.max_lines,
+    )
+    mapping = cut_map(json.loads(args.cuts.read_text(encoding="utf-8"))["cuts"])
+    placed, failures = plan_runs(
+        cues,
+        rate=args.rate,
+        region=Box(0.0, args.region_top, float(width), args.region_bottom),
+        center_x=width / 2,
+        clearance=args.clearance,
+        envelope=top_envelope(
+            line_sizes(args.paging),
+            padding=float(calibration["padding"]),
+            ascent=float(calibration["nativeFont"]["renderedAscent"]),
+            line_advance=float(calibration["style"]["motion_line_advance"]),
+        ),
+        person_top=person_top_from(
+            observed, mapping, rate=args.rate, maximum_drift=args.maximum_drift
+        ),
+    )
+    chosen = rebased(placed, offset=args.start_seconds) if args.rebase else placed
+    document = candidate_for(
+        chosen,
+        canvas=(int(width), int(height)),
+        rate=args.rate,
+        calibration=args.calibration,
+        inputs=[reflow, args.window_index, args.cuts],
+    )
+    document["plannedRuns"] = {"placedCues": len(placed), "failedRuns": failures}
+    args.output.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"placedCues": len(placed), "failedRuns": len(failures)}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse(argv)
+    if args.output.exists() or args.output.is_symlink():
+        raise ReplayError("Refusing to overwrite the output")
+    print(json.dumps(run_plan(args, load_observed(args.window_index))))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
