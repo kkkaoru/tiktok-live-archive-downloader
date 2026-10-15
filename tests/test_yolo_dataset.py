@@ -315,3 +315,56 @@ def test_thinning_that_removes_every_training_frame_is_refused(tmp_path: Path) -
     source = make_dataset(tmp_path, [(60, "train"), (120, "val")])
     with pytest.raises(ReplayError, match="removes every training frame"):
         dataset.thin_train(source, tmp_path / "thin", every=2, step=60)
+
+
+def relabel_source(tmp_path: Path) -> Path:
+    source = tmp_path / "base"
+    for part in ("train", "val"):
+        (source / "images" / part).mkdir(parents=True)
+        (source / "labels" / part).mkdir(parents=True)
+    rows = [
+        {"frame": 0, "split": "train", "captions": 1, "face": False},
+        {"frame": 60, "split": "val", "captions": 1, "face": False},
+    ]
+    for row in rows:
+        name = f"frame-{row['frame']:06d}"
+        (source / "images" / str(row["split"]) / f"{name}.jpg").write_bytes(b"jpeg")
+        (source / "labels" / str(row["split"]) / f"{name}.txt").write_text("1 0.5 0.5 0.1 0.1\n")
+    (source / "frames.json").write_text(json.dumps(rows), encoding="utf-8")
+    (source / "data.yaml").write_text(f"path: {source}\ntrain: images/train\n", encoding="utf-8")
+    return source
+
+
+def test_relabel_links_the_images_keeps_the_split_and_adds_new_face_labels(tmp_path: Path) -> None:
+    source = relabel_source(tmp_path)
+    caption = PixelBox(100.0, 200.0, 300.0, 100.0)
+    face = PixelBox(10.0, 20.0, 108.0, 192.0)
+    output = tmp_path / "relabelled"
+    counts = dataset.relabel(
+        source,
+        output,
+        captions={0: [caption], 60: [caption]},
+        faces={60: face},
+    )
+    assert counts == (2, 1)
+    assert (output / "images/train/frame-000000.jpg").samefile(
+        source / "images/train/frame-000000.jpg"
+    )
+    assert (output / "labels/train/frame-000000.txt").read_text() == (
+        "1 0.231481 0.130208 0.277778 0.052083\n"
+    )
+    assert (output / "labels/val/frame-000060.txt").read_text().splitlines()[1].startswith("0 ")
+    rows = json.loads((output / "frames.json").read_text())
+    assert [(r["frame"], r["split"], r["face"]) for r in rows] == [
+        (0, "train", False),
+        (60, "val", True),
+    ]
+    assert (output / "data.yaml").read_text() == f"path: {output}\ntrain: images/train\n"
+
+
+def test_relabel_refuses_a_frame_without_a_caption_observation(tmp_path: Path) -> None:
+    source = relabel_source(tmp_path)
+    with pytest.raises(ReplayError, match="no caption observation"):
+        dataset.relabel(
+            source, tmp_path / "out", captions={0: [PixelBox(0.0, 0.0, 10.0, 10.0)]}, faces={}
+        )

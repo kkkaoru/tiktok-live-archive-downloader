@@ -9,6 +9,7 @@ blocks with a guard gap.
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -155,6 +156,51 @@ def thin_train(source: Path, output: Path, *, every: int, step: int) -> tuple[in
     return train, len(kept) - train
 
 
+def relabel(
+    source: Path,
+    output: Path,
+    *,
+    captions: dict[int, list[PixelBox]],
+    faces: dict[int, PixelBox],
+) -> tuple[int, int]:
+    """Rebuild a dataset's labels from newer face observations, reusing its extracted images.
+
+    Images are hard-linked (no copy, no new decoding) and the train/validation split is kept, so
+    scores stay comparable. Returns (frames, frames with a face label). A frame whose caption
+    observation is gone is refused rather than silently left unlabelled.
+    """
+    record = json.loads((source / "frames.json").read_text(encoding="utf-8"))
+    for part in ("train", "val"):
+        (output / "images" / part).mkdir(parents=True)
+        (output / "labels" / part).mkdir(parents=True)
+    result: list[dict[str, object]] = []
+    for item in record:
+        number, part = int(item["frame"]), str(item["split"])
+        if number not in captions:
+            raise ReplayError("A frame of the dataset has no caption observation")
+        name = f"frame-{number:06d}"
+        os.link(source / "images" / part / f"{name}.jpg", output / "images" / part / f"{name}.jpg")
+        rows = [yolo_row(CAPTION, box, canvas=CANVAS) for box in captions[number]]
+        face = faces.get(number)
+        if face is not None:
+            rows.append(yolo_row(FACE, face, canvas=CANVAS))
+        (output / "labels" / part / f"{name}.txt").write_text(
+            "\n".join(rows) + "\n", encoding="utf-8"
+        )
+        result.append(
+            {
+                "frame": number,
+                "split": part,
+                "captions": len(captions[number]),
+                "face": face is not None,
+            }
+        )
+    data = (source / "data.yaml").read_text(encoding="utf-8").replace(str(source), str(output))
+    (output / "data.yaml").write_text(data, encoding="utf-8")
+    (output / "frames.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
+    return len(result), sum(1 for row in result if row["face"])
+
+
 def extract(source: Path, frames: list[int], directory: Path, *, size: int, rate: int) -> None:
     """Write one JPEG per frame number, seeking to each frame instead of decoding the whole file."""
     for number in frames:
@@ -183,12 +229,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gap", type=int, required=True)
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument("--limit", type=int, default=0, help="0 = no limit (diagnostics only)")
+    parser.add_argument(
+        "--relabel-from",
+        type=Path,
+        help="reuse the images and split of this dataset; only the labels are rebuilt",
+    )
     args = parser.parse_args(argv)
     admissions = args.admission + read_paths(args.admission_list)
     responses = args.face_response + read_paths(args.face_response_list)
     if not admissions or not responses:
         raise ReplayError("Admission and face-response paths are required")
     captions, faces = load_captions(admissions), load_faces(responses)
+    if args.relabel_from is not None:
+        frames, faced = relabel(args.relabel_from, args.output, captions=captions, faces=faces)
+        print(json.dumps({"frames": frames, "framesWithFaceLabel": faced}))
+        return 0
     candidates = [n for n in sorted(captions) if n % args.step == 0]
     if args.limit:
         candidates = candidates[: args.limit]
