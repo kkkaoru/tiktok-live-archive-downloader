@@ -90,20 +90,6 @@ def worst_person_top(series: Sequence[TrackingPosition], start: Fraction, end: F
     return top
 
 
-def bottom_origin_envelope(top_origin: Box, *, padding: float) -> Box:
-    """Re-express a top-origin envelope with the paragraph bottom as the origin.
-
-    The paragraph keeps its measured height; `padding` is added below the origin so that a border or
-    shadow that extends past the last baseline can only push the caption away from the person.
-    """
-    if not isfinite(padding) or padding < 0:
-        raise ReplayError("Invalid envelope padding")
-    height = top_origin.bottom - top_origin.top
-    if height <= 0:
-        raise ReplayError("Envelope has no height")
-    return Box(top_origin.left, -height, top_origin.right, padding)
-
-
 @dataclass(frozen=True, slots=True)
 class PersonTopEstimate:
     """The worst-case person top for a run and whether it was observed or held.
@@ -192,12 +178,21 @@ def candidate_document(
     rate: int,
     coordinate_system: str,
     inputs: dict[str, str],
+    calibration: tuple[str, str],
 ) -> dict[str, object]:
-    """Candidate-only measured-caption document; approvals stay false for the caller to earn."""
+    """Candidate-only measured-caption document; approvals stay false for the caller to earn.
+
+    `calibration` is the (path, sha256) of the render calibration; downstream readers require it
+    to be one of the bound inputs with the same digest, so a mismatch is refused here already.
+    """
+    path, digest = calibration
+    if inputs.get(path) != digest:
+        raise ReplayError("The render calibration must be bound among the document inputs")
     return {
         "version": 1,
         "candidateOnly": True,
         "inputs": inputs,
+        "renderCalibration": {"path": path, "sha256": digest},
         "canvas": list(canvas),
         "coordinateSystem": coordinate_system,
         "policy": {"frame_rate": rate},

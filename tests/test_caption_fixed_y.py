@@ -147,10 +147,12 @@ def test_candidate_document_is_candidate_only_with_all_approvals_false() -> None
         result,
         canvas=(1080, 1920),
         rate=30,
-        coordinate_system="top-left canvas; measured paragraph bottom origin",
-        inputs={"/x": "0" * 64},
+        coordinate_system="top-left canvas; calibrated text origin",
+        inputs={"/cal.json": "1" * 64},
+        calibration=("/cal.json", "1" * 64),
     )
     assert document["candidateOnly"] is True
+    assert document["renderCalibration"] == {"path": "/cal.json", "sha256": "1" * 64}
     assert document["canvas"] == [1080, 1920]
     assert document["policy"] == {"frame_rate": 30}
     assert document["candidates"] == [
@@ -202,15 +204,19 @@ def test_person_top_with_hold_rejects_invalid_requests() -> None:
         fixed.person_top_with_hold(observed(), Fraction(1), Fraction(2), maximum_drift=-1.0)
 
 
-def test_a_bottom_origin_envelope_keeps_the_measured_height_and_adds_padding_below() -> None:
-    top_origin = Box(-300.0, -90.0, 300.0, 60.0)
-    assert fixed.bottom_origin_envelope(top_origin, padding=12.0) == Box(
-        -300.0, -150.0, 300.0, 12.0
-    )
-
-
-def test_a_bottom_origin_envelope_rejects_bad_padding_or_an_empty_box() -> None:
-    with pytest.raises(ReplayError, match="Invalid envelope padding"):
-        fixed.bottom_origin_envelope(Box(-1.0, -2.0, 1.0, 2.0), padding=-1.0)
-    with pytest.raises(ReplayError, match="no height"):
-        fixed.bottom_origin_envelope(Box(-1.0, 2.0, 1.0, 2.0), padding=1.0)
+def test_a_calibration_missing_from_or_different_in_the_inputs_is_refused() -> None:
+    cues = [cue("あ", "0", "1/3")]
+    result = fixed.fixed_origins(
+        cues, rate=30, region=REGION, center_x=540.0, clearance=20.0,
+        envelope=envelope, person_top=person(1000.0),
+    )  # fmt: skip
+    with pytest.raises(ReplayError, match="bound among the document inputs"):
+        fixed.candidate_document(
+            result, canvas=(1080, 1920), rate=30, coordinate_system="c",
+            inputs={}, calibration=("/cal.json", "1" * 64),
+        )  # fmt: skip
+    with pytest.raises(ReplayError, match="bound among the document inputs"):
+        fixed.candidate_document(
+            result, canvas=(1080, 1920), rate=30, coordinate_system="c",
+            inputs={"/cal.json": "2" * 64}, calibration=("/cal.json", "1" * 64),
+        )  # fmt: skip
