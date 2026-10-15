@@ -50,7 +50,6 @@ WINDOW = 8 * MODEL_SAMPLE_RATE
 HOP = WINDOW // 2
 MAX_CHUNK_SAMPLES = 3600 * MODEL_SAMPLE_RATE
 MAX_WORKERS = 2
-DEVICES = ("cpu", "mps")
 POLL_SECONDS = 0.2
 METADATA_ALLOWANCE_BYTES = 16 * 1024 * 1024
 ARRAY_HEADER_ALLOWANCE_BYTES = 4096
@@ -391,9 +390,7 @@ def request_definition(
     selected: tuple[Window, ...],
     budget: WindowBudget,
     directory: Path,
-    device: str = "cpu",
 ) -> dict[str, object]:
-    require(device in DEVICES, "Unsupported separation device")
     environment = _local_environment()
     scratch = directory / "tmp"
     cache = directory / "cache"
@@ -422,7 +419,7 @@ def request_definition(
         "weightsSHA256": MODEL_SHA256,
         "configSHA256": MODEL_CONFIG_SHA256,
         "environment": environment,
-        "device": device,
+        "device": "cpu",
         "qualityApproved": False,
     }
 
@@ -454,7 +451,7 @@ def verify_worker(directory: Path) -> dict[str, object]:
     require(
         request.get("codePins") == code_pins()
         and request.get("providerPins") == provider_pins()
-        and request.get("device") in DEVICES
+        and request.get("device") == "cpu"
         and request.get("modelRevision") == MODEL_REVISION
         and request.get("weightsSHA256") == MODEL_SHA256
         and request.get("configSHA256") == MODEL_CONFIG_SHA256
@@ -479,7 +476,7 @@ def verify_worker(directory: Path) -> dict[str, object]:
 def worker(
     directory: Path,
     *,
-    backend_factory: BackendFactory | None = None,
+    backend_factory: BackendFactory = lambda: _MlxBackend("cpu"),
     auditor: Auditor = audit_descriptors,
 ) -> None:
     """A fresh Python process owns its model, arrays, scratch and only its outputs."""
@@ -502,7 +499,7 @@ def worker(
         request.get("codePins") == code_pins()
         and request.get("providerPins") == provider_pins()
         and request.get("environment") == _local_environment()
-        and request.get("device") in DEVICES
+        and request.get("device") == "cpu"
         and request.get("modelRevision") == MODEL_REVISION
         and request.get("weightsSHA256") == MODEL_SHA256
         and request.get("configSHA256") == MODEL_CONFIG_SHA256
@@ -513,8 +510,7 @@ def worker(
     source = load_array(payload, samples=int(str(samples)))
     auditor(directory, "before-load")
     loaded = time.monotonic()
-    device = str(request["device"])
-    backend = backend_factory() if backend_factory is not None else _MlxBackend(device)
+    backend = backend_factory()
     load_seconds = time.monotonic() - loaded
     auditor(directory, "after-load")
     timings: dict[str, float] = {}
@@ -526,10 +522,6 @@ def worker(
         predicted = backend.extract_vocals(padded)
         require(
             predicted.shape == (2, WINDOW) and bool(np.isfinite(predicted).all()), "Invalid voice"
-        )
-        require(
-            device == "cpu" or not bool(np.any(padded)) or bool(np.any(predicted)),
-            "Silent accelerator output for non-silent input",
         )
         timings[str(window.index)] = time.monotonic() - started
         save_array(directory / f"window-{window.index:06d}.npy", predicted)
@@ -654,9 +646,7 @@ def run_windows(
     *,
     budget: WindowBudget,
     execute: Execute = execute_children,
-    device: str = "cpu",
 ) -> NDArray[np.float32]:
-    require(device in DEVICES, "Unsupported separation device")
     directory = local_directory(directory)
     require(
         audio.dtype == np.dtype(np.float32)
@@ -681,8 +671,6 @@ def run_windows(
         "codePins": code_pins(),
         "providerPins": provider_pins(),
     }
-    if device != "cpu":
-        definition["device"] = device
     with execution_lock(directory, ".parent") as acquired:
         require(acquired, "Parallel window owner already active")
         if (directory / "input.json").exists():
@@ -704,7 +692,6 @@ def run_windows(
                 selected=selected[index::count],
                 budget=budget,
                 directory=child_directory,
-                device=device,
             )
             path = child_directory / "request.json"
             if path.exists():
@@ -877,9 +864,7 @@ def _nonnegative_number(value: object) -> bool:
     )
 
 
-def _verify_pool(
-    plan: ProbePlan, name: str, audio: NDArray[np.float32], device: str = "cpu"
-) -> NDArray[np.float32]:
+def _verify_pool(plan: ProbePlan, name: str, audio: NDArray[np.float32]) -> NDArray[np.float32]:
     pool = plan.directory / name
     budget = _serial_budget(plan.budget) if name == "serial" else plan.budget
     expected = {
@@ -889,8 +874,6 @@ def _verify_pool(
         "codePins": code_pins(),
         "providerPins": provider_pins(),
     }
-    if device != "cpu":
-        expected["device"] = device
     require(read(pool / "input.json") == expected, "Pool input binding changed")
     require(
         np.array_equal(load_array(pool / "chunk.npy", samples=plan.samples), audio),
@@ -911,8 +894,7 @@ def _verify_pool(
         require(
             selected_windows(request) == windows(plan.samples)[index::count]
             and request.get("samples") == plan.samples
-            and request.get("budget") == asdict(budget)
-            and request.get("device") == device,
+            and request.get("budget") == asdict(budget),
             "Worker allocation changed",
         )
         environment = _local_environment()

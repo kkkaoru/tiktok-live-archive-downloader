@@ -477,36 +477,3 @@ def test_comparison_cli_routes(plan: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert pipeline.main([*arguments, "--verify"]) == 0
     assert pipeline.main([*arguments, "--resume"]) == 1
     assert calls == [False, True]
-
-
-def test_accelerator_plan_records_device_and_verifies_readonly(
-    plan: Path, setup: tuple[Path, window.Execute]
-) -> None:
-    work, execute = setup
-    data = read(plan)
-    data["device"] = "mps"
-    replace_json(plan, data)
-    receipt = pipeline.run(plan, execute=execute)
-    assert read(receipt)["device"] == "mps"
-    assert read(work / "pipeline/chunks/chunk-000000/parallel/input.json")["device"] == "mps"
-    assert read(work / "pipeline/chunks/chunk-000000/parallel/worker-00/request.json")[
-        "device"
-    ] == ("mps")
-    pipeline.verify(plan)
-
-
-def test_plan_without_device_stays_a_cpu_plan(
-    plan: Path, setup: tuple[Path, window.Execute]
-) -> None:
-    work, execute = setup
-    receipt = pipeline.run(plan, execute=execute)
-    assert read(receipt)["device"] == "cpu"
-    assert "device" not in read(work / "pipeline/chunks/chunk-000000/parallel/input.json")
-
-
-def test_unsupported_plan_device_refused(plan: Path) -> None:
-    data = read(plan)
-    data["device"] = "gpu"
-    replace_json(plan, data)
-    with pytest.raises(ReplayError, match="Unsupported pipeline plan"):
-        pipeline.load_plan(plan)

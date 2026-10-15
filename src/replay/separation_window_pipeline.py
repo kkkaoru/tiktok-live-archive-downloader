@@ -49,7 +49,6 @@ from replay.recordings import record
 from replay.separation_forward_probe import _local_environment
 from replay.separation_window_budget import (
     ARRAY_HEADER_ALLOWANCE_BYTES,
-    DEVICES,
     METADATA_ALLOWANCE_BYTES,
     Execute,
     ProbePlan,
@@ -114,11 +113,6 @@ class PipelinePlan:
     definition: dict[str, object]
 
 
-def plan_device(plan: PipelinePlan) -> str:
-    """The separation device the plan declares; plans without the field are CPU plans."""
-    return str(plan.definition.get("device", "cpu"))
-
-
 def pcm_info(path: Path) -> int:
     before = identity(path)
     with path.open("rb") as stream, wave.open(stream, "rb") as audio:
@@ -154,7 +148,7 @@ def load_plan(path: Path) -> PipelinePlan:
     path = canonical(str(path))
     data = read(path)
     require(
-        set(data) - {"device"}
+        set(data)
         == {
             "version",
             "kind",
@@ -177,8 +171,7 @@ def load_plan(path: Path) -> PipelinePlan:
         and _integer(data.get("overlapSamples")) == OVERLAP
         and _integer(data.get("sampleRate")) == MODEL_SAMPLE_RATE
         and data.get("qualityApproved") is False
-        and data.get("productionBackendAdopted") is False
-        and data.get("device", "cpu") in DEVICES,
+        and data.get("productionBackendAdopted") is False,
         "Unsupported pipeline plan",
     )
     source_ref = _references([data.get("source")])
@@ -327,7 +320,7 @@ def verify_chunk(
     before = [pin(path) for path in outputs]
     checkpoint = read(proxy.directory / "complete.json")
     require(checkpoint == {"outputs": before, "qualityApproved": False}, "Chunk checkpoint changed")
-    reduced = _verify_pool(proxy, "parallel", audio, plan_device(plan))
+    reduced = _verify_pool(proxy, "parallel", audio)
     saved = load_array(proxy.directory / "vocals.npy", samples=end - start)
     require(
         np.array_equal(reduced, saved) and [pin(path) for path in outputs] == before,
@@ -355,11 +348,7 @@ def run_chunk(
         proxy.directory.mkdir(mode=0o700, parents=True)
         durable(proxy.directory / "input.json", definition)
     reduced = run_windows(
-        audio,
-        proxy.directory / "parallel",
-        budget=plan.budget.window,
-        execute=execute,
-        device=plan_device(plan),
+        audio, proxy.directory / "parallel", budget=plan.budget.window, execute=execute
     )
     destination = proxy.directory / "vocals.npy"
     if destination.exists():
@@ -562,7 +551,7 @@ def run(plan_path: Path, *, resume: bool = False, execute: Execute = execute_chi
                 "source": str(plan.source),
                 "gainDB": 0.0,
                 "preparedInput": True,
-                "device": plan_device(plan),
+                "device": "cpu",
                 "modelInput": str(plan.source),
                 "vocals": str(destination),
                 "separation": repr(result),
