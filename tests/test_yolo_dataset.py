@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from replay import yolo_dataset as dataset
+from replay.core import ReplayError
 from replay.yolo_labels import PixelBox
 
 
@@ -207,3 +208,110 @@ def test_main_builds_the_dataset_in_process(tmp_path: Path) -> None:
     assert (tmp_path / "out/labels/train/frame-000060.txt").read_text().splitlines() == [
         "1 0.462963 0.807292 0.740741 0.052083"
     ]
+
+
+def test_path_lists_keep_their_order_and_ignore_blank_lines(tmp_path: Path) -> None:
+    listing = tmp_path / "paths.txt"
+    listing.write_text("/a/one.json\n\n/b/two.json\n", encoding="utf-8")
+    assert dataset.read_paths(listing) == [Path("/a/one.json"), Path("/b/two.json")]
+    assert dataset.read_paths(None) == []
+
+
+def test_main_requires_admission_and_face_paths(tmp_path: Path) -> None:
+    with pytest.raises(ReplayError, match="paths are required"):
+        dataset.main(
+            [str(tmp_path / "s.mp4"), str(tmp_path / "o"), "--step", "30", "--block", "1",
+             "--validation-every", "2", "--gap", "0"]
+        )  # fmt: skip
+
+
+def test_a_faced_dataset_keeps_only_frames_with_a_face_label(tmp_path: Path) -> None:
+    source = tmp_path / "all"
+    for part in ("train", "val"):
+        (source / "images" / part).mkdir(parents=True)
+        (source / "labels" / part).mkdir(parents=True)
+    rows = [
+        {"frame": 0, "split": "train", "captions": 1, "face": True},
+        {"frame": 30, "split": "train", "captions": 1, "face": False},
+        {"frame": 60, "split": "val", "captions": 1, "face": True},
+    ]
+    for row in rows:
+        name = f"frame-{row['frame']:06d}"
+        (source / "images" / str(row["split"]) / f"{name}.jpg").write_bytes(b"jpeg")
+        (source / "labels" / str(row["split"]) / f"{name}.txt").write_text("1 0.5 0.5 0.1 0.1\n")
+    (source / "frames.json").write_text(json.dumps(rows), encoding="utf-8")
+    (source / "data.yaml").write_text(f"path: {source}\ntrain: images/train\n", encoding="utf-8")
+    output = tmp_path / "faced"
+    assert dataset.select_faced(source, output) == 2
+    assert sorted(p.name for p in (output / "images/train").iterdir()) == ["frame-000000.jpg"]
+    assert sorted(p.name for p in (output / "labels/val").iterdir()) == ["frame-000060.txt"]
+    assert (output / "data.yaml").read_text() == f"path: {output}\ntrain: images/train\n"
+    assert [r["frame"] for r in json.loads((output / "frames.json").read_text())] == [0, 60]
+
+
+def test_a_faced_dataset_needs_at_least_one_face_label(tmp_path: Path) -> None:
+    source = tmp_path / "all"
+    source.mkdir()
+    rows = [{"frame": 0, "split": "train", "captions": 1, "face": False}]
+    (source / "frames.json").write_text(json.dumps(rows), encoding="utf-8")
+    with pytest.raises(ReplayError, match="No frame carries a trusted face label"):
+        dataset.select_faced(source, tmp_path / "faced")
+
+
+def make_dataset(root: Path, frames: list[tuple[int, str]]) -> Path:
+    source = root / "all"
+    for part in ("train", "val"):
+        (source / "images" / part).mkdir(parents=True)
+        (source / "labels" / part).mkdir(parents=True)
+    rows = []
+    for number, split in frames:
+        name = f"frame-{number:06d}"
+        (source / "images" / split / f"{name}.jpg").write_bytes(b"jpeg")
+        (source / "labels" / split / f"{name}.txt").write_text("1 0.5 0.5 0.1 0.1\n")
+        rows.append({"frame": number, "split": split, "captions": 1, "face": True})
+    (source / "frames.json").write_text(json.dumps(rows), encoding="utf-8")
+    (source / "data.yaml").write_text(f"path: {source}\ntrain: images/train\n", encoding="utf-8")
+    return source
+
+
+def test_thinning_keeps_every_nth_training_frame_and_all_validation_frames(tmp_path: Path) -> None:
+    frames = [
+        (0, "train"),
+        (60, "train"),
+        (120, "train"),
+        (180, "train"),
+        (240, "val"),
+        (300, "val"),
+    ]
+    source = make_dataset(tmp_path, frames)
+    output = tmp_path / "thin"
+    assert dataset.thin_train(source, output, every=2, step=60) == (2, 2)
+    assert sorted(p.name for p in (output / "images/train").iterdir()) == [
+        "frame-000000.jpg",
+        "frame-000120.jpg",
+    ]
+    assert sorted(p.name for p in (output / "labels/val").iterdir()) == [
+        "frame-000240.txt",
+        "frame-000300.txt",
+    ]
+    assert (output / "data.yaml").read_text() == f"path: {output}\ntrain: images/train\n"
+    assert [r["frame"] for r in json.loads((output / "frames.json").read_text())] == [
+        0,
+        120,
+        240,
+        300,
+    ]
+
+
+def test_an_invalid_thinning_request_is_refused(tmp_path: Path) -> None:
+    source = make_dataset(tmp_path, [(0, "train"), (60, "val")])
+    with pytest.raises(ReplayError, match="Invalid thinning request"):
+        dataset.thin_train(source, tmp_path / "a", every=1, step=60)
+    with pytest.raises(ReplayError, match="Invalid thinning request"):
+        dataset.thin_train(source, tmp_path / "b", every=2, step=0)
+
+
+def test_thinning_that_removes_every_training_frame_is_refused(tmp_path: Path) -> None:
+    source = make_dataset(tmp_path, [(60, "train"), (120, "val")])
+    with pytest.raises(ReplayError, match="removes every training frame"):
+        dataset.thin_train(source, tmp_path / "thin", every=2, step=60)

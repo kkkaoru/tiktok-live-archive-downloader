@@ -9,6 +9,7 @@ blocks with a guard gap.
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -88,6 +89,72 @@ def load_faces(responses: list[Path]) -> dict[int, PixelBox]:
     return result
 
 
+def read_paths(path: Path | None) -> list[Path]:
+    """Ordered paths from a list file (one per line, blank lines ignored)."""
+    if path is None:
+        return []
+    return [Path(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def select_faced(source: Path, output: Path) -> int:
+    """Copy only frames that carry a trusted face label into a new two-class dataset.
+
+    A frame without a face label shows the avatar often enough that training on it would teach the
+    detector that a visible face is background, so such frames are left out of this dataset.
+    """
+    record = json.loads((source / "frames.json").read_text(encoding="utf-8"))
+    kept = [item for item in record if item["face"]]
+    if not kept:
+        raise ReplayError("No frame carries a trusted face label")
+    for part in ("train", "val"):
+        (output / "images" / part).mkdir(parents=True)
+        (output / "labels" / part).mkdir(parents=True)
+    for item in kept:
+        name, part = f"frame-{item['frame']:06d}", item["split"]
+        shutil.copy2(
+            source / "images" / part / f"{name}.jpg", output / "images" / part / f"{name}.jpg"
+        )
+        shutil.copy2(
+            source / "labels" / part / f"{name}.txt", output / "labels" / part / f"{name}.txt"
+        )
+    data = (source / "data.yaml").read_text(encoding="utf-8").replace(str(source), str(output))
+    (output / "data.yaml").write_text(data, encoding="utf-8")
+    (output / "frames.json").write_text(json.dumps(kept, indent=1), encoding="utf-8")
+    return len(kept)
+
+
+def thin_train(source: Path, output: Path, *, every: int, step: int) -> tuple[int, int]:
+    """Copy a dataset keeping every `every`-th training frame (by frame number / `step`).
+
+    Validation frames are copied unchanged so scores stay comparable with the full training set.
+    Returns (training frames kept, validation frames copied).
+    """
+    if every < 2 or step < 1:
+        raise ReplayError("Invalid thinning request")
+    record = json.loads((source / "frames.json").read_text(encoding="utf-8"))
+    kept = [
+        item for item in record if item["split"] == "val" or (item["frame"] // step) % every == 0
+    ]
+    if not any(item["split"] == "train" for item in kept):
+        raise ReplayError("Thinning removes every training frame")
+    for part in ("train", "val"):
+        (output / "images" / part).mkdir(parents=True)
+        (output / "labels" / part).mkdir(parents=True)
+    for item in kept:
+        name, part = f"frame-{item['frame']:06d}", item["split"]
+        shutil.copy2(
+            source / "images" / part / f"{name}.jpg", output / "images" / part / f"{name}.jpg"
+        )
+        shutil.copy2(
+            source / "labels" / part / f"{name}.txt", output / "labels" / part / f"{name}.txt"
+        )
+    data = (source / "data.yaml").read_text(encoding="utf-8").replace(str(source), str(output))
+    (output / "data.yaml").write_text(data, encoding="utf-8")
+    (output / "frames.json").write_text(json.dumps(kept, indent=1), encoding="utf-8")
+    train = sum(1 for item in kept if item["split"] == "train")
+    return train, len(kept) - train
+
+
 def extract(source: Path, frames: list[int], directory: Path, *, size: int, rate: int) -> None:
     """Write one JPEG per frame number, seeking to each frame instead of decoding the whole file."""
     for number in frames:
@@ -104,8 +171,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--admission", type=Path, action="append", required=True)
-    parser.add_argument("--face-response", type=Path, action="append", required=True)
+    parser.add_argument("--admission", type=Path, action="append", default=[])
+    parser.add_argument("--face-response", type=Path, action="append", default=[])
+    parser.add_argument("--admission-list", type=Path, help="file with one admission path per line")
+    parser.add_argument(
+        "--face-response-list", type=Path, help="file with one response path per line"
+    )
     parser.add_argument("--step", type=int, required=True, help="keep one frame per STEP frames")
     parser.add_argument("--block", type=int, required=True)
     parser.add_argument("--validation-every", type=int, required=True)
@@ -113,7 +184,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument("--limit", type=int, default=0, help="0 = no limit (diagnostics only)")
     args = parser.parse_args(argv)
-    captions, faces = load_captions(args.admission), load_faces(args.face_response)
+    admissions = args.admission + read_paths(args.admission_list)
+    responses = args.face_response + read_paths(args.face_response_list)
+    if not admissions or not responses:
+        raise ReplayError("Admission and face-response paths are required")
+    captions, faces = load_captions(admissions), load_faces(responses)
     candidates = [n for n in sorted(captions) if n % args.step == 0]
     if args.limit:
         candidates = candidates[: args.limit]
