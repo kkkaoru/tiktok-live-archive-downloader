@@ -120,6 +120,7 @@ def test_the_producers_run_with_a_local_scratch_and_offline_models(
     assert [call[0][4] for call in calls] == ["extract", "prepare-plan"]
     assert calls[1][0][-1] == str(new / "PIPELINE-PLAN-v1.json")
     first = calls[0][1]
+    assert calls[0][0][0] == str(refresh.PROVIDER_PYTHON)
     assert first["TMPDIR"] == str(new / "tmp")
     assert first["XDG_CACHE_HOME"] == str(new / "cache")
     assert first["HF_HUB_OFFLINE"] == "1"

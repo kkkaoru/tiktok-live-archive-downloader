@@ -7,6 +7,8 @@ refreshes only the pinned digests of files that are already in the pinned set, p
 outputs at the new directory, and runs the ordinary `extract` and `prepare-plan` producers there
 so every digest is checked by them again. The old namespace is only read. A closure whose
 membership changed (a module added or removed) is refused by `prepare-plan`; it is never patched.
+The producers run in the separation provider environment (`edits/.venv-mel-roformer`), because
+`prepare-plan` checks that the model provider is installed.
 """
 
 import argparse
@@ -21,6 +23,7 @@ from replay.core import ReplayError
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_HOME = ROOT / "edits" / "models" / "mel-roformer"
+PROVIDER_PYTHON = ROOT / "edits" / ".venv-mel-roformer" / "bin" / "python"
 PRODUCER = "replay.separation_pipeline_prepare"
 CONFIG_NAME = "PCM-PREPARATION-CONFIG-v1.json"
 TEMPLATE_NAME = "PIPELINE-PLAN-TEMPLATE-v1.json"
@@ -80,7 +83,7 @@ def environment(directory: Path) -> dict[str, str]:
 
 def produce(directory: Path, *arguments: str) -> None:
     subprocess.run(
-        [sys.executable, "-B", "-m", PRODUCER, *arguments],
+        [str(PROVIDER_PYTHON), "-B", "-m", PRODUCER, *arguments],
         cwd=ROOT,
         env=environment(directory),
         stdin=subprocess.DEVNULL,
