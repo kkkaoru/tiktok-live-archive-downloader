@@ -134,3 +134,94 @@ def test_main_writes_without_running_when_asked(
     new = root / "edits" / "work" / "mainrun"
     assert refresh.main([str(config), str(template), str(new), "--no-run"]) == 0
     assert capsys.readouterr().out.strip() == str(new / "PIPELINE-PLAN-v1.json")
+
+
+def recording(root: Path) -> tuple[Path, Path, Path, Path]:
+    config, template, _ = pinned(root)
+    base = json.loads(config.read_text())
+    base.update(
+        {
+            "source": {"path": "old", "sha256": "old"},
+            "preparation": {"path": "old", "sha256": "old"},
+            "audioClock": {"path": "old", "sha256": "old"},
+            "audioClockProducer": {"path": "old", "sha256": "old"},
+            "completedExtraction": {"x": 1},
+        }
+    )
+    config.write_text(json.dumps(base))
+    plan = json.loads(template.read_text())
+    plan["budget"] = {"max_samples": 1, "max_saved_bytes": 1, "window": {}}
+    template.write_text(json.dumps(plan))
+    work = root / "edits" / "work" / "live"
+    work.mkdir()
+    source = root / "media.mp4"
+    source.write_bytes(b"media")
+    (work / "preparation.json").write_text(
+        json.dumps({"inputs": [{"path": str(source), "sha256": "feed"}]})
+    )
+    (work / "audio-clock.json").write_text("clock")
+    (work / "audio-clock.producer.json").write_text("producer")
+    return config, template, work, source
+
+
+def test_a_new_recording_namespace_takes_its_source_clocks_and_sample_budget(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, template, work, source = recording(root)
+    calls: list[str] = []
+
+    def fake_produce(directory: Path, *arguments: str) -> None:
+        calls.append(arguments[0])
+        if arguments[0] == "extract":
+            (directory / "pcm-preparation.json").write_text(
+                json.dumps({"outputSampleCount": 44100 * 600})
+            )
+
+    monkeypatch.setattr(refresh, "produce", fake_produce)
+    monkeypatch.setattr(refresh, "budget_bytes", lambda samples: samples * 2)
+    new = root / "edits" / "work" / "second"
+    plan = refresh.for_recording(config, template, work, source, new)
+    written = json.loads((new / "PCM-PREPARATION-CONFIG-v1.json").read_text())
+    shaped = json.loads((new / "PIPELINE-PLAN-TEMPLATE-v1.json").read_text())
+    assert plan == new / "PIPELINE-PLAN-v1.json"
+    assert calls == ["extract", "prepare-plan"]
+    assert written["source"] == {"path": str(source), "sha256": "feed"}
+    assert written["preparation"] == {
+        "path": str(work / "preparation.json"),
+        "sha256": digest(work.joinpath("preparation.json").read_bytes()),
+    }
+    assert written["audioClock"]["sha256"] == digest(b"clock")
+    assert written["audioClockProducer"]["sha256"] == digest(b"producer")
+    assert written["completedExtraction"] is None
+    assert written["directory"] == str(new)
+    assert shaped["budget"]["max_samples"] == 26460000
+    assert shaped["budget"]["max_saved_bytes"] == 52920000
+
+
+def test_a_source_the_preparation_does_not_pin_is_refused(root: Path) -> None:
+    _, _, work, source = recording(root)
+    with pytest.raises(ReplayError, match="does not pin this source"):
+        refresh.source_digest(work / "preparation.json", root / "other.mp4")
+    assert refresh.source_digest(work / "preparation.json", source) == "feed"
+
+
+def test_the_byte_budget_is_the_estimate_rounded_up_to_a_gibibyte() -> None:
+    one_hour = 44100 * 3600
+    value = refresh.budget_bytes(one_hour)
+    assert value % 1024**3 == 0
+    assert 6 * 1024**3 <= value <= 8 * 1024**3
+
+
+def test_main_builds_another_recording_and_rejects_half_arguments(
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, template, work, source = recording(root)
+    new = root / "edits" / "work" / "viamain"
+    monkeypatch.setattr(refresh, "for_recording", lambda *args: new / "PIPELINE-PLAN-v1.json")
+    code = refresh.main(
+        [str(config), str(template), str(new), "--work", str(work), "--source", str(source)]
+    )
+    assert code == 0
+    assert capsys.readouterr().out.strip() == str(new / "PIPELINE-PLAN-v1.json")
+    with pytest.raises(ReplayError, match="go together"):
+        refresh.main([str(config), str(template), str(new), "--work", str(work)])
