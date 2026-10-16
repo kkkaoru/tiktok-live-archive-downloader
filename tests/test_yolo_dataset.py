@@ -368,3 +368,69 @@ def test_relabel_refuses_a_frame_without_a_caption_observation(tmp_path: Path) -
         dataset.relabel(
             source, tmp_path / "out", captions={0: [PixelBox(0.0, 0.0, 10.0, 10.0)]}, faces={}
         )
+
+
+def synthetic_video(tmp_path: Path) -> Path:
+    video = tmp_path / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1080x1920:rate=30:duration=4",
+         "-pix_fmt", "yuv420p", str(video)],
+        check=True,
+    )  # fmt: skip
+    return video
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+def test_a_face_only_dataset_uses_face_boxes_alone_and_splits_by_time_blocks(
+    tmp_path: Path,
+) -> None:
+    face = PixelBox(100.0, 200.0, 300.0, 400.0)
+    faces = {n: face for n in range(0, 120, 30)}
+    output = tmp_path / "face"
+    counts = dataset.build_face_only(
+        synthetic_video(tmp_path), output, faces=faces, step=30, block=2, validation_every=2,
+        gap=0, all_validation=False, size=64,
+    )  # fmt: skip
+    assert counts == (2, 2)
+    assert sorted(p.name for p in (output / "images/train").iterdir()) == [
+        "frame-000000.jpg",
+        "frame-000030.jpg",
+    ]
+    label = (output / "labels/val/frame-000060.txt").read_text()
+    assert label == "0 0.231481 0.208333 0.277778 0.208333\n"
+    assert (output / "data.yaml").read_text().endswith("names:\n  0: avatar_face\n")
+    rows = json.loads((output / "frames.json").read_text())
+    assert [(r["split"], r["captions"]) for r in rows] == [
+        ("train", 0), ("train", 0), ("val", 0), ("val", 0),
+    ]  # fmt: skip
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+def test_a_held_out_face_only_recording_is_all_validation(tmp_path: Path) -> None:
+    faces = {0: PixelBox(10.0, 20.0, 30.0, 40.0), 60: PixelBox(10.0, 20.0, 30.0, 40.0)}
+    output = tmp_path / "heldout"
+    counts = dataset.build_face_only(
+        synthetic_video(tmp_path), output, faces=faces, step=30, block=2, validation_every=2,
+        gap=0, all_validation=True, size=64,
+    )  # fmt: skip
+    assert counts == (0, 2)
+    assert sorted(p.name for p in (output / "images/val").iterdir()) == [
+        "frame-000000.jpg",
+        "frame-000060.jpg",
+    ]
+
+
+def test_a_face_only_dataset_needs_a_face_at_a_step_multiple_and_a_valid_step(
+    tmp_path: Path,
+) -> None:
+    box = PixelBox(1.0, 1.0, 5.0, 5.0)
+    with pytest.raises(ReplayError, match="Invalid step"):
+        dataset.build_face_only(
+            tmp_path / "v.mp4", tmp_path / "o", faces={0: box}, step=0, block=1,
+            validation_every=2, gap=0, all_validation=False, size=64,
+        )  # fmt: skip
+    with pytest.raises(ReplayError, match="No frame with a face box"):
+        dataset.build_face_only(
+            tmp_path / "v.mp4", tmp_path / "o", faces={7: box}, step=30, block=1,
+            validation_every=2, gap=0, all_validation=False, size=64,
+        )  # fmt: skip

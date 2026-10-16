@@ -156,6 +156,56 @@ def thin_train(source: Path, output: Path, *, every: int, step: int) -> tuple[in
     return train, len(kept) - train
 
 
+def build_face_only(
+    source: Path,
+    output: Path,
+    *,
+    faces: dict[int, PixelBox],
+    step: int,
+    block: int,
+    validation_every: int,
+    gap: int,
+    all_validation: bool,
+    size: int,
+) -> tuple[int, int]:
+    """A one-class (avatar_face) dataset from Vision face boxes alone, with no caption labels.
+
+    Candidate frames are the multiples of `step` that carry a trusted face box. With
+    `all_validation` every frame is validation (a recording held out of training); otherwise the
+    usual guarded time-block split applies. Returns (train frames, validation frames).
+    """
+    if step < 1:
+        raise ReplayError("Invalid step")
+    candidates = [number for number in sorted(faces) if number % step == 0]
+    if not candidates:
+        raise ReplayError("No frame with a face box matches the step")
+    if all_validation:
+        train: tuple[int, ...] = ()
+        validation = tuple(range(len(candidates)))
+    else:
+        train, validation = split_by_time_blocks(
+            len(candidates), block=block, validation_every=validation_every, gap=gap
+        )
+    output.mkdir(mode=0o700, parents=True)
+    record: list[dict[str, object]] = []
+    for part, indices in (("train", train), ("val", validation)):
+        (output / "images" / part).mkdir(parents=True)
+        (output / "labels" / part).mkdir(parents=True)
+        numbers = [candidates[i] for i in indices]
+        extract(source, numbers, output / "images" / part, size=size, rate=RATE)
+        for number in numbers:
+            (output / "labels" / part / f"frame-{number:06d}.txt").write_text(
+                yolo_row(FACE, faces[number], canvas=CANVAS) + "\n", encoding="utf-8"
+            )
+            record.append({"frame": number, "split": part, "captions": 0, "face": True})
+    (output / "data.yaml").write_text(
+        f"path: {output}\ntrain: images/train\nval: images/val\nnames:\n  0: {CLASS_NAMES[FACE]}\n",
+        encoding="utf-8",
+    )
+    (output / "frames.json").write_text(json.dumps(record, indent=1), encoding="utf-8")
+    return len(train), len(validation)
+
+
 def relabel(
     source: Path,
     output: Path,
@@ -230,6 +280,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument("--limit", type=int, default=0, help="0 = no limit (diagnostics only)")
     parser.add_argument(
+        "--face-only",
+        action="store_true",
+        help="one-class face dataset from the face responses alone (no admissions needed)",
+    )
+    parser.add_argument(
+        "--all-validation", action="store_true", help="with --face-only: hold the recording out"
+    )
+    parser.add_argument(
         "--relabel-from",
         type=Path,
         help="reuse the images and split of this dataset; only the labels are rebuilt",
@@ -237,6 +295,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     admissions = args.admission + read_paths(args.admission_list)
     responses = args.face_response + read_paths(args.face_response_list)
+    if args.face_only:
+        if not responses:
+            raise ReplayError("Face-response paths are required")
+        counts = build_face_only(
+            args.source, args.output, faces=load_faces(responses), step=args.step,
+            block=args.block, validation_every=args.validation_every, gap=args.gap,
+            all_validation=args.all_validation, size=args.size,
+        )  # fmt: skip
+        print(json.dumps({"train": counts[0], "val": counts[1]}))
+        return 0
     if not admissions or not responses:
         raise ReplayError("Admission and face-response paths are required")
     captions, faces = load_captions(admissions), load_faces(responses)
