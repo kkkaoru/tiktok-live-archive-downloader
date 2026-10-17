@@ -251,3 +251,49 @@ There is **no automatic migration CLI command**. Bootstrap provisions software; 
 Historical investigation material can be retained separately under `private/legacy-investigation/`. Old scripts, device configurations, and logs may retain historical absolute paths; archiving them does not make those auxiliary environments immediately runnable. Never substitute old experimental credentials for the active credential.
 
 Local migration runbooks and account-specific settings, if present, belong under `private/`; do not copy their contents into public documentation or an agent handoff.
+
+## Record mirror and shared-volume headroom
+
+- `python -m replay.record_mirror DESTINATION` copies the small, unrecoverable per-recording
+  records (`edit-config`, completion JSON, transcripts; never `evidence/` or `proxy/`) to a
+  different volume, verified by size and never deleting. Current mirror:
+  `/Volumes/m.2-ssd/movie/replay-records-backup` (rerun to refresh).
+- `disk_budget.require_shared_headroom({path: peak_need})` sums the needs of paths on one
+  device so scratch and output on the same SSD share a single free-space check.
+- `native_delivery_completion.observe_identity` no longer compares `st_dev` (remounts renumber
+  it); size, inode, mtime and ctime still bind the file, and `--verify-content` remains the
+  cryptographic check after a copy to another volume.
+
+### Large completed work lives in the external work root, not on extra volumes
+
+Per-folder `replay-cold-*` APFS volumes mounted over `edits/work/<NAME>` were retired on
+2026-10-17: macOS remounts them at `/Volumes/<name>` on every SSD reconnect, leaving the
+`edits/work` paths empty, and each mount renumbers `st_dev`. Large completed or offloaded work
+now lives as a plain directory in the approved external root
+`/Volumes/m.2-ssd/movie/replay-work/<NAME>` (the root `scripts/tmux-job.sh` accepts), and
+`edits/work/RELOCATED-TO-SSD.tsv` lists each moved folder's old path, new path, file count,
+bytes and time. Receipts that still name `edits/work/<NAME>` must be read through that index;
+moving between volumes gives files a new inode and ctime, so stat-bound pins recorded before
+the move need re-pinning, while content sha256 still verifies.
+
+- `python -m replay.work_roots resolve OLD_PATH...` prints where a recorded path lives now, and
+  `python -m replay.work_roots check` fails if a relocated folder is missing or its old path
+  reappeared. New code that validates a work directory should call
+  `replay.work_roots.within_work` (either root) instead of hard-coding `edits/work`; hash-pinned
+  modules keep their `edits/work` checks until their owners re-pin them.
+- Do not create new per-folder volumes, bind-like mounts or symlinks; start large jobs in the
+  external root directly.
+- `native_invocation.identity()` no longer records `device` (decision 2026-10-16, user), so
+  pins made after that survive remounts; pins recorded earlier still hold `device`.
+- Re-pin (2026-10-17): `python -m replay.receipt_repin LIST --report OUT` re-verifies every
+  pinned input of a finished receipt by sha256 and size at its current location (through
+  `work_roots.resolve`) and writes `<receipt>.repin.json` with the current stat identity; the
+  receipt is never edited, and the only accepted digest changes are the edits approved for
+  this work (`native_invocation.py` option A, `native_delivery_completion.py`,
+  `disk_budget.py`). Of the 7,541 receipts pinning the old digest, 6,730 were re-pinned. 811
+  stay unresolved because an input really differs: 689 are pytest scratch receipts whose test
+  media was deleted or mutated by the tests themselves, and 122 pin code that changed later
+  (`separation_window_*.py`, `disjoint_wave_queue.py`, `Package.swift`, AudioClockProbe
+  sources); those need their stage re-run by the owner, not a rewritten pin. Reports:
+  `edits/work/cold-consolidation/repin-report.json` and `repin-report-2.json`. Plans that will run again are re-bound with
+  `replay.separation_plan_refresh` or `replay.metal_asr_config`.
