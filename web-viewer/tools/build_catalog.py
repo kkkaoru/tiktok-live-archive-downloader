@@ -10,7 +10,17 @@ Rules mirror TranscriptCatalog/CandidateSelection (subset, fail-closed):
 Outputs data/catalog.json plus data/<id>.json (cues + saved summary).
 Stdlib only. Never writes outside the given output dir.
 """
-import argparse, csv, hashlib, io, json, os, re, subprocess, sys
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
 
 STAMP = re.compile(r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})_JST_")
 
@@ -27,7 +37,7 @@ def parse_srt(text):
     cues = []
     blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n"))
     for block in blocks:
-        lines = [l for l in block.strip("\n").split("\n") if l.strip()]
+        lines = [row for row in block.strip("\n").split("\n") if row.strip()]
         if len(lines) < 3 or not lines[0].strip().isdigit() or "-->" not in lines[1]:
             if block.strip():
                 raise ValueError(f"malformed SRT block: {block[:40]!r}")
@@ -40,11 +50,16 @@ def parse_srt(text):
             h, m, s = clock.split(":")
             return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
-        cues.append({
-            "id": len(cues), "start": sec(start_label), "end": sec(end_label),
-            "startLabel": start_label, "endLabel": end_label,
-            "text": "\n".join(lines[2:]).strip(),
-        })
+        cues.append(
+            {
+                "id": len(cues),
+                "start": sec(start_label),
+                "end": sec(end_label),
+                "startLabel": start_label,
+                "endLabel": end_label,
+                "text": "\n".join(lines[2:]).strip(),
+            }
+        )
     return cues
 
 
@@ -52,14 +67,22 @@ def parse_csv(text):
     rows = list(csv.reader(io.StringIO(text)))
     if not rows or rows[0] != ["start_seconds", "end_seconds", "start", "end", "text"]:
         raise ValueError("CSV header mismatch")
-    return [{
-        "id": i, "start": float(r[0]), "end": float(r[1]),
-        "startLabel": r[2], "endLabel": r[3], "text": r[4],
-    } for i, r in enumerate(rows[1:]) if r]
+    return [
+        {
+            "id": i,
+            "start": float(r[0]),
+            "end": float(r[1]),
+            "startLabel": r[2],
+            "endLabel": r[3],
+            "text": r[4],
+        }
+        for i, r in enumerate(rows[1:])
+        if r
+    ]
 
 
 def load_cues(path):
-    text = open(path, encoding="utf-8").read()
+    text = Path(path).read_text(encoding="utf-8")
     return parse_srt(text) if path.lower().endswith(".srt") else parse_csv(text)
 
 
@@ -68,12 +91,16 @@ def load_summary(transcript_path):
     if not os.path.isfile(p):
         return None
     try:
-        rec = json.load(open(p, encoding="utf-8"))
+        rec = json.loads(Path(p).read_text(encoding="utf-8"))
         if rec.get("version") != 1 or not rec.get("sections") or not rec.get("overview"):
             return None
-        return {"overview": rec["overview"], "sections": [
-            {"start": s["startSeconds"], "end": s["endSeconds"], "text": s["text"]}
-            for s in rec["sections"]]}
+        return {
+            "overview": rec["overview"],
+            "sections": [
+                {"start": s["startSeconds"], "end": s["endSeconds"], "text": s["text"]}
+                for s in rec["sections"]
+            ],
+        }
     except (ValueError, KeyError, TypeError):
         return None
 
@@ -84,7 +111,7 @@ def superseded(folder):
         for name in sorted(os.listdir(d)):
             if name.endswith(".json"):
                 try:
-                    rec = json.load(open(os.path.join(d, name)))
+                    rec = json.loads(Path(d, name).read_text(encoding="utf-8"))
                     out[rec["delivery"]] = rec["size"]
                 except (ValueError, KeyError, TypeError):
                     pass
@@ -95,7 +122,7 @@ def candidate_selection(folder, library):
     path = os.path.join(folder, "evidence", "candidate-selection.json")
     if not os.path.isfile(path):
         return None
-    rec = json.load(open(path))
+    rec = json.loads(Path(path).read_text(encoding="utf-8"))
     if rec.get("version") != 1 or rec.get("status") != "unverified-candidate":
         raise ValueError("candidate-selection: bad version/status")
     movie = os.path.join(folder, rec["movie"])
@@ -104,7 +131,7 @@ def candidate_selection(folder, library):
     lib_real = os.path.realpath(library)
     if not target.startswith(lib_real + os.sep) or os.path.getsize(target) != rec["movieSize"]:
         raise ValueError("candidate-selection: movie target/size mismatch")
-    digest = hashlib.sha256(open(transcript, "rb").read()).hexdigest()
+    digest = hashlib.sha256(Path(transcript).read_bytes()).hexdigest()
     if digest != rec["transcriptSha256"]:
         raise ValueError("candidate-selection: transcript hash mismatch")
     return target, transcript, True
@@ -114,8 +141,11 @@ def canonical_deliveries(folder, name):
     sup = superseded(folder)
     found = []
     for dirpath, dirnames, filenames in os.walk(folder):
-        dirnames[:] = [d for d in dirnames if d not in
-                       ("work", "audio", "evidence", "transcripts", "proxy", "models")]
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in ("work", "audio", "evidence", "transcripts", "proxy", "models")
+        ]
         rel_parts = os.path.relpath(dirpath, folder).split(os.sep)
         if "delivery" not in rel_parts:
             continue
@@ -129,8 +159,14 @@ def canonical_deliveries(folder, name):
             rel = os.path.relpath(movie, folder)
             if sup.get(rel) == os.path.getsize(movie):
                 continue
-            tr = next((os.path.join(dirpath, stem + e) for e in (".srt", ".csv")
-                       if os.path.isfile(os.path.join(dirpath, stem + e))), None)
+            tr = next(
+                (
+                    os.path.join(dirpath, stem + e)
+                    for e in (".srt", ".csv")
+                    if os.path.isfile(os.path.join(dirpath, stem + e))
+                ),
+                None,
+            )
             if tr:
                 found.append((movie, tr))
     return found
@@ -145,7 +181,7 @@ def find_original(folder, name, youtube_originals, roots=()):
         if not os.path.isfile(cfg):
             continue
         try:
-            rec = json.load(open(cfg))
+            rec = json.loads(Path(cfg).read_text(encoding="utf-8"))
             src = rec.get("source")
             if src and os.path.isfile(src) and os.path.getsize(src) == rec.get("source_size"):
                 return src
@@ -153,6 +189,7 @@ def find_original(folder, name, youtube_originals, roots=()):
             pass
     if name.startswith("youtube-") and youtube_originals:
         import glob as g
+
         hits = g.glob(os.path.join(youtube_originals, f"*_youtube-{name[8:]}/*"))
         media = [h for h in hits if h.lower().endswith((".mp4", ".mkv"))]
         if len(media) == 1:
@@ -163,9 +200,11 @@ def find_original(folder, name, youtube_originals, roots=()):
 def duration(path):
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=60)
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         return round(float(out.stdout.strip()), 3)
     except Exception:
         return None
@@ -213,20 +252,34 @@ def main():
                 with open(os.path.join(a.out, vid + ".json"), "w", encoding="utf-8") as fh:
                     json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
                 original = find_original(folder, name, a.youtube_originals, a.root)
-                videos.append({
-                    "id": vid, "streamer": a.streamer, "title": name + (" [未検証候補]" if unverified else ""),
-                    "broadcastStartJST": stamp_label(base),
-                    "movie": base, "size": os.path.getsize(movie),
-                    # MKV originals are served as a generated H.264 MP4 proxy
-                    # (same basename, .mp4); the uploader creates it from localPath.
-                    "original": ({"movie": os.path.basename(original)[:-4] + ".mp4"
-                                  if original.lower().endswith(".mkv") else os.path.basename(original),
-                                  "size": os.path.getsize(original),
-                                  "localPath": os.path.abspath(original)} if original else None),
-                    "duration": None if a.no_duration else duration(movie),
-                    "transcriptPath": os.path.abspath(transcript), "cueCount": len(cues), "hasSummary": data["summary"] is not None,
-                    "localPath": os.path.abspath(movie),
-                })
+                videos.append(
+                    {
+                        "id": vid,
+                        "streamer": a.streamer,
+                        "title": name + (" [未検証候補]" if unverified else ""),
+                        "broadcastStartJST": stamp_label(base),
+                        "movie": base,
+                        "size": os.path.getsize(movie),
+                        # MKV originals are served as a generated H.264 MP4 proxy
+                        # (same basename, .mp4); the uploader creates it from localPath.
+                        "original": (
+                            {
+                                "movie": os.path.basename(original)[:-4] + ".mp4"
+                                if original.lower().endswith(".mkv")
+                                else os.path.basename(original),
+                                "size": os.path.getsize(original),
+                                "localPath": os.path.abspath(original),
+                            }
+                            if original
+                            else None
+                        ),
+                        "duration": None if a.no_duration else duration(movie),
+                        "transcriptPath": os.path.abspath(transcript),
+                        "cueCount": len(cues),
+                        "hasSummary": data["summary"] is not None,
+                        "localPath": os.path.abspath(movie),
+                    }
+                )
             except Exception as e:  # fail-closed per recording, like the native scan
                 issues.append(f"unreadable: {name} ({e})")
     videos.sort(key=lambda v: (v["broadcastStartJST"] or "", v["id"]), reverse=True)
@@ -234,7 +287,7 @@ def main():
     with open(os.path.join(a.out, "catalog.json"), "w", encoding="utf-8") as fh:
         json.dump(catalog, fh, ensure_ascii=False, indent=1)
     total = sum(v["size"] for v in videos)
-    print(f"videos={len(videos)} total={total/2**30:.1f} GiB issues={len(issues)}")
+    print(f"videos={len(videos)} total={total / 2**30:.1f} GiB issues={len(issues)}")
     for i in issues:
         print("  " + i)
 
