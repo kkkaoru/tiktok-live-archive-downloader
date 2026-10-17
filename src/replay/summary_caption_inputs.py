@@ -266,9 +266,12 @@ def _segment_jobs(
     identifiers = [_integer(member, maximum=MAX_JOBS - 1) for member in members]
     for member in identifiers:
         _job_source(directory, row, member, sources)
-    # Keep the native segment's nonempty/4096-token budget. An empty individual
-    # recognition job is valid only as part of a nonempty recognized segment.
-    read_tokens(directory, {**row, "jobs": identifiers}, bindings, sources)
+    # Keep the native segment's 4096-token budget. An empty individual recognition job is
+    # valid only as part of a nonempty recognized segment, which is checked here because the
+    # native reader bounds only the upper count.
+    segment_tokens, _ = read_tokens(directory, {**row, "jobs": identifiers}, bindings, sources)
+    if not segment_tokens:
+        raise ReplayError("Segment token count must be nonempty")
     result: list[dict[str, object]] = []
     pins: dict[str, str] = {}
     count = 0
