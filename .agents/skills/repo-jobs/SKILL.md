@@ -28,7 +28,8 @@ resubmission; a new instruction is not a reason to duplicate an uncertain job.
    process/job IDs, receipts and partial results. No status file or a timeout is
    not proof that a job never ran. Reconcile an uncertain outcome before retrying.
 2. Resolve the checkout and a private, stable, purpose-named work directory under
-   `edits/work/`; reuse it across tasks, retaining prior reports under descriptive
+   `edits/work/` (or, for large render/offload jobs, under the approved external root
+   `/Volumes/m.2-ssd/movie/replay-work/`; `scripts/tmux-job.sh` accepts both); reuse it across tasks, retaining prior reports under descriptive
    non-overwriting names. Do not create random work roots or per-video scripts.
    Reject escaping symlinks, including tmp/cache/log destinations. Set child
    `TMPDIR`, `TMP`, `TEMP` and tool-specific cache/profile/output paths locally.

@@ -212,3 +212,35 @@ def test_launch_proceeds_when_the_floor_is_met(project: Path) -> None:
     result = launch(project, "/usr/bin/true")
     assert result.returncode == 0
     assert (project / "edits/work/jobs/probe.launch").is_dir()
+
+
+def test_a_job_directory_under_the_external_work_root_is_accepted(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external = tmp_path / "external-work"
+    (external / "jobs").mkdir(parents=True)
+    monkeypatch.setenv("REPLAY_EXTERNAL_WORK_ROOT", str(external.resolve()))
+    result = subprocess.run(
+        ["/bin/bash", "scripts/tmux-job.sh", str(external / "jobs"), "probe", "/usr/bin/true"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert (external / "jobs/probe.status").read_text(encoding="utf-8") == "0\n"
+
+
+def test_a_job_directory_outside_both_roots_is_refused(project: Path, tmp_path: Path) -> None:
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    result = subprocess.run(
+        ["/bin/bash", "scripts/tmux-job.sh", str(other), "probe", "/usr/bin/true"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 2

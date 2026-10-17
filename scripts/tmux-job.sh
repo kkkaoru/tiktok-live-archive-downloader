@@ -18,9 +18,12 @@ repo="$(cd "$(dirname "$0")/.." && pwd -P)"
 work="$(cd "$1" && pwd -P)"
 name="$2"
 shift 2
+# Large render work may live on the external SSD scratch root approved in AGENTS.md.
+external="${REPLAY_EXTERNAL_WORK_ROOT:-/Volumes/m.2-ssd/movie/replay-work}"
 case "$work" in
   "$repo"/edits/work/*) ;;
-  *) echo "work directory must be under edits/work" >&2; exit 2 ;;
+  "$external"/*) ;;
+  *) echo "work directory must be under edits/work or the external work root" >&2; exit 2 ;;
 esac
 if [[ ! "$name" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
   echo "invalid job name" >&2
