@@ -63,6 +63,38 @@ def test_require_headroom_refuses_below_the_floor(
         disk_budget.require_headroom([tmp_path], 20 * GIB)
 
 
+def test_shared_volume_needs_are_summed_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "work").mkdir()
+    (tmp_path / "storage").mkdir()
+    monkeypatch.setattr(
+        disk_budget,
+        "measure",
+        lambda path, need: disk_budget.Headroom(path, 1000 * GIB, 400 * GIB, 50 * GIB, need),
+    )
+    volumes = disk_budget.require_shared_headroom(
+        {tmp_path / "work": 100 * GIB, tmp_path / "storage": 60 * GIB}
+    )
+    assert [(volume.path, volume.need) for volume in volumes] == [(tmp_path / "work", 160 * GIB)]
+
+
+def test_shared_volume_refuses_when_the_summed_need_breaks_the_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "work").mkdir()
+    (tmp_path / "storage").mkdir()
+    monkeypatch.setattr(
+        disk_budget,
+        "measure",
+        lambda path, need: disk_budget.Headroom(path, 1000 * GIB, 200 * GIB, 50 * GIB, need),
+    )
+    with pytest.raises(ReplayError, match="is 200.0 GiB; 250.0 GiB is required"):
+        disk_budget.require_shared_headroom(
+            {tmp_path / "work": 100 * GIB, tmp_path / "storage": 100 * GIB}
+        )
+
+
 def test_physical_usage_counts_real_allocation_by_directory_and_extension(tmp_path: Path) -> None:
     _write(tmp_path / "a" / "b" / "c" / "d" / "big.mov", 2 * MIB)
     _write(tmp_path / "a" / "audio.wav", 3 * MIB)

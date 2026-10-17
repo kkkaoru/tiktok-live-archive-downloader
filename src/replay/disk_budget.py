@@ -14,7 +14,7 @@ import json
 import os
 import shutil
 import stat
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,13 +71,35 @@ def require_headroom(paths: Iterable[Path], need: int = 0) -> list[Headroom]:
     short = [volume for volume in volumes if volume.spare < 0]
     if short:
         worst = min(short, key=lambda volume: volume.spare)
-        raise ReplayError(
-            f"Free space on {worst.path} is {worst.free / GIB:.1f} GiB; "
-            f"{(worst.need + worst.floor) / GIB:.1f} GiB is required "
-            f"(need {worst.need / GIB:.1f} + floor {worst.floor / GIB:.1f}). "
-            "Retire approved intermediates before starting new large work."
-        )
+        raise ReplayError(_shortage(worst))
     return volumes
+
+
+def require_shared_headroom(needs: Mapping[Path, int]) -> list[Headroom]:
+    """Like `require_headroom`, but paths on one volume share a single free-space pool.
+
+    Each path states its own peak need; needs of paths whose volume is the same device
+    are summed and checked once against that volume's floor, so scratch and output on one
+    disk cannot both claim the same free bytes.
+    """
+    grouped: dict[int, list[Path]] = {}
+    for path in needs:
+        grouped.setdefault(path.stat().st_dev, []).append(path)
+    volumes = [measure(paths[0], sum(needs[path] for path in paths)) for paths in grouped.values()]
+    short = [volume for volume in volumes if volume.spare < 0]
+    if short:
+        worst = min(short, key=lambda volume: volume.spare)
+        raise ReplayError(_shortage(worst))
+    return volumes
+
+
+def _shortage(worst: Headroom) -> str:
+    return (
+        f"Free space on {worst.path} is {worst.free / GIB:.1f} GiB; "
+        f"{(worst.need + worst.floor) / GIB:.1f} GiB is required "
+        f"(need {worst.need / GIB:.1f} + floor {worst.floor / GIB:.1f}). "
+        "Retire approved intermediates before starting new large work."
+    )
 
 
 def _extension(name: str) -> str:
