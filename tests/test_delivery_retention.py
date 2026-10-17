@@ -1,12 +1,34 @@
 import json
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from replay import delivery_render, delivery_retention, edit_completion
+from replay import delivery_render, delivery_retention, disk_budget, edit_completion, r2_worker
 from replay.core import ReplayError
+from replay.r2_worker import RemoteObject
 
 STEM = "2024-01-01_09-00-00_JST_replay-1-review"
+
+
+class FakeStore:
+    """In-memory R2 double for the offload that precedes every applied retirement."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, tuple[int, dict[str, str]]] = {}
+
+    def head(self, key: str) -> RemoteObject | None:
+        stored = self.objects.get(key)
+        if stored is None:
+            return None
+        return RemoteObject(stored[0], datetime(2026, 10, 17, tzinfo=UTC), dict(stored[1]))
+
+    def put(self, key: str, path: Path, metadata: Mapping[str, str]) -> None:
+        self.objects[key] = (path.stat().st_size, dict(metadata))
+
+    def get(self, key: str, destination: Path) -> int:
+        raise AssertionError(f"retention never downloads {key} to {destination}")
 
 
 def write(path: Path, value: object) -> Path:
@@ -227,8 +249,23 @@ def test_apply_removes_intermediates_and_records_the_receipt(
 ) -> None:
     config = produced(tmp_path)
     movie = accepted(config, monkeypatch)
-    outcome = delivery_retention.retire(config.path, apply=True)
-    assert (outcome.mode, outcome.eligible, outcome.retired) == ("apply", 6, 6)
+    store = FakeStore()
+    outcome = delivery_retention.retire(config.path, apply=True, store=store)
+    assert (outcome.mode, outcome.eligible, outcome.retired, outcome.offloaded) == (
+        "apply",
+        6,
+        6,
+        6,
+    )
+    assert len(store.objects) == 1
+    assert (
+        json.loads(
+            (config.viewer_root / "evidence" / "intermediate-offload.json").read_text(
+                encoding="utf-8"
+            )
+        )["files"][0]["state"]
+        == "retired"
+    )
     assert outcome.logical_bytes == 6 * len(b"synthetic media")
     assert outcome.held == {}
     assert not (config.storage / "joined-video.mp4").exists()
@@ -243,8 +280,8 @@ def test_apply_is_idempotent_after_retirement(
 ) -> None:
     config = produced(tmp_path)
     accepted(config, monkeypatch)
-    delivery_retention.retire(config.path, apply=True)
-    again = delivery_retention.retire(config.path, apply=True)
+    delivery_retention.retire(config.path, apply=True, store=FakeStore())
+    again = delivery_retention.retire(config.path, apply=True, store=FakeStore())
     assert (again.eligible, again.retired) == (0, 0)
 
 
@@ -263,8 +300,8 @@ def test_apply_holds_a_row_changed_after_planning(
         return result
 
     monkeypatch.setattr(delivery_retention, "plan", planned)
-    outcome = delivery_retention.retire(config.path, apply=True)
-    assert outcome.retired == 5
+    outcome = delivery_retention.retire(config.path, apply=True, store=FakeStore())
+    assert (outcome.offloaded, outcome.retired) == (5, 5)
     assert outcome.held == {"identity changed": 1}
     assert (config.storage / "joined-video.mp4").is_file()
     assert delivery_retention.is_retired(config.path) is False
@@ -294,3 +331,53 @@ def test_main_reports_an_unaccepted_delivery(
     config = produced(tmp_path)
     assert delivery_retention.main([str(config.path), "--apply"]) == 1
     assert "DELIVERY_RETENTION_ERROR" in capsys.readouterr().err
+
+
+def test_restore_rearms_a_retired_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = produced(tmp_path)
+    accepted(config, monkeypatch)
+    media(config.source)
+    delivery_retention.retire(config.path, apply=True, store=FakeStore())
+    assert delivery_retention.is_retired(config.path) is True
+    monkeypatch.setattr(disk_budget, "require_headroom", lambda _paths: [])
+    capsys.readouterr()
+    assert delivery_retention.main([str(config.path), "--restore"]) == 0
+    assert "reset" in capsys.readouterr().out
+    assert delivery_retention.is_retired(config.path) is False
+
+
+def test_apply_without_an_r2_store_unlinks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = produced(tmp_path)
+    accepted(config, monkeypatch)
+    with pytest.raises(ReplayError, match="needs an R2 store"):
+        delivery_retention.retire(config.path, apply=True)
+    assert (config.storage / "joined-video.mp4").is_file()
+    assert delivery_retention.is_retired(config.path) is False
+
+
+def test_main_applies_through_a_worker_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = produced(tmp_path)
+    accepted(config, monkeypatch)
+    buckets: list[str] = []
+
+    class Session:
+        def __init__(self, bucket: str) -> None:
+            buckets.append(bucket)
+
+        def __enter__(self) -> FakeStore:
+            return FakeStore()
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(r2_worker, "session", Session)
+    assert delivery_retention.main([str(config.path), "--apply"]) == 0
+    assert buckets == ["replay-intermediates"]
+    assert json.loads(capsys.readouterr().out)["offloaded"] == 6
+    assert delivery_retention.is_retired(config.path) is True

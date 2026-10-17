@@ -6,7 +6,10 @@ startup disk (`work`) and the external SSD (`storage`) although nothing needs th
 come only from producer declarations (Compressor job `output`, workflow stage `outputs` and
 native `render.response.json`); nothing is found by file-name pattern. They are written to a
 SHA-pinned disposition file and unlinked by `replay.leaf_retirement`, which rechecks
-identity, canonical parents and open handles per row. The default is a dry run.
+identity, canonical parents and open handles per row. The default is a dry run. An applied run
+first uploads every row to R2 through `replay.intermediate_offload`, which records them in the
+recording's manifest so `python -m replay.intermediate_offload restore` can bring them back;
+a failed upload stops the run before anything is unlinked.
 
 Files an FCPXML timeline references are kept, as are JSON, receipts, models, the dated
 delivery, its transcript, verification report and Viewer links. A receipt is written after
@@ -28,7 +31,17 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
-from replay import delivery_render, disk_budget, edit_completion, leaf_retirement
+import httpx
+
+from replay import (
+    delivery_render,
+    delivery_restore,
+    disk_budget,
+    edit_completion,
+    intermediate_offload,
+    leaf_retirement,
+    r2_worker,
+)
 from replay.core import ReplayError
 from replay.recordings import record
 
@@ -56,6 +69,7 @@ class Outcome:
     skipped: dict[str, str]
     free_before: dict[str, int]
     free_after: dict[str, int]
+    offloaded: int = 0
 
 
 def _read(path: Path) -> object:
@@ -234,12 +248,41 @@ def is_retired(config_path: Path) -> bool:
     return isinstance(work, str) and (Path(work) / RETENTION_DIRECTORY / RECEIPT_NAME).is_file()
 
 
-def retire(config_path: Path, timelines: Sequence[Path] = (), *, apply: bool = False) -> Outcome:
+def _offload(
+    config: delivery_render.Config,
+    dispositions: Path,
+    digest: str,
+    store: intermediate_offload.ObjectStore | None,
+) -> int:
+    """Upload every eligible row before retirement; returns how many rows are in R2."""
+    if store is None:
+        raise ReplayError("Applied retention needs an R2 store to offload intermediates first")
+    summary = intermediate_offload.offload(
+        leaf_retirement.load_eligible(dispositions, digest),
+        recording=config.recording,
+        roots=(config.work, config.storage),
+        viewer_root=config.viewer_root,
+        store=store,
+    )
+    return summary.uploaded + summary.reused
+
+
+def retire(
+    config_path: Path,
+    timelines: Sequence[Path] = (),
+    *,
+    apply: bool = False,
+    store: intermediate_offload.ObjectStore | None = None,
+) -> Outcome:
     config = delivery_render.load_config(config_path)
     require_accepted(config)
     rows, skipped = plan(config, timelines)
     directory = config.work / RETENTION_DIRECTORY
+    recipe = delivery_restore.prepare(
+        config.work, config.composition, [Path(str(row["path"])) for row in rows]
+    )
     dispositions, digest = _write_dispositions(directory, rows)
+    offloaded = _offload(config, dispositions, digest, store) if apply else 0
     before = _free(config)
     summary = leaf_retirement.retire(
         dispositions,
@@ -248,6 +291,8 @@ def retire(config_path: Path, timelines: Sequence[Path] = (), *, apply: bool = F
         directory / "retirement.log",
         apply=apply,
     )
+    if apply:
+        intermediate_offload.mark_retired(config.viewer_root, recording=config.recording)
     outcome = Outcome(
         "apply" if apply else "dry-run",
         summary.eligible,
@@ -257,8 +302,10 @@ def retire(config_path: Path, timelines: Sequence[Path] = (), *, apply: bool = F
         skipped,
         before,
         _free(config),
+        offloaded,
     )
     if apply and summary.retired == summary.eligible:
+        delivery_restore.archive(recipe, directory)
         receipt = directory / RECEIPT_NAME
         if not receipt.exists():
             with receipt.open("x", encoding="utf-8") as stream:
@@ -266,15 +313,37 @@ def retire(config_path: Path, timelines: Sequence[Path] = (), *, apply: bool = F
     return outcome
 
 
+def restore(config_path: Path) -> int:
+    """Re-arm the pipeline for a retired delivery; it then rebuilds from the original."""
+    config = delivery_render.load_config(config_path)
+    named = delivery_restore.restore(
+        config.source,
+        (config.work, config.storage),
+        config.work / RETENTION_DIRECTORY,
+        RECEIPT_NAME,
+    )
+    print(json.dumps({"reset": named, "next": "python -m replay.delivery_pipeline CONFIG"}))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("--fcpxml", action="append", type=Path, default=[])
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--restore", action="store_true")
     args = parser.parse_args(argv)
     try:
-        outcome = retire(args.config.absolute(), args.fcpxml, apply=args.apply)
-    except (ReplayError, OSError, ValueError, ET.ParseError) as error:
+        if args.restore:
+            return restore(args.config.absolute())
+        if args.apply:
+            # Deploy the R2 Worker only for a delivery that retention will actually accept.
+            require_accepted(delivery_render.load_config(args.config.absolute()))
+            with r2_worker.session(intermediate_offload.BUCKET) as store:
+                outcome = retire(args.config.absolute(), args.fcpxml, apply=True, store=store)
+        else:
+            outcome = retire(args.config.absolute(), args.fcpxml)
+    except (ReplayError, OSError, ValueError, ET.ParseError, httpx.HTTPError) as error:
         print(f"DELIVERY_RETENTION_ERROR {error}", file=sys.stderr)
         return 1
     print(json.dumps(asdict(outcome), indent=2, sort_keys=True))

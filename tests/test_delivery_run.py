@@ -404,3 +404,56 @@ def test_run_and_cli_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     settings = write(tmp_path / "defaults.json", defaults(tmp_path))
     assert delivery_run.main([str(description), "--defaults", str(settings)]) == 0
     assert calls == ["prepare", "measure", "finish"]
+
+
+def _cleanup_recording(tmp_path: Path, extra: dict[str, object]) -> Path:
+    data: dict[str, object] = {
+        "version": 1,
+        "recording": "replay-1",
+        "source": str(tmp_path / "a.mp4"),
+        "labels": str(tmp_path / "labels.json"),
+        "cuts": str(tmp_path / "cuts.json"),
+        "vocals": str(tmp_path / "vocals.wav"),
+        **extra,
+    }
+    return write(tmp_path / "delivery.json", data)
+
+
+def test_single_clean_source_uses_its_pinned_index_and_is_pinned_in_the_render_config(
+    tmp_path: Path,
+) -> None:
+    index = write(tmp_path / "evidence" / "single-source-index.json", {"ranges": []})
+    cleanup = write(
+        tmp_path / "source-cleanup.json", {"cleanIndex": {"path": str(index), "sha256": "0" * 64}}
+    )
+    loaded = delivery_run.load_recording(
+        _cleanup_recording(tmp_path, {"sourceCleanup": str(cleanup)})
+    )
+    runner = Recorder()
+    delivery = delivery_run.Delivery(
+        loaded, defaults(tmp_path), runner=runner, probe=lambda _path: (1080, 1920)
+    )
+    data = json.loads(delivery.prepare().read_text(encoding="utf-8"))
+    assert data["sourceChunks"] == str(index)
+    assert data["sourceCleanup"]["path"] == str(cleanup)
+    assert len(data["sourceCleanup"]["sha256"]) == 64
+    assert "chunk-index" not in [command[3] for command in runner.commands if len(command) > 3]
+
+
+def test_recording_must_select_exactly_one_clean_source_form(tmp_path: Path) -> None:
+    with pytest.raises(ReplayError, match="exactly one"):
+        delivery_run.load_recording(_cleanup_recording(tmp_path, {}))
+    with pytest.raises(ReplayError, match="exactly one"):
+        delivery_run.load_recording(
+            _cleanup_recording(
+                tmp_path,
+                {"sourceCleanup": str(tmp_path / "c.json"), "sourceRenderConfigs": ["/r/*.json"]},
+            )
+        )
+
+
+def test_clean_source_recording_keeps_legacy_fields_strict(tmp_path: Path) -> None:
+    with pytest.raises(ReplayError, match="unknown, missing"):
+        delivery_run.load_recording(
+            _cleanup_recording(tmp_path, {"sourceCleanup": str(tmp_path / "c.json"), "extra": 1})
+        )

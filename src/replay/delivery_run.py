@@ -25,14 +25,14 @@ from pathlib import Path
 
 from replay import delivery_render, delivery_retention
 from replay.core import ReplayError
+from replay.local_asr import fingerprint
 from replay.recordings import record
 
 CANVAS = (1080, 1920)
 RATE = 30
 NATIVE_SUFFIXES = frozenset({".mp4", ".mov", ".m4v"})
-DELIVERY_KEYS = frozenset(
-    {"version", "recording", "source", "labels", "cuts", "sourceRenderConfigs", "vocals"}
-)
+REQUIRED_DELIVERY_KEYS = frozenset({"version", "recording", "source", "labels", "cuts"})
+OPTIONAL_DELIVERY_KEYS = frozenset({"vocals", "sourceRenderConfigs", "sourceCleanup"})
 DEFAULT_KEYS = frozenset(
     {
         "version",
@@ -71,6 +71,7 @@ class Recording:
     cuts: Path
     render_configs: tuple[str, ...]
     vocals: Path | None
+    source_cleanup: Path | None = None
 
 
 def _json(path: Path) -> dict[str, object]:
@@ -85,15 +86,22 @@ def _path(value: object, field: str) -> Path:
 
 def load_recording(path: Path) -> Recording:
     raw = _json(path)
-    if set(raw) - {"vocals"} != DELIVERY_KEYS - {"vocals"} or raw.get("version") != 1:
+    keys = set(raw)
+    if (
+        not keys >= REQUIRED_DELIVERY_KEYS
+        or keys - REQUIRED_DELIVERY_KEYS - OPTIONAL_DELIVERY_KEYS
+        or raw.get("version") != 1
+    ):
         raise ReplayError("delivery.json has unknown, missing or unsupported fields")
     name = raw.get("recording")
     if not isinstance(name, str) or not name.startswith(("replay-", "youtube-")):
         raise ReplayError("recording must be replay-<id> or youtube-<id>")
-    patterns = raw.get("sourceRenderConfigs")
+    if ("sourceRenderConfigs" in keys) == ("sourceCleanup" in keys):
+        raise ReplayError("Select exactly one of sourceRenderConfigs and sourceCleanup")
+    patterns = raw.get("sourceRenderConfigs", [])
     if not isinstance(patterns, list) or not all(isinstance(item, str) for item in patterns):
         raise ReplayError("sourceRenderConfigs must be a list of glob patterns")
-    vocals = raw.get("vocals")
+    vocals, cleanup = raw.get("vocals"), raw.get("sourceCleanup")
     return Recording(
         name=name,
         source=_path(raw.get("source"), "source"),
@@ -101,6 +109,7 @@ def load_recording(path: Path) -> Recording:
         cuts=_path(raw.get("cuts"), "cuts"),
         render_configs=tuple(str(item) for item in patterns),
         vocals=None if vocals is None else _path(vocals, "vocals"),
+        source_cleanup=None if cleanup is None else _path(cleanup, "sourceCleanup"),
     )
 
 
@@ -222,19 +231,27 @@ class Delivery:
             ),
             "token projection",
         )
+        chunks = self.source_chunks()
+        return self.render_config(chunks, vocals, audio_clock)
+
+    def source_chunks(self) -> Path:
+        """Chunk index of the caption-removed source: pinned clean index, or built from globs."""
+        cleanup = self.recording.source_cleanup
+        if cleanup is not None:
+            index = record(_json(cleanup).get("cleanIndex"))
+            return _path(index.get("path"), "cleanIndex")
         configs = sorted(
             {item for pattern in self.recording.render_configs for item in glob.glob(pattern)}
         )
         if not configs:
             raise ReplayError("No caption-removed render configs matched")
-        chunks = self._step(
+        return self._step(
             self.work / "source-chunks.json",
             _module(
                 "replay.delivery_media", "chunk-index", self.work / "source-chunks.json", *configs
             ),
             "chunk index",
         )
-        return self.render_config(chunks, vocals, audio_clock)
 
     def separate(self) -> Path:
         directory = self.storage / "separation"
@@ -285,6 +302,9 @@ class Delivery:
             "calibration": self.defaults["calibration"],
             "viewerRoot": str(self._root("viewerRoot")),
         }
+        cleanup = self.recording.source_cleanup
+        if cleanup is not None:
+            config["sourceCleanup"] = {"path": str(cleanup), "sha256": fingerprint(cleanup)}
         (self.work / "render").mkdir(mode=0o700, exist_ok=True)
         (self.storage / "render").mkdir(mode=0o700, exist_ok=True)
         with path.open("x", encoding="utf-8") as stream:
