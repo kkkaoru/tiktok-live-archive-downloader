@@ -13,9 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from replay import cleanup_lane_successor as proof
 from replay import code_dependency_inventory, workflow
 from replay import code_generation_compat as compat
-from replay import cleanup_lane_successor as proof
 from replay import subtitle_session_cleanup as consumer
 from replay import subtitle_session_cleanup_plan as drafts
 from replay.core import ReplayError
