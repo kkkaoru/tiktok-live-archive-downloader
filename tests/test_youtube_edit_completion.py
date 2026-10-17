@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,33 @@ from replay.youtube_delivery import source_stem
 
 VIDEO_ID = "TEST1234567"
 STAMP = 1791811754
+
+
+@dataclass(frozen=True)
+class Recording:
+    """Paths of the synthetic recording fixture."""
+
+    root: Path
+    work: Path
+    movie: Path
+    cut_program: Path
+    source: Path
+    tools: dict[str, Path]
+
+
+def _rows(value: object) -> list[dict[str, object]]:
+    assert isinstance(value, list)
+    assert all(isinstance(item, dict) for item in value)
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _missing(report: dict[str, object], index: int) -> dict[str, object]:
+    return _row(_rows(report["deliveries"])[index]["missingStages"])
+
+
+def _row(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return value
 
 
 def _write(path: Path, data: object) -> Path:
@@ -111,7 +139,7 @@ def _alpha_probe(frames: int) -> dict[str, object]:
 
 
 @pytest.fixture
-def recording(tmp_path: Path, tools: dict[str, Path]) -> dict[str, Path]:
+def recording(tmp_path: Path, tools: dict[str, Path]) -> Recording:
     root = tmp_path / f"youtube-{VIDEO_ID}"
     media_dir = tmp_path / "media"
     media_dir.mkdir()
@@ -275,18 +303,13 @@ def recording(tmp_path: Path, tools: dict[str, Path]) -> dict[str, Path]:
     cut_program.write_bytes(b"fake-program")
     _probe(probes, cut_program.name, _media_probe("100.0"))
     _levels(tools["levels"], cut_program.name, "-20.0", "-3.0")
-    return {
-        "root": root,
-        "work": work,
-        "movie": movie,
-        "cut_program": cut_program,
-        "source": source,
-        "tools": tools,
-    }
+    return Recording(
+        root=root, work=work, movie=movie, cut_program=cut_program, source=source, tools=tools
+    )
 
 
 def test_full_check_passes(
-    recording: dict[str, Path], capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    recording: Recording, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(completion, "_diff_band_height", lambda program, movie, time: 300)
     monkeypatch.setattr(completion, "_alpha_box", lambda render, time: (800, 850, 900, 1000))
@@ -296,17 +319,17 @@ def test_full_check_passes(
     code = completion.main(
         [
             "check",
-            str(recording["root"]),
+            str(recording.root),
             "--workdir",
-            str(recording["work"]),
+            str(recording.work),
             "--cut-program",
-            str(recording["cut_program"]),
+            str(recording.cut_program),
         ]
     )
     assert code == 0
     report = json.loads(capsys.readouterr().out)
     assert report["complete"] is True
-    assert report["deliveries"][-1]["missingStages"] == {}
+    assert _missing(report, -1) == {}
     assert report["deliveries"][-1]["complete"] is True
     assert report["deliveries"][0]["superseded"] is True
     assert report["deliveries"][0]["complete"] is False
@@ -321,162 +344,160 @@ def test_full_check_passes(
 
 
 def test_check_without_cut_program_passes_with_note(
-    recording: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    recording: Recording, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(completion, "_alpha_box", lambda render, time: (800, 850, 900, 1000))
     failures, facts = completion.assess_delivery(
-        recording["root"],
-        completion.find_deliveries(recording["root"])[-1],
-        workdir=recording["work"],
+        recording.root,
+        completion.find_deliveries(recording.root)[-1],
+        workdir=recording.work,
     )
     assert failures == {}
-    assert facts["bgmRemoval"]["audioIdentity"] == "unverified-no-reference"
+    assert _row(facts["bgmRemoval"])["audioIdentity"] == "unverified-no-reference"
 
 
-def test_burn_in_paths(recording: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> None:
-    movie = recording["movie"]
-    program = recording["cut_program"]
+def test_burn_in_paths(recording: Recording, monkeypatch: pytest.MonkeyPatch) -> None:
+    movie = recording.movie
+    program = recording.cut_program
     real_diff = completion._diff_band_height
     assert real_diff(program, movie, 0.0) == 0
     monkeypatch.setenv("STUB_FFMPEG_FAIL", "1")
     with pytest.raises(ReplayError):
         real_diff(program, movie, 0.0)
     monkeypatch.setenv("STUB_FFMPEG_FAIL", "0")
-    failure, _ = completion.check_burn_in(recording["work"], "v1", program, movie)
+    failure, _ = completion.check_burn_in(recording.work, "v1", program, movie)
     assert failure is not None and "burn-in" in failure
     monkeypatch.setattr(completion, "_diff_band_height", lambda program, movie, time: 300)
-    failure, info = completion.check_burn_in(recording["work"], "v1", program, movie)
+    failure, info = completion.check_burn_in(recording.work, "v1", program, movie)
     assert failure is None and info["bandHeightsPx"] == [300]
     monkeypatch.setattr(completion, "_diff_band_height", lambda program, movie, time: 0)
-    failure, _ = completion.check_burn_in(recording["work"], "v1", program, movie)
+    failure, _ = completion.check_burn_in(recording.work, "v1", program, movie)
     assert failure is not None and "burn-in" in failure
-    failure, info = completion.check_burn_in(recording["work"], "v1", None, movie)
+    failure, info = completion.check_burn_in(recording.work, "v1", None, movie)
     assert failure is None and info["burnIn"] == "unverified-no-reference"
 
 
-def test_delivery_exception_row(recording: dict[str, Path]) -> None:
-    (recording["work"] / "separation" / "result.json").unlink()
-    (recording["tools"]["probes"] / (recording["movie"].name + ".json")).unlink()
-    report = completion.completion_report(recording["root"], workdir=recording["work"])
+def test_delivery_exception_row(recording: Recording) -> None:
+    (recording.work / "separation" / "result.json").unlink()
+    (recording.tools["probes"] / (recording.movie.name + ".json")).unlink()
+    report = completion.completion_report(recording.root, workdir=recording.work)
     assert report["complete"] is False
-    assert "delivery" in report["deliveries"][0]["missingStages"]
-    assert (
-        completion.main(["check", str(recording["root"]), "--workdir", str(recording["work"])]) == 2
-    )
+    assert "delivery" in _missing(report, 0)
+    assert completion.main(["check", str(recording.root), "--workdir", str(recording.work)]) == 2
 
 
-def test_default_workdir_branch(recording: dict[str, Path]) -> None:
-    report = completion.completion_report(recording["root"])
+def test_default_workdir_branch(recording: Recording) -> None:
+    report = completion.completion_report(recording.root)
     assert report["complete"] is False
-    assert "delivery" in report["deliveries"][0]["missingStages"]
+    assert "delivery" in _missing(report, 0)
 
 
-def test_bgm_failure_paths(recording: dict[str, Path]) -> None:
-    delivery = completion.find_deliveries(recording["root"])[-1]
-    result = recording["work"] / "separation" / "result.json"
+def test_bgm_failure_paths(recording: Recording) -> None:
+    delivery = completion.find_deliveries(recording.root)[-1]
+    result = recording.work / "separation" / "result.json"
     data = json.loads(result.read_text(encoding="utf-8"))
     data["device"] = "cpu"
     result.write_text(json.dumps(data), encoding="utf-8")
-    failure, _ = completion.check_bgm_removal(recording["source"], delivery, recording["work"])
+    failure, _ = completion.check_bgm_removal(recording.source, delivery, recording.work)
     assert failure is not None
     data["device"] = "mps"
-    data["vocals"] = str(recording["work"] / "missing.wav")
+    data["vocals"] = str(recording.work / "missing.wav")
     result.write_text(json.dumps(data), encoding="utf-8")
-    failure, _ = completion.check_bgm_removal(recording["source"], delivery, recording["work"])
-    assert "vocals" in failure
-    (recording["work"] / "vocals.wav").write_bytes(b"")
-    data["vocals"] = str(recording["work"] / "vocals.wav")
+    failure, _ = completion.check_bgm_removal(recording.source, delivery, recording.work)
+    assert failure is not None and "vocals" in failure
+    (recording.work / "vocals.wav").write_bytes(b"")
+    data["vocals"] = str(recording.work / "vocals.wav")
     result.write_text(json.dumps(data), encoding="utf-8")
-    failure, _ = completion.check_bgm_removal(recording["source"], delivery, recording["work"])
-    assert "vocals" in failure
+    failure, _ = completion.check_bgm_removal(recording.source, delivery, recording.work)
+    assert failure is not None and "vocals" in failure
 
 
-def test_bgm_audio_mismatch(recording: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> None:
-    delivery = completion.find_deliveries(recording["root"])[-1]
-    _levels(recording["tools"]["levels"], recording["cut_program"].name, "-30.0", "-3.0")
+def test_bgm_audio_mismatch(recording: Recording, monkeypatch: pytest.MonkeyPatch) -> None:
+    delivery = completion.find_deliveries(recording.root)[-1]
+    _levels(recording.tools["levels"], recording.cut_program.name, "-30.0", "-3.0")
     failure, _ = completion.check_bgm_removal(
-        recording["source"], delivery, recording["work"], cut_program=recording["cut_program"]
+        recording.source, delivery, recording.work, cut_program=recording.cut_program
     )
     assert failure is not None and "differs" in failure
     monkeypatch.setenv("STUB_FFMPEG_FAIL", "1")
-    failure, _ = completion.check_bgm_removal(recording["source"], delivery, recording["work"])
-    assert "fully decode" in failure
+    failure, _ = completion.check_bgm_removal(recording.source, delivery, recording.work)
+    assert failure is not None and "fully decode" in failure
 
 
-def test_bgm_more_branches(recording: dict[str, Path]) -> None:
-    delivery = completion.find_deliveries(recording["root"])[-1]
-    probes = recording["tools"]["probes"]
-    movie_probe = json.loads((probes / (recording["movie"].name + ".json")).read_text())
+def test_bgm_more_branches(recording: Recording) -> None:
+    delivery = completion.find_deliveries(recording.root)[-1]
+    probes = recording.tools["probes"]
+    movie_probe = json.loads((probes / (recording.movie.name + ".json")).read_text())
     movie_probe["streams"][1]["codec_name"] = "mp3"
-    _probe(probes, recording["movie"].name, movie_probe)
-    failure, _ = completion.check_bgm_removal(recording["source"], delivery, recording["work"])
+    _probe(probes, recording.movie.name, movie_probe)
+    failure, _ = completion.check_bgm_removal(recording.source, delivery, recording.work)
     assert failure == "delivery audio is not AAC"
     movie_probe["streams"][1]["codec_name"] = "aac"
     movie_probe["streams"][1]["profile"] = "HE-AAC"
-    _probe(probes, recording["movie"].name, movie_probe)
-    failure, _ = completion.check_bgm_removal(recording["source"], delivery, recording["work"])
-    assert "LC AAC" in failure
+    _probe(probes, recording.movie.name, movie_probe)
+    failure, _ = completion.check_bgm_removal(recording.source, delivery, recording.work)
+    assert failure is not None and "LC AAC" in failure
     movie_probe["streams"][1]["profile"] = "LC"
-    _probe(probes, recording["movie"].name, movie_probe)
+    _probe(probes, recording.movie.name, movie_probe)
     _probe(
         probes,
-        (recording["work"] / "vocals.wav").name,
+        (recording.work / "vocals.wav").name,
         {"streams": [], "format": {"duration": "10.0", "size": "1"}},
     )
-    failure, _ = completion.check_bgm_removal(recording["source"], delivery, recording["work"])
-    assert "cover" in failure
+    failure, _ = completion.check_bgm_removal(recording.source, delivery, recording.work)
+    assert failure is not None and "cover" in failure
 
 
-def test_silence_more_branches(recording: dict[str, Path]) -> None:
-    work = recording["work"]
+def test_silence_more_branches(recording: Recording) -> None:
+    work = recording.work
     cut = work / "cut-plan" / "p1" / "cuts.json"
     data = json.loads(cut.read_text(encoding="utf-8"))
     data["cuts"] = [{"source_start_frame": "x", "source_end_frame": 1, "output_start_frame": 0}]
     cut.write_text(json.dumps(data), encoding="utf-8")
-    failure, _ = completion.check_silence_cut(recording["source"], 100.0, work)
-    assert "matches" in failure
+    failure, _ = completion.check_silence_cut(recording.source, 100.0, work)
+    assert failure is not None and "matches" in failure
     (work / "cut-plan" / "p1" / "cuts.json").unlink()
     (work / "cut-plan" / "p1" / "peaks.txt").unlink()
     (work / "cut-plan" / "p1").rmdir()
     (work / "cut-plan").rmdir()
-    failure, _ = completion.check_silence_cut(recording["source"], 100.0, work)
-    assert "no cut plan" in failure
+    failure, _ = completion.check_silence_cut(recording.source, 100.0, work)
+    assert failure is not None and "no cut plan" in failure
 
 
-def test_transcription_more_branches(recording: dict[str, Path]) -> None:
-    delivery = completion.find_deliveries(recording["root"])[-1]
-    work = recording["work"]
+def test_transcription_more_branches(recording: Recording) -> None:
+    delivery = completion.find_deliveries(recording.root)[-1]
+    work = recording.work
     candidate = work / "asr-candidate-filtered.json"
     data = json.loads(candidate.read_text(encoding="utf-8"))
     data["clock"] = "other"
     candidate.write_text(json.dumps(data), encoding="utf-8")
     failure, _ = completion.check_transcription(delivery, work, 100.0, 200.0)
-    assert "missing or empty" in failure
+    assert failure is not None and "missing or empty" in failure
     data["clock"] = "input-pcm-not-projected"
     data["labels"] = data["labels"] * 60
     candidate.write_text(json.dumps(data), encoding="utf-8")
     failure, info = completion.check_transcription(delivery, work, 100.0, 200.0)
-    assert "less than half" in failure
+    assert failure is not None and "less than half" in failure
     delivery.transcript.write_text("1\n00:00:01,000 --> 00:04:00,000\nlate\n", encoding="utf-8")
     failure, _ = completion.check_transcription(delivery, work, 100.0, 200.0)
-    assert "exceeds" in failure
+    assert failure is not None and "exceeds" in failure
     (work / "cut-plan" / "p1" / "cuts.json").unlink()
     failure, _ = completion.check_transcription(delivery, work, 100.0, 200.0)
-    assert "no cut plan" in failure
+    assert failure is not None and "no cut plan" in failure
 
 
-def test_silence_cut_paths(recording: dict[str, Path]) -> None:
-    failure, info = completion.check_silence_cut(recording["source"], 100.0, recording["work"])
+def test_silence_cut_paths(recording: Recording) -> None:
+    failure, info = completion.check_silence_cut(recording.source, 100.0, recording.work)
     assert failure is None and info["cuts"] == 1
-    failure, _ = completion.check_silence_cut(recording["source"], 50.0, recording["work"])
-    assert "matches" in failure
-    (recording["work"] / "cut-plan" / "p1" / "peaks.txt").unlink()
-    failure, _ = completion.check_silence_cut(recording["source"], 100.0, recording["work"])
-    assert "measurement" in failure
+    failure, _ = completion.check_silence_cut(recording.source, 50.0, recording.work)
+    assert failure is not None and "matches" in failure
+    (recording.work / "cut-plan" / "p1" / "peaks.txt").unlink()
+    failure, _ = completion.check_silence_cut(recording.source, 100.0, recording.work)
+    assert failure is not None and "measurement" in failure
 
 
-def test_mask_paths(recording: dict[str, Path]) -> None:
-    root = recording["root"]
+def test_mask_paths(recording: Recording) -> None:
+    root = recording.root
     failure, info = completion.check_source_caption_mask(root)
     assert failure is None and info["totalFrames"] == 150
     summary = root / "evidence" / "source-masks-none" / "summary.json"
@@ -484,14 +505,14 @@ def test_mask_paths(recording: dict[str, Path]) -> None:
     data["totalFrames"] = 8
     summary.write_text(json.dumps(data), encoding="utf-8")
     failure, _ = completion.check_source_caption_mask(root)
-    assert "thinner" in failure
+    assert failure is not None and "thinner" in failure
     data["reason"] = "repeated-caption-band-detected"
     summary.write_text(json.dumps(data), encoding="utf-8")
     failure, _ = completion.check_source_caption_mask(root)
-    assert "visible" in failure
+    assert failure is not None and "visible" in failure
     summary.unlink()
     failure, _ = completion.check_source_caption_mask(root)
-    assert "no source-masks-none" in failure
+    assert failure is not None and "no source-masks-none" in failure
     summary.write_text(
         json.dumps({"noSourceSubtitlesDetected": True, "observedTextFrames": 0}), encoding="utf-8"
     )
@@ -499,36 +520,36 @@ def test_mask_paths(recording: dict[str, Path]) -> None:
     assert failure is None
 
 
-def test_mask_digest_mismatch(recording: dict[str, Path]) -> None:
-    summary = recording["root"] / "evidence" / "source-masks-none" / "summary.json"
+def test_mask_digest_mismatch(recording: Recording) -> None:
+    summary = recording.root / "evidence" / "source-masks-none" / "summary.json"
     data = json.loads(summary.read_text(encoding="utf-8"))
-    data["framesFile"] = {"path": str(recording["work"] / "frames-ocr.json"), "sha256": "0" * 64}
+    data["framesFile"] = {"path": str(recording.work / "frames-ocr.json"), "sha256": "0" * 64}
     summary.write_text(json.dumps(data), encoding="utf-8")
-    failure, _ = completion.check_source_caption_mask(recording["root"])
-    assert "digest" in failure
+    failure, _ = completion.check_source_caption_mask(recording.root)
+    assert failure is not None and "digest" in failure
 
 
-def test_transcription_paths(recording: dict[str, Path]) -> None:
-    delivery = completion.find_deliveries(recording["root"])[-1]
-    failure, info = completion.check_transcription(delivery, recording["work"], 100.0, 200.0)
+def test_transcription_paths(recording: Recording) -> None:
+    delivery = completion.find_deliveries(recording.root)[-1]
+    failure, info = completion.check_transcription(delivery, recording.work, 100.0, 200.0)
     assert failure is None and info["srtCues"] == 2
     assert info["mappedLabels"] == 3 and info["unmappedLabels"] == 0
     delivery.transcript.write_text("no cues here\n", encoding="utf-8")
-    failure, _ = completion.check_transcription(delivery, recording["work"], 100.0, 200.0)
-    assert "no transcript" in failure
+    failure, _ = completion.check_transcription(delivery, recording.work, 100.0, 200.0)
+    assert failure is not None and "no transcript" in failure
 
 
-def test_dynamic_more_branches(recording: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> None:
-    delivery = completion.find_deliveries(recording["root"])[-1]
-    work = recording["work"]
-    probes = recording["tools"]["probes"]
+def test_dynamic_more_branches(recording: Recording, monkeypatch: pytest.MonkeyPatch) -> None:
+    delivery = completion.find_deliveries(recording.root)[-1]
+    work = recording.work
+    probes = recording.tools["probes"]
     manifest = work / "composite-full-v1-parts.json"
     manifest.unlink()
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "no composite parts manifest" in failure
+    assert failure is not None and "no composite parts manifest" in failure
     _write(manifest, {"rate": 30, "parts": "x"})
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "matches" in failure
+    assert failure is not None and "matches" in failure
     _write(
         manifest,
         {
@@ -539,7 +560,7 @@ def test_dynamic_more_branches(recording: dict[str, Path], monkeypatch: pytest.M
         },
     )
     failure, info = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "missing" in failure and info["missingHead"] != []
+    assert failure is not None and "missing" in failure and info["missingHead"] != []
     alpha = json.loads((probes / ((work / "part-0000-alpha.mov").name + ".json")).read_text())
     alpha["streams"][0]["pix_fmt"] = "yuv420p"
     _probe(probes, (work / "part-0000-alpha.mov").name, alpha)
@@ -555,112 +576,110 @@ def test_dynamic_more_branches(recording: dict[str, Path], monkeypatch: pytest.M
         },
     )
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "alpha" in failure
+    assert failure is not None and "alpha" in failure
     alpha["streams"][0]["pix_fmt"] = "yuva444p12le"
     alpha["streams"][0]["nb_frames"] = "5"
     _probe(probes, (work / "part-0000-alpha.mov").name, alpha)
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "frame count" in failure
+    assert failure is not None and "frame count" in failure
 
 
-def test_dynamic_delivery_branches(
-    recording: dict[str, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    delivery = completion.find_deliveries(recording["root"])[-1]
-    work = recording["work"]
-    probes = recording["tools"]["probes"]
+def test_dynamic_delivery_branches(recording: Recording, monkeypatch: pytest.MonkeyPatch) -> None:
+    delivery = completion.find_deliveries(recording.root)[-1]
+    work = recording.work
+    probes = recording.tools["probes"]
     wrap = work / "titles" / "wrap-evidence-v1.json"
     data = json.loads(wrap.read_text(encoding="utf-8"))
     data["failures"] = 2
     _write(wrap, data)
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "failures" in failure
+    assert failure is not None and "failures" in failure
     data["failures"] = 0
     data["widestRewrappedLine"] = 9999.0
     _write(wrap, data)
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "safe width" in failure
+    assert failure is not None and "safe width" in failure
     data["widestRewrappedLine"] = 100.0
     _write(wrap, data)
-    movie = probes / (recording["movie"].name + ".json")
+    movie = probes / (recording.movie.name + ".json")
     probe = json.loads(movie.read_text(encoding="utf-8"))
     probe["streams"][0]["codec_name"] = "mpeg4"
-    _probe(probes, recording["movie"].name, probe)
+    _probe(probes, recording.movie.name, probe)
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "QuickTime" in failure
+    assert failure is not None and "QuickTime" in failure
     probe["streams"][0]["codec_name"] = "h264"
     probe["streams"][0]["width"] = 1280
-    _probe(probes, recording["movie"].name, probe)
+    _probe(probes, recording.movie.name, probe)
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "1920x1080" in failure
+    assert failure is not None and "1920x1080" in failure
     probe["streams"][0]["width"] = 1920
-    _probe(probes, recording["movie"].name, probe)
-    recording["movie"].write_bytes(b"no-boxes-here")
+    _probe(probes, recording.movie.name, probe)
+    recording.movie.write_bytes(b"no-boxes-here")
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "moov" in failure
+    assert failure is not None and "moov" in failure
     monkeypatch.setenv("STUB_FFMPEG_FAIL", "1")
-    recording["movie"].write_bytes(
+    recording.movie.write_bytes(
         b"\x00\x00\x00\x10ftyp\x00\x00\x00\x00\x00\x00\x00\x00"
         b"\x00\x00\x00\x10moov\x00\x00\x00\x00\x00\x00\x00\x00"
     )
     failure, _ = completion.check_dynamic_captions(delivery, work, 100.0)
-    assert "fully decode" in failure
+    assert failure is not None and "fully decode" in failure
     monkeypatch.setenv("STUB_FFMPEG_FAIL", "0")
 
 
-def test_dynamic_caption_paths(recording: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dynamic_caption_paths(recording: Recording, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(completion, "_alpha_box", lambda render, time: (800, 850, 900, 1000))
-    delivery = completion.find_deliveries(recording["root"])[-1]
-    failure, info = completion.check_dynamic_captions(delivery, recording["work"], 100.0)
+    delivery = completion.find_deliveries(recording.root)[-1]
+    failure, info = completion.check_dynamic_captions(delivery, recording.work, 100.0)
     assert failure is None and info["parts"] == 1
-    failure, _ = completion.check_dynamic_captions(delivery, recording["work"], 10.0)
-    assert "matches" in failure
-    manifest = recording["work"] / "composite-full-v1-parts.json"
+    failure, _ = completion.check_dynamic_captions(delivery, recording.work, 10.0)
+    assert failure is not None and "matches" in failure
+    manifest = recording.work / "composite-full-v1-parts.json"
     data = json.loads(manifest.read_text(encoding="utf-8"))
-    part_path = str(recording["work"] / "part-0000-alpha.mov")
+    part_path = str(recording.work / "part-0000-alpha.mov")
     data["parts"] = [
         {"path": part_path, "offsetFrame": 0, "frames": 2000},
         {"path": part_path, "offsetFrame": 1000, "frames": 2000},
     ]
     manifest.write_text(json.dumps(data), encoding="utf-8")
-    failure, _ = completion.check_dynamic_captions(delivery, recording["work"], 100.0)
-    assert "overlap" in failure
+    failure, _ = completion.check_dynamic_captions(delivery, recording.work, 100.0)
+    assert failure is not None and "overlap" in failure
 
 
-def test_mask_and_placement_more_branches(recording: dict[str, Path]) -> None:
-    summary = recording["root"] / "evidence" / "source-masks-none" / "summary.json"
+def test_mask_and_placement_more_branches(recording: Recording) -> None:
+    summary = recording.root / "evidence" / "source-masks-none" / "summary.json"
     data = json.loads(summary.read_text(encoding="utf-8"))
     data["framesFile"] = []
     summary.write_text(json.dumps(data), encoding="utf-8")
-    failure, _ = completion.check_source_caption_mask(recording["root"])
-    assert "bound raw" in failure
-    work = recording["work"]
+    failure, _ = completion.check_source_caption_mask(recording.root)
+    assert failure is not None and "bound raw" in failure
+    work = recording.work
     rows = [{"part": 9, "startFrame": 0, "leftOk": False, "box": [100, 800, 900, 900]}]
     _write(
         work / "titles" / "left-edge-v1-settled.json", {"summary": {"undetected": 0}, "rows": rows}
     )
     passed, placement = completion.check_placement(work, "v1")
     assert passed is False
-    assert placement["violations"][0]["part"] == 9
+    assert _rows(placement["violations"])[0]["part"] == 9
     (work / "titles" / "bundle-v1.json").unlink()
     with pytest.raises(ReplayError):
         completion.check_placement(work, "v1")
 
 
-def test_assess_volumedetect_raise(recording: dict[str, Path]) -> None:
-    (recording["tools"]["levels"] / (recording["movie"].name + ".levels")).unlink()
+def test_assess_volumedetect_raise(recording: Recording) -> None:
+    (recording.tools["levels"] / (recording.movie.name + ".levels")).unlink()
     report = completion.completion_report(
-        recording["root"], workdir=recording["work"], cut_program=recording["cut_program"]
+        recording.root, workdir=recording.work, cut_program=recording.cut_program
     )
     assert report["complete"] is False
-    assert "delivery" in report["deliveries"][-1]["missingStages"]
+    assert "delivery" in _missing(report, -1)
 
 
-def test_clip_geometry_paths(recording: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> None:
-    work = recording["work"]
+def test_clip_geometry_paths(recording: Recording, monkeypatch: pytest.MonkeyPatch) -> None:
+    work = recording.work
     parts = [{"path": str(work / "part-0000-alpha.mov"), "offsetFrame": 0, "frames": 3000}]
-    movie = recording["movie"]
-    program = recording["cut_program"]
+    movie = recording.movie
+    program = recording.cut_program
     failure, _ = completion.check_clip_geometry(
         work, "v1", parts, program=None, delivery_movie=movie
     )
@@ -669,7 +688,7 @@ def test_clip_geometry_paths(recording: dict[str, Path], monkeypatch: pytest.Mon
     failure, _ = completion.check_clip_geometry(
         work, "v1", parts, program=None, delivery_movie=movie
     )
-    assert "exceeds the safe area" in failure
+    assert failure is not None and "exceeds the safe area" in failure
     monkeypatch.setattr(completion, "_alpha_box", lambda render, time: (800, 850, 900, 1000))
     failure, info = completion.check_clip_geometry(
         work, "v1", parts, program=None, delivery_movie=movie
@@ -681,7 +700,7 @@ def test_clip_geometry_paths(recording: dict[str, Path], monkeypatch: pytest.Mon
     failure, _ = completion.check_clip_geometry(
         work, "v1", parts, program=program, delivery_movie=movie
     )
-    assert "canvas edge" in failure
+    assert failure is not None and "canvas edge" in failure
     monkeypatch.setattr(
         completion, "_diff_band_box", lambda program, movie, time: (800, 850, 900, 1000)
     )
@@ -695,12 +714,12 @@ def test_clip_geometry_paths(recording: dict[str, Path], monkeypatch: pytest.Mon
     failure, _ = completion.check_clip_geometry(
         work, "v1", parts, program=None, delivery_movie=movie
     )
-    assert "measurable samples" in failure
+    assert failure is not None and "measurable samples" in failure
 
 
-def test_placement_violations(recording: dict[str, Path]) -> None:
+def test_placement_violations(recording: Recording) -> None:
     _write(
-        recording["work"] / "titles" / "bundle-v1.json",
+        recording.work / "titles" / "bundle-v1.json",
         {
             "titleParts": [
                 {
@@ -719,14 +738,14 @@ def test_placement_violations(recording: dict[str, Path]) -> None:
         {"part": 0, "startFrame": 20, "leftOk": False, "box": [500, 800, 900, 900]},
     ]
     _write(
-        recording["work"] / "titles" / "left-edge-v1-settled.json",
+        recording.work / "titles" / "left-edge-v1-settled.json",
         {"summary": {"undetected": 2}, "rows": rows},
     )
-    passed, placement = completion.check_placement(recording["work"], "v1")
+    passed, placement = completion.check_placement(recording.work, "v1")
     assert passed is False
-    assert [v["box"] for v in placement["violations"]] == [[500, 800, 900, 900]]
-    assert [t["box"] for t in placement["transient"]] == [[100, 800, 900, 900]]
-    assert [t["box"] for t in placement["tolerated"]] == [[742, 800, 900, 900]]
+    assert [v["box"] for v in _rows(placement["violations"])] == [[500, 800, 900, 900]]
+    assert [t["box"] for t in _rows(placement["transient"])] == [[100, 800, 900, 900]]
+    assert [t["box"] for t in _rows(placement["tolerated"])] == [[742, 800, 900, 900]]
     assert placement["undetected"] == 2
 
 
@@ -804,10 +823,10 @@ def test_srt_and_probe_helpers(tmp_path: Path) -> None:
         completion._resolve_media(tmp_path / "missing.mp4")
 
 
-def test_volume_levels_unreadable(recording: dict[str, Path]) -> None:
-    _levels(recording["tools"]["levels"], recording["movie"].name, "x", "y")
+def test_volume_levels_unreadable(recording: Recording) -> None:
+    _levels(recording.tools["levels"], recording.movie.name, "x", "y")
     with pytest.raises(ReplayError):
-        completion.volume_levels(recording["movie"], 0.0)
+        completion.volume_levels(recording.movie, 0.0)
 
 
 def test_faststart_shapes(tmp_path: Path) -> None:
@@ -834,11 +853,11 @@ def test_main_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None
 
 
 def test_ass_candidate_route_is_separate_and_preserves_other_gates(
-    recording: dict[str, Path],
+    recording: Recording,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    evidence = recording["work"] / "ass-evidence.json"
+    evidence = recording.work / "ass-evidence.json"
     evidence.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         caption_ass_completion,
@@ -861,15 +880,15 @@ def test_ass_candidate_route_is_separate_and_preserves_other_gates(
     result = completion.main(
         [
             "check",
-            str(recording["root"]),
+            str(recording.root),
             "--workdir",
-            str(recording["work"]),
+            str(recording.work),
             "--cut-program",
-            str(recording["cut_program"]),
+            str(recording.cut_program),
             "--candidate",
-            str(recording["movie"]),
+            str(recording.movie),
             "--transcript",
-            str(recording["movie"].with_suffix(".srt")),
+            str(recording.movie.with_suffix(".srt")),
             "--ass-evidence",
             str(evidence),
         ]
@@ -900,30 +919,30 @@ def test_find_deliveries_empty(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("registered", [False, True])
 def test_ass_published_selection_uses_bound_movie_not_generation_date(
-    recording: dict[str, Path], monkeypatch: pytest.MonkeyPatch, registered: bool
+    recording: Recording, monkeypatch: pytest.MonkeyPatch, registered: bool
 ) -> None:
-    later = recording["root"] / "delivery" / "2027-01-01_00-00-00_JST_youtube-TEST1234567-old"
+    later = recording.root / "delivery" / "2027-01-01_00-00-00_JST_youtube-TEST1234567-old"
     later.mkdir()
     (later / "wrong.mp4").write_bytes(b"wrong old generation")
     (later / "wrong.srt").write_text("old", encoding="utf-8")
     evidence = (
-        recording["root"] / "evidence" / "caption-ass-delivery.json"
+        recording.root / "evidence" / "caption-ass-delivery.json"
         if registered
-        else recording["work"] / "proof.json"
+        else recording.work / "proof.json"
     )
     evidence.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         caption_ass_completion, "read_document", lambda path: {"artifacts": {"movie": {}}}
     )
-    monkeypatch.setattr(caption_ass_completion, "bound_path", lambda ref: recording["movie"])
+    monkeypatch.setattr(caption_ass_completion, "bound_path", lambda ref: recording.movie)
     monkeypatch.setattr(
         completion,
         "assess_delivery",
         lambda *args, **kwargs: ({}, {"placement": {"violations": []}}),
     )
     report = completion.completion_report(
-        recording["root"],
-        workdir=recording["work"],
+        recording.root,
+        workdir=recording.work,
         ass_evidence=None if registered else evidence,
     )
     assert report["route"] == "youtube-libass-phrase"
