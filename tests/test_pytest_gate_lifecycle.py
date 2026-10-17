@@ -1,8 +1,10 @@
 """Real isolated synthetic pytest children and mocked unsafe boundary failures."""
 
 import hashlib
+import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -348,16 +350,24 @@ def test_package_coverage_includes_relocated_file_and_real_subprocess(gate: Gate
 
 
 def test_lazy_plugin_cold_import_definitions_are_measured(gate: Gate) -> None:
-    gate.test.write_text("def test_cold_import():\n    assert True\n", encoding="utf-8")
-    raw = decode(gate.request.read_bytes())
-    raw["coverageSources"] = [str(module.CHECKOUT / "src")]
-    raw["coveragePackages"] = ["replay"]
-    raw["sourcePins"] = [ref(gate.test)]
-    raw["apply"] = False
-    gate.request.write_bytes(encode(raw))
-    result = decode(module.run(gate.request).read_bytes())
+    # This gate runs pytest in the real checkout, whose scratch plugin refuses an explicit
+    # basetemp inside its default tree; tmp_path lives there, so the gate root must not.
+    root = module.CHECKOUT / "edits/work/pytest-gate-cold-import" / uuid.uuid4().hex / "gate"
+    root.mkdir(parents=True)
+    try:
+        gate.test.write_text("def test_cold_import():\n    assert True\n", encoding="utf-8")
+        raw = decode(gate.request.read_bytes())
+        raw["root"] = str(root)
+        raw["coverageSources"] = [str(module.CHECKOUT / "src")]
+        raw["coveragePackages"] = ["replay"]
+        raw["sourcePins"] = [ref(gate.test)]
+        raw["apply"] = False
+        gate.request.write_bytes(encode(raw))
+        result = decode(module.run(gate.request).read_bytes())
+        coverage = decode((root / "evidence/coverage.json").read_bytes())
+    finally:
+        shutil.rmtree(root.parent)
     assert result["pytestExitStatus"] == 0
-    coverage = decode((gate.root / "evidence/coverage.json").read_bytes())
     files = coverage["files"]
     assert isinstance(files, dict)
     constants = files["src/replay/caption_style_defaults.py"]

@@ -7,7 +7,10 @@ filesystem or environment side effects; this is a development-only plugin.
 import fcntl
 import hashlib
 import os
+import re
+import shutil
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -17,6 +20,9 @@ import pytest
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 TEMP_ENVIRONMENT = ("TMPDIR", "TMP", "TEMP", "PYTEST_DEBUG_TEMPROOT")
+RUN_NAME = re.compile(r"run-[0-9a-f]{32}")
+KEEP_RUNS = 4  # newest finished runs always kept for inspection
+MIN_AGE_SECONDS = 3600  # a run younger than this is never swept
 
 
 @dataclass(frozen=True)
@@ -71,6 +77,49 @@ def _lock(base: Path, *, root: Path, default: Path) -> int:
     return descriptor
 
 
+def _finished(run: Path, locks: Path) -> bool:
+    """A run is finished when nobody holds the flock its owner took on its base path."""
+    name = hashlib.sha256(os.fsencode(run / "pytest")).hexdigest()
+    lock = locks / name
+    if not lock.is_file() or lock.is_symlink():
+        return True
+    descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def sweep(default: Path, *, keep: int = KEEP_RUNS, min_age: float = MIN_AGE_SECONDS) -> list[Path]:
+    """Delete finished, old default-scratch runs beyond the newest ``keep``; protect live ones.
+
+    Only real ``run-<uuid>`` directories directly inside ``default`` are considered, never
+    symlinks. A run owned by a live pytest process holds its flock and is skipped.
+    """
+    locks = default / "locks"
+    now = time.time()
+    runs = sorted(
+        (
+            path
+            for path in default.iterdir()
+            if RUN_NAME.fullmatch(path.name) and path.is_dir() and not path.is_symlink()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    removed: list[Path] = []
+    for run in runs[keep:]:
+        if now - run.stat().st_mtime < min_age or not _finished(run, locks):
+            continue
+        shutil.rmtree(run)
+        (locks / hashlib.sha256(os.fsencode(run / "pytest")).hexdigest()).unlink(missing_ok=True)
+        removed.append(run)
+    return removed
+
+
 def _base(value: object, *, root: Path) -> Path | None:
     if value is None:
         return None
@@ -91,6 +140,7 @@ def _bootstrap(config: pytest.Config) -> None:
     base = _checked(run / "pytest", root=root) if explicit is None else explicit
     descriptor = _lock(base, root=root, default=default)
     config.add_cleanup(lambda: os.close(descriptor))
+    sweep(default)
     run.mkdir(mode=0o700)
     scratch = _checked(run / "python-tmp", root=root)
     scratch.mkdir(mode=0o700)
