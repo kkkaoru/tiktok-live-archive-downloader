@@ -16,16 +16,16 @@ separation = ["demucs>=4.1,<5", "numpy>=1.26,<2"]
 roformer = ["mlx-audio==0.4.3", "numpy>=2.2,<3"]
 dialogue-separation = ["mlx-audio[sts]==0.5.7", "numpy>=2.2,<3", "scipy>=1.12,<2"]
 ja-alignment = ["nagisa==0.3.0", "pykakasi==2.3.0"]
-ctc-alignment = ["torch==2.6.0", "transformers==5.17.0", "numpy>=1.26,<3", "scipy>=1.12,<2"]
+ctc-alignment = ["torch==2.14.1", "transformers==5.17.0", "numpy>=1.26,<3", "scipy>=1.12,<2"]
 coreml-extraction = ["coremltools>=9,<10; sys_platform == 'darwin'"]
 yolo = [
     "ultralytics==8.4.177",
-    "torch==2.6.0",
-    "torchvision==0.21.0",
+    "torch==2.14.1",
+    "torchvision==0.29.1",
     "numpy>=2.2,<3",
     "opencv-python-headless>=4.10,<5",
 ]
-usef-extraction = ["torch==2.6.0", "numpy>=1.26,<2", "scipy>=1.12,<2"]
+usef-extraction = ["torch==2.14.1", "numpy>=1.26,<2", "scipy>=1.12,<2"]
 speaker-extraction = [
     "torch==2.2.2", "torchaudio==2.2.2", "numpy>=1.26,<2",
     "scipy>=1.12,<2", "huggingface-hub>=0.34,<2", "speechbrain==1.0.3",
