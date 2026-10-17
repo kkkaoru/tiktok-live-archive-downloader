@@ -142,7 +142,39 @@ checked on the startup volume and on any offload volume.
   `delivery_retention CONFIG` without `--apply` for a dry run. A `work/retention/retention-receipt.json`
   marks completion, and `delivery_run` and `pipeline_supervisor` then refuse to rerender, because a
   rerun would regenerate the removed media. This does not cover native-revision `part-*-master.mov`
-  files, which still follow the `compressed_part_*` route below.
+  files, which still follow the `compressed_part_*` route below. Retirement also writes
+  `work/retention/restore-recipe.json` and moves (never deletes) the checkpoint directories and
+  JSON outputs of every producer plan that touched a retired file into `work/retention/archive/`.
+  `delivery_retention CONFIG --restore` sets the retention receipt aside; `delivery_pipeline` then
+  rebuilds the media from the original. Rebuilt movies are accepted by media verification, not by digest.
+- **Applied retention offloads to R2 first.** Before anything is unlinked, `--apply` deploys the
+  temporary token-gated Worker (`web-viewer/src/upload-worker.js`, through `replay.r2_worker`,
+  deleted afterwards) and uploads every eligible row to the private `replay-intermediates`
+  bucket as `intermediates/<recording>/<sha256>`, with the SHA-256 as object metadata and each
+  multipart part checked against its MD5 ETag. The recording's manifest
+  `edits/<recording>/evidence/intermediate-offload.json` records `root`, `relative`, size,
+  mode, mtime, key and state (`pending`, `uploaded`, `retired`, `restored`); it never names an
+  absolute media path. A failed upload stops retention before any unlink, and reruns reuse
+  matching objects. The bucket's lifecycle rule deletes `intermediates/` objects 90 days after
+  upload (`expiresAt`) and aborts unfinished multipart uploads after one day.
+  `python -m replay.intermediate_offload status edits/<recording>` counts entries;
+  `python -m replay.intermediate_offload restore edits/<recording> [--relative PATH]` downloads
+  next to the target, verifies SHA-256, restores mode and mtime and links the file into place
+  without overwriting. After expiry use `delivery_retention CONFIG --restore` to rebuild.
+- **Quiet scratch under `edits/work` offloads the same way.** `python -m replay.work_offload`
+  is a dry run; `--apply` uploads, then retires, every single-link regular file with at least
+  1 MiB allocated (not mostly sparse) whose mtime and ctime are older than `--quiet-days`
+  (default 7). Each `edits/work/<name>` is one unit with its own
+  `<name>/evidence/intermediate-offload.json` under recording id `<name>`, so `status` and
+  `restore edits/work/<name>` above apply. `.git`, offload manifests, locks, partial
+  downloads, `r2-worker/` and the `work-offload/` log directory are never candidates. Open
+  files are uploaded but held; a failing unit keeps every file and the sweep continues.
+  Smaller non-empty files go through `python -m replay.work_pack sweep [--apply]`, which packs
+  each unit's quiet small files into one tar under `edits/work/work-offload/packs/<unit>/`,
+  offloads the tar the same way, retires the listed members and then the local tar. The
+  unit's `evidence/small-files-offload.json` lists each pack's members with SHA-256, size,
+  mode and mtime; `python -m replay.work_pack restore edits/work/<unit>` links back every
+  missing member and never overwrites a file.
 - **Prefer a verified replacement to a hold.** Large ProRes parts and whole masters are
   retired once a verified compact HEVC part set (`compressed_part_*`) and the dated delivery
   exist; keep clean sources, settings, clocks, receipts and failure evidence.
@@ -251,6 +283,15 @@ There is **no automatic migration CLI command**. Bootstrap provisions software; 
 Historical investigation material can be retained separately under `private/legacy-investigation/`. Old scripts, device configurations, and logs may retain historical absolute paths; archiving them does not make those auxiliary environments immediately runnable. Never substitute old experimental credentials for the active credential.
 
 Local migration runbooks and account-specific settings, if present, belong under `private/`; do not copy their contents into public documentation or an agent handoff.
+
+
+## Workflow failure records
+
+`python -m replay.workflow_diagnostics PLAN --state DIR` runs a workflow exactly like
+`python -m replay.workflow` but leaves `DIR/last-failure.json` on failure: the exception chain with
+source locations, the redacted message of repository-authored errors and the OS errno. Plan
+contents, command arguments and locals are never recorded. Prefer it for new long jobs so a failed
+stage points at its private `run.log` instead of leaving only the exception class.
 
 ## Record mirror and shared-volume headroom
 
