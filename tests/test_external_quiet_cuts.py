@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from replay.core import ReplayError
-from replay.external_quiet_cuts import run
+from replay.external_quiet_cuts import main, run
 
 RATE = 8000
 FFMPEG = shutil.which("ffmpeg")
@@ -38,7 +38,9 @@ def _write(tmp_path: Path) -> Path:
         stream.setnchannels(2)
         stream.setsampwidth(2)
         stream.setframerate(RATE)
-        stream.writeframes(b"".join(a + a for a in [audio[i : i + 2] for i in range(0, len(audio), 2)]))
+        stream.writeframes(
+            b"".join(a + a for a in [audio[i : i + 2] for i in range(0, len(audio), 2)])
+        )
     per = 1024
     count = (int(total * RATE) + per - 1) // per
     clock = tmp_path / "audio-clock.json"
@@ -113,8 +115,7 @@ def test_plans_cut_in_measured_quiet(tmp_path: Path) -> None:
     assert result["lineageIsCallerDeclared"] is True
     assert count >= 1
     kept = [
-        (cut["source_start_frame"] / 30, cut["source_end_frame"] / 30)
-        for cut in result["cuts"]
+        (cut["source_start_frame"] / 30, cut["source_end_frame"] / 30) for cut in result["cuts"]
     ]
     assert any(start <= 0.5 and end >= 1.5 for start, end in kept)
     assert any(start <= 6.5 and end >= 7.5 for start, end in kept)
@@ -130,3 +131,59 @@ def test_rejects_digest_mismatch(tmp_path: Path) -> None:
     config.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ReplayError, match="digest"):
         run(config, tmp_path / "out", ffmpeg=str(FFMPEG))
+
+
+def _edit(config: Path, change: dict[str, object]) -> None:
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data.update(change)
+    config.write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="FFmpeg fixture is unavailable")
+def test_refuses_an_existing_output_directory(tmp_path: Path) -> None:
+    output = tmp_path / "cuts"
+    output.mkdir()
+    with pytest.raises(ReplayError, match="new cut planning output"):
+        run(_write(tmp_path), output, ffmpeg=str(FFMPEG))
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="FFmpeg fixture is unavailable")
+def test_rejects_an_invalid_source_clock_contract(tmp_path: Path) -> None:
+    config = _write(tmp_path)
+    _edit(config, {"fps": 0})
+    with pytest.raises(ReplayError, match="Invalid source-clock"):
+        run(config, tmp_path / "out", ffmpeg=str(FFMPEG))
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="FFmpeg fixture is unavailable")
+def test_rejects_incomplete_lineage(tmp_path: Path) -> None:
+    config = _write(tmp_path)
+    data = json.loads(config.read_text(encoding="utf-8"))
+    del data["artifacts"]["videoClock"]
+    config.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ReplayError, match="Incomplete quiet"):
+        run(config, tmp_path / "out", ffmpeg=str(FFMPEG))
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="FFmpeg fixture is unavailable")
+def test_rejects_an_artifact_binding_with_extra_fields(tmp_path: Path) -> None:
+    config = _write(tmp_path)
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data["artifacts"]["labels"]["note"] = "extra"
+    config.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ReplayError, match="explicit artifact path"):
+        run(config, tmp_path / "out", ffmpeg=str(FFMPEG))
+
+
+def test_rejects_a_missing_planning_config(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        run(tmp_path / "absent.json", tmp_path / "out", ffmpeg="ffmpeg")
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="FFmpeg fixture is unavailable")
+def test_main_prints_the_number_of_planned_cuts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _write(tmp_path)
+    assert main([str(config), str(tmp_path / "cuts"), "--ffmpeg", str(FFMPEG)]) == 0
+    assert capsys.readouterr().out.startswith("Planned quiet cuts: ")

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from replay.core import ReplayError
-from replay.external_recognition_projection import run
+from replay.external_recognition_projection import main, run
 
 RATE = 16000
 
@@ -20,9 +20,7 @@ def _sha(path: Path) -> str:
 def _probe(frames: int, per: int) -> dict[str, object]:
     return {
         "streams": [{"sample_rate": "16000", "time_base": "1/16000"}],
-        "frames": [
-            {"pts": index * per, "nb_samples": per} for index in range(frames)
-        ],
+        "frames": [{"pts": index * per, "nb_samples": per} for index in range(frames)],
     }
 
 
@@ -114,3 +112,94 @@ def test_rejects_digest_mismatch_and_bad_clock(tmp_path: Path) -> None:
     Path(paths["config"]).write_text(json.dumps(config), encoding="utf-8")
     with pytest.raises(ReplayError, match="bind the declared PCM"):
         run(Path(paths["config"]), tmp_path / "out2.json")
+
+
+def _rewrite(path: Path, change: dict[str, object]) -> None:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(change)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _rebind(config: Path, name: str, artifact: Path) -> None:
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data["artifacts"][name]["sha256"] = _sha(artifact)
+    config.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_refuses_an_existing_output(tmp_path: Path) -> None:
+    paths = _write(tmp_path)
+    output = tmp_path / "exists.json"
+    output.write_text("{}", encoding="utf-8")
+    with pytest.raises(ReplayError, match="new output"):
+        run(Path(paths["config"]), output)
+
+
+def test_rejects_an_unsupported_clock_contract(tmp_path: Path) -> None:
+    paths = _write(tmp_path)
+    _rewrite(Path(paths["config"]), {"version": 2})
+    with pytest.raises(ReplayError, match="Unsupported projection clock"):
+        run(Path(paths["config"]), tmp_path / "out.json")
+
+
+def test_rejects_incomplete_lineage(tmp_path: Path) -> None:
+    paths = _write(tmp_path)
+    config = Path(paths["config"])
+    data = json.loads(config.read_text(encoding="utf-8"))
+    del data["artifacts"]["pcm"]
+    config.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ReplayError, match="complete caller-declared lineage"):
+        run(config, tmp_path / "out.json")
+
+
+def test_rejects_an_artifact_binding_with_extra_fields(tmp_path: Path) -> None:
+    paths = _write(tmp_path)
+    config = Path(paths["config"])
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data["artifacts"]["labels"]["note"] = "extra"
+    config.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ReplayError, match="explicit artifact path"):
+        run(config, tmp_path / "out.json")
+
+
+def test_rejects_non_numeric_recognition_clocks(tmp_path: Path) -> None:
+    paths = _write(tmp_path)
+    labels = Path(paths["labels"])
+    _rewrite(labels, {"labels": [{"text": "あ", "start": "0", "end": 0.5, "provenance": "w:0"}]})
+    _rebind(Path(paths["config"]), "labels", labels)
+    with pytest.raises(ReplayError, match="must be numeric"):
+        run(Path(paths["config"]), tmp_path / "out.json")
+
+
+def test_rejects_labels_without_text_or_provenance(tmp_path: Path) -> None:
+    paths = _write(tmp_path)
+    labels = Path(paths["labels"])
+    _rewrite(labels, {"labels": [{"text": 5, "start": 0.0, "end": 0.5, "provenance": "w:0"}]})
+    _rebind(Path(paths["config"]), "labels", labels)
+    with pytest.raises(ReplayError, match="text/provenance"):
+        run(Path(paths["config"]), tmp_path / "out.json")
+
+
+def test_rejects_an_empty_label_list(tmp_path: Path) -> None:
+    paths = _write(tmp_path)
+    labels = Path(paths["labels"])
+    _rewrite(labels, {"labels": []})
+    _rebind(Path(paths["config"]), "labels", labels)
+    with pytest.raises(ReplayError, match="bounded unprojected"):
+        run(Path(paths["config"]), tmp_path / "out.json")
+
+
+def test_rejects_pcm_that_differs_from_the_recognition_manifest(tmp_path: Path) -> None:
+    paths = _write(tmp_path)
+    manifest = tmp_path / "inputs.json"
+    _rewrite(manifest, {"samples": 1})
+    _rebind(Path(paths["config"]), "asrInputs", manifest)
+    with pytest.raises(ReplayError, match="duration-preserving"):
+        run(Path(paths["config"]), tmp_path / "out.json")
+
+
+def test_main_prints_the_projected_label_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = _write(tmp_path)
+    assert main([paths["config"], str(tmp_path / "out.json")]) == 0
+    assert capsys.readouterr().out == "Projected external recognition labels: 2\n"
