@@ -345,7 +345,7 @@ def test_physical_observation_records_confined_permission_denial(
     monkeypatch.setattr(benchmark, "SystemHost", lambda: Mock(birth=lambda pid: "1:2"))
     monkeypatch.setattr(benchmark, "sample_family", Mock(side_effect=PermissionError("ps denied")))
     observer = benchmark.PhysicalObservation()
-    observer._observe()
+    observer.thread.start()
     assert observer.finish() == {
         "available": False,
         "reason": "process-family observation denied by confined execution",
