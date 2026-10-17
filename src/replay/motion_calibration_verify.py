@@ -90,7 +90,18 @@ def parse_plan(raw: dict[str, object]) -> Plan:
         or not 1 <= len(entries) <= motion_caption.MAX_SEQUENCE_SENTENCES
     ):
         raise ValueError("Invalid bounded plan dimensions or states")
-    states = tuple(motion_stages._placement(entry, rate) for entry in entries)
+    states = tuple(
+        motion_stages._placement(
+            entry,
+            rate,
+            coordinate_space="motion-origin",
+            source_width=width,
+            source_height=height,
+            output_width=width,
+            output_height=height,
+        )
+        for entry in entries
+    )
     previous = 0
     for state in states:
         if (

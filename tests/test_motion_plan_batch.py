@@ -12,6 +12,14 @@ from replay import motion_finish, motion_plan_batch, motion_stages
 from replay.core import ReplayError
 
 
+def _first_title_part(value: dict[str, object]) -> dict[str, object]:
+    parts = value["titleParts"]
+    assert isinstance(parts, list)
+    part = parts[0]
+    assert isinstance(part, dict)
+    return part
+
+
 def _bundle() -> dict[str, object]:
     part = {
         "version": 1,
@@ -165,8 +173,7 @@ def test_anchors_multiline_blocks_by_measured_advance(
 ) -> None:
     template, bundle, output = _inputs(tmp_path)
     value = _bundle()
-    part = value["titleParts"][0]
-    assert isinstance(part, dict)
+    part = _first_title_part(value)
     part["placements"] = [
         {"text": "一行", "startFrame": 0, "endFrame": 4, "x": 0, "y": 0},
         {"text": "二行\n目", "startFrame": 4, "endFrame": 8, "x": 0, "y": 0},
@@ -198,8 +205,7 @@ def test_recomputes_anchor_when_merging_lines(
 ) -> None:
     template, bundle, output = _inputs(tmp_path)
     value = _bundle()
-    part = value["titleParts"][0]
-    assert isinstance(part, dict)
+    part = _first_title_part(value)
     part["placements"] = [
         {"text": "上\n", "startFrame": 0, "endFrame": 6, "x": 0, "y": 0},
         {"text": "下", "startFrame": 5, "endFrame": 12, "x": 0, "y": 0},
@@ -228,15 +234,21 @@ def test_recomputes_anchor_when_merging_lines(
 
 
 def test_rejects_bad_anchor_geometry() -> None:
-    good = dict(text="あ", height=720, anchor_y_ratio=Fraction(8, 9),
-                font_size=104.0, output_height=1080)
-    assert motion_plan_batch._anchored_y(**good) == 640.0
-    bad = dict(good, font_size=0.0)
+    ratio = Fraction(8, 9)
+    assert (
+        motion_plan_batch._anchored_y(
+            "あ", height=720, anchor_y_ratio=ratio, font_size=104.0, output_height=1080
+        )
+        == 640.0
+    )
     with pytest.raises(ReplayError):
-        motion_plan_batch._anchored_y(**bad)
+        motion_plan_batch._anchored_y(
+            "あ", height=720, anchor_y_ratio=ratio, font_size=0.0, output_height=1080
+        )
     with pytest.raises(ReplayError):
-        motion_plan_batch._anchored_y("", height=720, anchor_y_ratio=Fraction(8, 9),
-                                       font_size=104.0, output_height=1080)
+        motion_plan_batch._anchored_y(
+            "", height=720, anchor_y_ratio=Fraction(8, 9), font_size=104.0, output_height=1080
+        )
 
 
 def test_rejects_changed_inputs_on_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -290,3 +302,73 @@ def test_rejects_inconsistent_counts_and_duplicate_json_keys(
     bundle.write_text('{"version":1,"version":1}', encoding="utf-8")
     with pytest.raises(ReplayError, match="duplicate keys"):
         motion_plan_batch.expand(template, bundle, output, anchor_y_ratio=Fraction(8, 9))
+
+
+def test_regular_rejects_symlinked_missing_empty_and_oversized_inputs(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    empty = tmp_path / "empty.json"
+    empty.write_bytes(b"")
+    with pytest.raises(ReplayError, match="symlinks"):
+        motion_plan_batch._regular(link, limit=100)
+    with pytest.raises(ReplayError, match="unavailable"):
+        motion_plan_batch._regular(tmp_path / "absent.json", limit=100)
+    with pytest.raises(ReplayError, match="bounded regular"):
+        motion_plan_batch._regular(empty, limit=100)
+    with pytest.raises(ReplayError, match="bounded regular"):
+        motion_plan_batch._regular(target, limit=1)
+    assert motion_plan_batch._regular(target, limit=100) == target
+
+
+def test_mapping_integer_and_number_validate_their_inputs() -> None:
+    with pytest.raises(ReplayError, match="plan x fields"):
+        motion_plan_batch._mapping({"a": 1}, name="x", keys={"b"})
+    with pytest.raises(ReplayError, match="plan frames"):
+        motion_plan_batch._integer(True, name="frames")
+    with pytest.raises(ReplayError, match="plan frames"):
+        motion_plan_batch._integer(-1, name="frames")
+    with pytest.raises(ReplayError, match="plan y"):
+        motion_plan_batch._number(True, name="y")
+    with pytest.raises(ReplayError, match="plan y"):
+        motion_plan_batch._number(float("nan"), name="y")
+    assert motion_plan_batch._number(3, name="y") == 3.0
+
+
+def test_main_reports_an_error_and_returns_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "motion",
+            str(tmp_path / "t"),
+            str(tmp_path / "b"),
+            str(tmp_path / "o"),
+            "--anchor-y-ratio",
+            "8/9",
+        ],
+    )
+    assert motion_plan_batch.main() == 1
+    assert capsys.readouterr().out.startswith("MOTION_BATCH_ERROR")
+
+
+def test_main_prints_the_manifest_path_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    monkeypatch.setattr(motion_plan_batch, "expand", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "motion",
+            str(tmp_path / "t"),
+            str(tmp_path / "b"),
+            str(tmp_path / "o"),
+            "--anchor-y-ratio",
+            "8/9",
+        ],
+    )
+    assert motion_plan_batch.main() == 0
+    assert capsys.readouterr().out == f"{manifest}\n"
