@@ -436,6 +436,17 @@ def test_demucs_backend_returns_input_as_vocals(monkeypatch: pytest.MonkeyPatch)
     assert np.array_equal(backend.extract_instrumental(chunk), np.zeros_like(chunk))
 
 
+def test_a_demucs_backend_on_mps_registers_the_graph_release_at_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_imports(monkeypatch)
+    registered: list[str] = []
+    monkeypatch.setattr(bgm, "release_mps_graphs_at_exit", lambda: registered.append("mps"))
+    bgm._load_backend("htdemucs", "mps")
+    bgm._load_backend("htdemucs", "cpu")
+    assert registered == ["mps"]
+
+
 def test_demucs_backend_requires_vocals_stem(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_imports(monkeypatch, sources=("drums", "bass"))
     with pytest.raises(ReplayError, match="no vocals stem"):

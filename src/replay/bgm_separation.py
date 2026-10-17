@@ -25,6 +25,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from replay.core import ReplayError
+from replay.mps_graph_cache import release_mps_graphs_at_exit
 
 MODEL_NAME = "mlx-community/mel-roformer-mlx"
 MODEL_REVISION = "639de4848eb79a9e29cc8cba3c01170ddf165eef"
@@ -72,6 +73,8 @@ class _DemucsBackend:
         pretrained = _import("demucs.pretrained")
         apply = _import("demucs.apply")
         model = pretrained.get_model(model_name)
+        if device == "mps":
+            release_mps_graphs_at_exit()
         model.to(device)
         model.eval()
         names = tuple(str(name) for name in model.sources)
