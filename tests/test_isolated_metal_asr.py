@@ -20,7 +20,6 @@ from replay.core import ReplayError
 from replay.fcp_recovery_runtime import SystemHost
 from replay.isolated_metal_asr_probe import planned_environment
 from replay.native_invocation import durable, pin
-from replay.recordings import record
 from replay.native_sequence import ContractError
 from replay.recordings import record
 
