@@ -1,6 +1,7 @@
 // Temporary bulk-upload helper (delete this Worker after the upload finishes).
 // R2 multipart via binding, gated by a dedicated UPLOAD_TOKEN secret because
 // `cf r2 objects put` caps at 300 MB and no S3 token can be minted here.
+// `replay.r2_worker` deploys the same file to offload and restore render intermediates.
 export default {
   async fetch(request, env) {
     if (request.headers.get("X-Upload-Token") !== env.UPLOAD_TOKEN) {
@@ -13,7 +14,19 @@ export default {
       }
       if (url.pathname === "/head") {
         const head = await env.MEDIA.head(url.searchParams.get("key"));
-        return head ? Response.json({ size: head.size }) : new Response("Not found", { status: 404 });
+        return head
+          ? Response.json({
+              size: head.size,
+              uploaded: head.uploaded.toISOString(),
+              metadata: head.customMetadata || {},
+            })
+          : new Response("Not found", { status: 404 });
+      }
+      if (url.pathname === "/get") { // streamed download for restoring offloaded files
+        const object = await env.MEDIA.get(url.searchParams.get("key"));
+        return object
+          ? new Response(object.body, { headers: { "Content-Length": String(object.size) } })
+          : new Response("Not found", { status: 404 });
       }
       if (url.pathname === "/put") { // small objects only (catalog / per-video JSON)
         const body = await request.arrayBuffer();
@@ -24,9 +37,10 @@ export default {
         return Response.json({ ok: true, size: body.byteLength });
       }
       if (url.pathname === "/create") {
-        const { key } = await request.json();
+        const { key, type, metadata } = await request.json();
         const up = await env.MEDIA.createMultipartUpload(key, {
-          httpMetadata: { contentType: "video/mp4" },
+          httpMetadata: { contentType: type || "video/mp4" },
+          customMetadata: metadata || {},
         });
         return Response.json({ uploadId: up.uploadId });
       }

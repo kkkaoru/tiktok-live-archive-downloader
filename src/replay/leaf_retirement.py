@@ -241,9 +241,8 @@ def _retire_chunk(
     return retired, logical
 
 
-def retire(
-    dispositions: Path,
-    expected_sha256: str,
+def retire_rows(
+    rows: Sequence[Row],
     roots: Sequence[Path],
     log: Path,
     *,
@@ -251,7 +250,7 @@ def retire(
     probe: BatchProbe = lsof_open_among,
     chunk_size: int = CHUNK_SIZE,
 ) -> Summary:
-    rows = load_eligible(dispositions, expected_sha256)
+    """Retire rows the caller already vetted, with the same per-row checks and log."""
     held: Counter[str] = Counter()
     retired = logical = 0
     ordered = sorted(rows, key=lambda row: (row.kind == "symlink", row.path))
@@ -263,6 +262,20 @@ def retire(
             retired += done
             logical += size
     return Summary(len(rows), retired, logical, dict(held))
+
+
+def retire(
+    dispositions: Path,
+    expected_sha256: str,
+    roots: Sequence[Path],
+    log: Path,
+    *,
+    apply: bool,
+    probe: BatchProbe = lsof_open_among,
+    chunk_size: int = CHUNK_SIZE,
+) -> Summary:
+    rows = load_eligible(dispositions, expected_sha256)
+    return retire_rows(rows, roots, log, apply=apply, probe=probe, chunk_size=chunk_size)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
