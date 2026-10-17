@@ -217,8 +217,10 @@ remain false. A failed job preserves its partial directory and cannot overwrite 
 `python -m replay.delivery_run DELIVERY.json --defaults DEFAULTS.json` runs the whole
 render side for one recording. `DELIVERY.json` (version 1) names only `recording`
 (`replay-<id>` or `youtube-<id>`), the dated `source`, source-clock transcript `labels`,
-the frame `cuts`, glob patterns `sourceRenderConfigs` of the caption-removed chunk
-renders and an optional separated `vocals`. `DEFAULTS.json` names the machine's
+the frame `cuts`, either glob patterns `sourceRenderConfigs` of the caption-removed chunk
+renders or, for one verified single-file clean source, the pinned `sourceCleanup` config
+(`assemblyManifest`, `assemblyReceipt`, `cleanIndex`; its index becomes the render
+config's `sourceChunks` and the config pins it), and an optional separated `vocals`. `DEFAULTS.json` names the machine's
 measurement/foreground executables, calibration, Motion template and finish arguments,
 Compressor presets, work/storage/delivery/viewer roots, separation runtime, summary CLI,
 the caption fallbacks (`minimumTop`, `unknownTop`) and worker counts.
@@ -1037,7 +1039,7 @@ weak acoustic support and unsupported transcripts must remain unresolved, not be
 forced into an approved subtitle.
 
 `uv sync --locked --no-dev --extra usef-extraction` selects an isolated
-PyTorch 2.6 / NumPy 1.x environment for reference-frame USEF experiments and
+PyTorch 2.14 / NumPy 1.x environment for reference-frame USEF experiments and
 restricted checkpoint loading with explicit `safe_globals`. It is incompatible
 with the old speaker-extraction, separation, editing, MLX and development extras.
 Keep `weights_only=True`: static pickle-global inspection and a narrowly reviewed
@@ -1351,3 +1353,149 @@ The publication check exports the Git index to a temporary directory and runs Gi
 The sdist explicitly includes public source, tests, scripts, and documentation. The wheel contains the runtime package. Check archive members when changing packaging; test with synthetic runtime files to ensure they are excluded, not with real secrets. Never upload `private/`, `downloads/`, captures, or test media as Actions artifacts.
 
 CI runs the same checks on macOS with read-only repository permission, SHA-pinned actions, and no account credentials. A local green test run and a hosted CI run are separate results.
+
+
+## MPS-batched repair detector
+
+`replay.subtitle_detector_mps.MpsTextDetector` runs the PP-OCRv3 DB network on Apple MPS from a
+checksum-pinned `torch.export` program (`.pt2`, dynamic over batch 1–64 and 32-multiple grids
+32–736) and lets OpenCV's own `TextDetectionModel_DB` decode the probability maps (embedded channel-0
+network, production thresholds). It keeps the production two-view geometry and `polygon_mask`, so
+masks are identical to `LearnedTextDetector` on measured real ROIs. It requires torch and an explicit
+device, never falls back, and moves the CPU-loaded program to MPS. Build the pinned program once with
+`edits/work/ocr-mps-detector-v1/build_exported_program.py` in an environment that has onnx and
+onnx2torch; it bakes onnx2torch's constant Resize/Squeeze inputs (which `torch.export` cannot trace),
+checks the program against onnx2torch on CPU and MPS, and writes `EXPORT-RECORD.json` (the deleted
+TorchScript artifact it replaced matched it exactly and is kept there only by checksum). Pass the
+recorded file and checksum as `detectorProgram` / `detectorProgramSHA256`. TorchScript (`torch.jit`)
+is deprecated in torch 2.14 and is not loaded.
+
+
+## Sampled-OCR source-caption repair (new generation)
+
+`replay.subtitle_sampled_job CONFIG.json` repairs one source chunk without recognising every frame:
+
+1. `subtitle_sampled_chunk.band_triggers` decodes only the subtitle band and marks abrupt changes
+   (threshold = median + 6 MAD of the chunk's own frame deltas).
+2. Native `video_text_recognize_session` reads every 6th frame plus the trigger frames only; each
+   sampled frame's region comes from the existing `frame_region` rule.
+3. The batched MPS detector (`subtitle_detector_mps`) supplies a per-frame region for every frame;
+   `subtitle_sampled_admission` unites the bracketed sampled regions with the detector regions
+   widened by 6 frames. Frames without any region stay unknown and unmodified.
+4. `subtitle_video_fast.render_repaired_video_fast` repairs; the production detector inside it is the
+   MPS one, whose masks are identical to `LearnedTextDetector` on measured real ROIs.
+5. `subtitle_repair_audit` OCRs every 5th repaired frame (zero-based candidate clock). Any line with
+   confidence >= 0.9 that overlaps that frame's search region fails the audit and escalates the whole
+   chunk to a full-OCR attempt (`stride 1`); a second failure accepts nothing.
+
+The receipt (`chunk-receipt.json`) records both attempts, the sampled frames, stage seconds and pins,
+and states `regionsFromSampling`, `qualityApproved: false` and `deliveryComplete: false`. Region
+fills are conservative search windows, not raw OCR; the repair stage still measures glyph pixels in
+every frame. The native tool needs its checkpoint directories inside the checkout, so state stays under
+`edits/work` while repaired videos go to the configured media root. Vision reports unreadable repair
+smear with fixed confidences 0.3/0.5 and real text with 1.0, which is what the audit relies on; a
+stride-5 audit samples frames and cannot prove absence.
+
+### Sampled eligibility validator
+
+`replay.subtitle_sampled_eligibility.validate_sampled_eligibility(receipt, admission, ...)` checks a
+sampled-OCR chunk before a later stage consumes it: honest sampling provenance (`rawOcr` false,
+`interpolated` true, fill rule, first and last frame sampled, no gap wider than the stride), exact
+per-frame clock, `repair_spans` membership, unknown frames listed exactly, pins matching the source
+hash, and an accepted final attempt whose audit passed with no residual lines. It certifies internal
+consistency only; quality approval and delivery stay false.
+
+### Sampled consumer adapter
+
+`replay.subtitle_sampled_consumer.adapt(Adaptation(...))` validates each sampled chunk with the
+sampled eligibility validator and writes `plan.json`, a pinned `settings.json` (same fields as the
+base settings with the sampled run's native identity) and per-chunk `chunk.json`,
+`candidate-config.json` and `repair/candidate.json` pointing at the accepted attempt's SSD media (no
+copy). `subtitle_cleanup_assembly.prepare` then produces the manifest for
+`delivery_source_assembly`. Quality, full decode and delivery flags remain false.
+
+### Sampled survey evidence and its limits
+
+`replay.subtitle_sampled_survey.survey(plan, assembly, output)` binds the per-chunk audits to the
+assembled source by hash and writes `source-masks-none` evidence that discloses sampling, escalations
+and rejected attempts. Its OCR-confidence audit cannot prove absence: a partially repaired caption can
+be read below the 0.9 gate (Oct10 chunk 194). Do not publish its summary as completion evidence until
+a colour-based residual check (unchanged caption-colour pixels inside detected text boxes) and review of
+the flagged frames are attached.
+
+### Colour residual gate and colour-key supplement (sampled path)
+
+The OCR-confidence audit misses partially repaired captions (Vision read them at 0.5). The sampled path
+adds an OCR-free check: `subtitle_colour_residual.unchanged_pink` counts caption-colour pixels that are
+unchanged by the repair inside the original's recognised line boxes; `GATE` (40 pixels per audited
+frame, one global constant) makes an attempt fail and escalate. `subtitle_colour_audit.colour_counts`
+decodes the audited frames of source and candidate in lockstep. For chunks that reach the gate,
+`subtitle_colour_support.ColourKeyDetector` ORs caption-fill pixels (plus outline) inside the line boxes
+into the learned glyph mask (job config `colourKey`, receipt pin `colourKey: pink-key-v1`); scene pixels
+of the same hue outside the boxes are untouched. Counts between 5 and 40 pixels remain a recorded
+residual risk that needs human review; neither check approves quality.
+
+### CTC label refinement (candidate only)
+
+`replay.asr_ctc_label_refine` replaces a supported run of assembled ASR labels with CTC-aligned
+onsets, and `replay.asr_ctc_label_refine_verify` proves the result differs from the pinned original
+only as declared. Text is compared after both sides drop whitespace and the aligner's unvoiced
+symbols; token and label edges that coincide form chunks (one token over several labels merges them,
+several tokens over one label time it by the first token, crossing edges or an unvoiced-only label
+inside a chunk are unmappable, unvoiced-only labels between chunks are carried unchanged). Ends are
+derived (`derived-next-onset`, last label: original end if it shows a frame, else one frame, never past
+the next original label) and recorded per label. A config without `block` and with only `deleteLabels`
+removes labels that share their predecessor's onset. Nothing is approved; speech accuracy needs review.
+
+With `block.mergeWeak` (opt-in) a run of weak units that lies between two supported contiguous units is
+folded into the preceding supported label: the merged text is the exact concatenation of the original
+labels, only the strong first token times it, the weak tokens are cited as `unusedWeak`, and a leading
+weak label, a trailing weak label, a gap with another label, or a merged label longer than the focused
+caption limit is never produced. The verifier requires `mergeWeak` to be declared for such citations.
+Merged labels are human-review markers.
+
+`replay.asr_window_substitute` (and `_verify`) replaces one collapsed label block, whose span must equal
+a declared window, with the words of a bounded re-recognition (same pinned recognizer, input-PCM clock)
+that lie wholly inside the window. Words crossing the window edge are listed as excluded and never
+inserted, every other label is unchanged, and the recognizer's own word times are kept until a CTC
+refinement re-times them. Excluded edge words can drop characters of the surrounding text; that needs
+human review.
+
+### Generic source-caption cleanup runner
+
+`python -m replay.source_clean_run DESCRIPTION.json configs|run|assemble` cleans a whole recording from
+one description (dated source and SHA-256, physical presentation clock, caption profile observations,
+native tool, pinned detector, base settings, work directory under `edits/work/`, media root, ffmpeg/ffprobe,
+chunk size, streams, free-space floor, sampling parameters). `configs` writes one chunk job per clock
+chunk (colour key and colour gate on), `run` executes `replay.subtitle_sampled_job` with bounded
+concurrent streams, skips chunks that have a receipt and stops starting chunks below the free-space
+floor, and `assemble` adapts the validated chunks, prepares the assembly manifest, joins the media with
+parallel probes and writes the pinned `source-cleanup.json`. It contains nothing recording-specific; the
+per-recording caption profile and clock bootstrap are inputs. Outputs are candidates.
+
+`source_clean_run BOOTSTRAP_DIR describe --defaults DEFAULTS.json` writes the description of a recording
+from its bootstrap directory (`source.sha256`, `cleanup-bootstrap-v1/`) and one machine-wide defaults file
+(native tool, pinned detector, ffmpeg/ffprobe, media root, budgets); the canvas is read with ffprobe.
+
+`asr_ctc_label_refine` also accepts the opt-in block option `foldUnvoiced`. Unvoiced-only labels
+(for example the long-vowel mark) that sit between two re-timed units are normally carried over at
+their original onset, which can precede the measured onset of the label before them and is then
+refused as reversed onsets. With `foldUnvoiced` such a label is instead appended, text and
+provenance intact and listed under `foldedUnvoiced`, to the timed label before it; no time is
+invented for a symbol the aligner does not align. The verifier requires the declaration, the exact
+original labels and an unchanged recognized text. This is candidate timing evidence, not speech
+accuracy approval.
+
+`asr_window_substitute` also accepts the opt-in block option `foldShorterThan` (seconds, at most
+0.1). A recognizer sometimes gives the pieces of one word a few milliseconds each, which paging
+then refuses as a replacement chain delayed by more than one frame. With the option, each
+re-recognized word shorter than the threshold is appended to the word before it: the text order is
+kept, the earlier start and the later end are the recognizer's own times, and the folded words are
+listed under `folded`. The verifier re-derives the folding. A short first word has nothing to fold
+into and stays. This is candidate evidence, not speech accuracy approval.
+
+The block option `dropSustained` (boolean) removes a block whose window holds only a sustained
+vowel or noise: the re-recognized words crossing the window must all consist of the held characters
+`あぁー～`, or the recognizer must hear nothing there. Any other recognized word makes the plan
+refuse. The block is deleted without substitute labels and the verifier re-derives the decision.
+This is candidate evidence; a person still confirms the deletion.
