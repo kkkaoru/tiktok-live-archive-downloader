@@ -294,6 +294,7 @@ the move need re-pinning, while content sha256 still verifies.
   stay unresolved because an input really differs: 689 are pytest scratch receipts whose test
   media was deleted or mutated by the tests themselves, and 122 pin code that changed later
   (`separation_window_*.py`, `disjoint_wave_queue.py`, `Package.swift`, AudioClockProbe
-  sources); those need their stage re-run by the owner, not a rewritten pin. Reports:
+  sources); on the user's instruction (2026-10-17) both groups were deleted, so no receipt is left
+  unresolved. Reports:
   `edits/work/cold-consolidation/repin-report.json` and `repin-report-2.json`. Plans that will run again are re-bound with
   `replay.separation_plan_refresh` or `replay.metal_asr_config`.
