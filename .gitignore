@@ -30,6 +30,10 @@ web-session.json
 secrets.json
 credentials*.txt
 .dev.vars
+# Google Colab CLI OAuth client config, tokens and session state
+.colab-cli-oauth-config.json
+colab-cli/
+sessions.json
 .netrc
 .npmrc
 *.p8
