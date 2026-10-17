@@ -1,5 +1,8 @@
 """Fixed-bottom placement uses canvas proportions only; no head observation."""
 
+from collections.abc import Callable
+from fractions import Fraction
+
 import pytest
 
 from replay import caption_fixed_bottom as fixed
@@ -34,7 +37,7 @@ def test_appearance_is_style20_at_twice_youtube_size() -> None:
     assert appearance.inner_black_stroke == pytest.approx(4.0 * 104 / 88)
     assert appearance.shadow_offset_y == pytest.approx(7.0 * 104 / 88)
     assert appearance.shadow_blur == pytest.approx(4.0 * 104 / 88)
-    assert appearance.entrance_duration == fixed.Fraction(1, 15)
+    assert appearance.entrance_duration == Fraction(1, 15)
     assert appearance.entrance_start_y_scale == 0.96
 
 
@@ -58,6 +61,9 @@ def test_non_16_by_9_and_bad_canvas_rejected() -> None:
         fixed.bottom_slot(1080, 1920)
     with pytest.raises(ValueError, match="16:9"):
         fixed.bottom_slot(1920, 1200)
-    for width, height in [(0, 1080), (1920, 0), (-1920, 1080), (1920.0, 1080)]:  # type: ignore[list-item]
+    for width, height in [(0, 1080), (1920, 0), (-1920, 1080)]:
         with pytest.raises(ValueError, match="[Cc]anvas"):
             fixed.bottom_slot(width, height)
+    unchecked: Callable[..., object] = fixed.bottom_slot
+    with pytest.raises(ValueError, match="[Cc]anvas"):
+        unchecked(1920.0, 1080)

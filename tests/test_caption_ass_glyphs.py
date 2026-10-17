@@ -2,6 +2,7 @@
 
 import io
 import json
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -45,7 +46,7 @@ def test_streamed_renderer_records_real_frame_geometry(
             assert timeout == 60
             return 0
 
-    monkeypatch.setattr(glyphs.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Process())
     result = glyphs.rasterize(
         ("字幕",),
         appearance=Appearance(52, 960, 1032, 0, 1920),

@@ -140,7 +140,9 @@ def test_wrong_cleanup(bound_request: Path, monkeypatch: pytest.MonkeyPatch) -> 
         binder.prepare(bound_request, bound_request.parent / "bound-head")
 
 
-def test_input_changes_during_verification(bound_request: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_input_changes_during_verification(
+    bound_request: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     def verify(path: Path) -> dict[str, object]:
         write(bound_request.parent / "replacement-metrics.json", {"changed": True})
         return {"outputFrames": 30}
@@ -152,7 +154,8 @@ def test_input_changes_during_verification(bound_request: Path, monkeypatch: pyt
 
 def test_token_mapping_required(bound_request: Path) -> None:
     write(
-        bound_request.parent / "replacement-reflow.json", {"settings": {"tokenSources": {"map": "hash"}}}
+        bound_request.parent / "replacement-reflow.json",
+        {"settings": {"tokenSources": {"map": "hash"}}},
     )
     with pytest.raises(ReplayError, match="requires its token mapping"):
         binder.prepare(bound_request, bound_request.parent / "bound-head")
@@ -164,9 +167,44 @@ def test_token_mapping_preserved(bound_request: Path, monkeypatch: pytest.Monkey
     data["artifactPaths"]["tokenSources"] = str(source_map)
     write(bound_request, data)
     write(
-        bound_request.parent / "replacement-reflow.json", {"settings": {"tokenSources": {"map": "hash"}}}
+        bound_request.parent / "replacement-reflow.json",
+        {"settings": {"tokenSources": {"map": "hash"}}},
     )
     monkeypatch.setattr(binder, "load_sources", lambda path, entries: ((), {"map": "hash"}))
     binder.prepare(bound_request, bound_request.parent / "bound-head")
     output = json.loads((bound_request.parent / "bound-head/head-config.json").read_text())
     assert output["tokenSources"]["path"].endswith("tokens-map.json")
+
+
+def _edit_template(request: Path, change: dict[str, object]) -> None:
+    data = json.loads(request.read_text())
+    template = Path(data["headTemplate"]["path"])
+    value = json.loads(template.read_text())
+    value.update(change)
+    write(template, value)
+    data["headTemplate"] = ref(template)
+    write(request, data)
+
+
+def test_incomplete_cleanup_lineage(bound_request: Path) -> None:
+    _edit_template(bound_request, {"cleanPaths": {"cleanIndex": str(bound_request)}})
+    with pytest.raises(ReplayError, match="Incomplete cleanup lineage"):
+        binder.prepare(bound_request, bound_request.parent / "bound-head")
+
+
+def test_blank_project_name(bound_request: Path) -> None:
+    _edit_template(bound_request, {"name": "  "})
+    with pytest.raises(ReplayError, match="explicit project name"):
+        binder.prepare(bound_request, bound_request.parent / "bound-head")
+
+
+def test_face_observations_of_another_source(bound_request: Path) -> None:
+    write(bound_request.parent / "face-config.json", {"source": "other", "sourceSHA256": "0" * 64})
+    with pytest.raises(ReplayError, match="another source"):
+        binder.prepare(bound_request, bound_request.parent / "bound-head")
+
+
+def test_invalid_template_schema(bound_request: Path) -> None:
+    _edit_template(bound_request, {"version": 2})
+    with pytest.raises(ReplayError, match="Invalid head template"):
+        binder.prepare(bound_request, bound_request.parent / "bound-head")

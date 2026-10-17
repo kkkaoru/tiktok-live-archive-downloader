@@ -8,6 +8,7 @@ import pytest
 from test_motion_entrance import SOURCE
 
 from replay import fcp_project, motion_entrance
+from replay.caption_style_defaults import MOTION_ENTRANCE_START_SCALE
 from replay.core import ReplayError
 from replay.fcp_measured import CaptionAnchor, read_measured_captions
 from replay.fcp_project import (
@@ -68,7 +69,9 @@ def test_native_zero_position_with_motion_entrance(title: Path) -> None:
     template = caption_template(title, anchor=CaptionAnchor.BOTTOM)
     assert template is not None
     title.write_text(
-        title.read_text(encoding="utf-8").replace("<value>0.96</value>", "<value>0.5</value>"),
+        title.read_text(encoding="utf-8").replace(
+            f"<value>{MOTION_ENTRANCE_START_SCALE}</value>", "<value>0.5</value>"
+        ),
         encoding="utf-8",
     )
     with pytest.raises(ReplayError, match="entrance curve"):

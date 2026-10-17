@@ -43,8 +43,9 @@ def test_char_fallback_splits_runs_and_long_tokens() -> None:
     assert linguistic["fallback"] is False
     assert str(linguistic["text"]).replace("\n", "") == long_token
     assert len(str(linguistic["text"]).split("\n")) <= 3
-    for entry in linguistic["lines"]:  # type: ignore[union-attr]
-        assert entry["width"] <= 1161.0
+    lines = linguistic["lines"]
+    assert isinstance(lines, list)
+    assert all(float(entry["width"]) <= 1161.0 for entry in lines)
 
 
 def test_linguistic_path_reports_no_fallback() -> None:
