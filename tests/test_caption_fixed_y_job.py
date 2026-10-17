@@ -296,9 +296,10 @@ def track_file(path: Path, rows: list[dict[str, object]], *, rate: int = 30) -> 
     path.write_text(
         json.dumps(
             {
-                "protocol": "yolo-face-caption-track-v1",
+                "protocol": "yolo-face-caption-track-v2",
                 "provenance": "yolo",
                 "rate": rate,
+                "timeBase": "1/90000",
                 "frames": rows,
             }
         ),
@@ -309,24 +310,35 @@ def track_file(path: Path, rows: list[dict[str, object]], *, rate: int = 30) -> 
 
 def test_yolo_samples_are_the_box_centre_and_top_of_single_confident_faces(tmp_path: Path) -> None:
     rows: list[dict[str, object]] = [
-        {"frame": 60, "face": [100.0, 800.0, 300.0, 1000.0, 0.9], "faceCount": 1, "captions": 0},
-        {"frame": 0, "face": [110.0, 810.0, 310.0, 1010.0, 0.8], "faceCount": 1, "captions": 0},
-        {"frame": 30, "face": None, "faceCount": 0, "captions": 0},
-        {"frame": 90, "face": [0.0, 1.0, 2.0, 3.0, 0.9], "faceCount": 2, "captions": 0},
-        {"frame": 120, "face": [0.0, 1.0, 2.0, 3.0, 0.3], "faceCount": 1, "captions": 0},
-    ]
+        {"frame": 60, "pts": 4680000, "face": [100.0, 800.0, 300.0, 1000.0, 0.9],
+         "faceCount": 1, "captions": 0},
+        {"frame": 0, "pts": 0, "face": [110.0, 810.0, 310.0, 1010.0, 0.8], "faceCount": 1,
+         "captions": 0},
+        {"frame": 30, "pts": 90000, "face": None, "faceCount": 0, "captions": 0},
+        {"frame": 90, "pts": 4770000, "face": [0.0, 1.0, 2.0, 3.0, 0.9], "faceCount": 2,
+         "captions": 0},
+        {"frame": 120, "pts": 4860000, "face": [0.0, 1.0, 2.0, 3.0, 0.3], "faceCount": 1,
+         "captions": 0},
+    ]  # fmt: skip
     found = job.load_yolo(track_file(tmp_path / "t.json", rows), rate=30, minimum_confidence=0.5)
     assert found == [
         TrackingPosition(Fraction(0), 210.0, 810.0),
-        TrackingPosition(Fraction(2), 200.0, 800.0),
+        TrackingPosition(Fraction(52), 200.0, 800.0),
     ]
 
 
 def test_a_track_of_another_protocol_or_rate_is_refused(tmp_path: Path) -> None:
     other = tmp_path / "other.json"
     other.write_text(json.dumps({"protocol": "x", "provenance": "yolo"}), encoding="utf-8")
-    with pytest.raises(ReplayError, match="Not a YOLO face track"):
+    with pytest.raises(ReplayError, match="Not a timestamped"):
         job.load_yolo(other, rate=30, minimum_confidence=0.5)
+    untimed = tmp_path / "v1.json"
+    untimed.write_text(
+        json.dumps({"protocol": "yolo-face-caption-track-v1", "provenance": "yolo"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReplayError, match="Not a timestamped"):
+        job.load_yolo(untimed, rate=30, minimum_confidence=0.5)
     slow = track_file(tmp_path / "slow.json", [], rate=24)
     with pytest.raises(ReplayError, match="different frame rate"):
         job.load_yolo(slow, rate=30, minimum_confidence=0.5)
@@ -358,7 +370,13 @@ def test_the_command_line_plans_from_a_yolo_track_without_a_vision_index(tmp_pat
     arguments = build_inputs(tmp_path)
     arguments[1] = "-"
     rows: list[dict[str, object]] = [
-        {"frame": n, "face": [100.0, 1000.0, 300.0, 1200.0, 0.9], "faceCount": 1, "captions": 0}
+        {
+            "frame": n,
+            "pts": n * 3000,
+            "face": [100.0, 1000.0, 300.0, 1200.0, 0.9],
+            "faceCount": 1,
+            "captions": 0,
+        }
         for n in range(0, 300, 10)
     ]
     track = track_file(tmp_path / "track.json", rows)

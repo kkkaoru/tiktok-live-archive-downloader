@@ -15,8 +15,10 @@ import os
 import subprocess
 import sys
 import time
+from bisect import bisect_left
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -24,14 +26,29 @@ import numpy as np
 from numpy.typing import NDArray
 
 from replay.core import ReplayError
+from replay.mps_graph_cache import released_mps_graphs
 from replay.yolo_labels import CAPTION, FACE
 from replay.yolo_train import check_checkpoint, check_settings
 
-PROTOCOL = "yolo-face-caption-track-v1"
+# v2: every row carries the frame's presentation timestamp. v1 derived time as frame / rate,
+# which drifts on variable-frame-rate recordings (45 s by the end of 10-07).
+PROTOCOL = "yolo-face-caption-track-v2"
 CONFIDENCE_FLOOR = 0.25
 TRAIN_WIDTH = 640
 MAX_BATCH = 64
 FACE_RULE = "highest-confidence face box; faceCount keeps the number of faces above the floor"
+
+
+@dataclass(frozen=True, slots=True)
+class Clock:
+    """Presentation timestamps of the video stream in display order, and their time base."""
+
+    pts: tuple[int, ...]
+    time_base: Fraction
+
+    def first_index(self, seconds: Fraction) -> int:
+        """Index of the first frame shown at or after `seconds` (where an input seek lands)."""
+        return bisect_left(self.pts, seconds / self.time_base)
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,9 +215,33 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def presentation_clock(source: Path, ffprobe: str) -> Clock:
+    """Packet timestamps of the first video stream, sorted into display order (no decoding)."""
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=time_base:packet=pts", "-of", "json", str(source)],
+        capture_output=True, text=True, check=True, timeout=600,
+    ).stdout  # fmt: skip
+    data = json.loads(out)
+    pts = sorted(int(packet["pts"]) for packet in data["packets"])
+    if not pts or len(set(pts)) != len(pts):
+        raise ReplayError("The video stream has no or duplicate presentation timestamps")
+    return Clock(tuple(pts), Fraction(str(data["streams"][0]["time_base"])))
+
+
+def timed_rows(rows: Sequence[Row], clock: Clock, *, start: Fraction, step: int) -> list[Row]:
+    """Rows renumbered to decoded-frame indices: the seek lands on the first frame at `start`."""
+    first = clock.first_index(start)
+    renumbered = [replace(row, frame=first + number * step) for number, row in enumerate(rows)]
+    if renumbered and renumbered[-1].frame >= len(clock.pts):
+        raise ReplayError("More decoded frames than presentation timestamps")
+    return renumbered
+
+
 def document(
     rows: Sequence[Row],
     *,
+    clock: Clock,
     weights: tuple[Path, str],
     source: tuple[Path, str],
     size: tuple[int, int],
@@ -217,12 +258,14 @@ def document(
         "height": size[1],
         "rate": rate,
         "step": step,
+        "timeBase": str(clock.time_base),
         "faceRule": FACE_RULE,
         "confidenceFloor": CONFIDENCE_FLOOR,
         "timing": timing,
         "frames": [
             {
                 "frame": row.frame,
+                "pts": clock.pts[row.frame],
                 "face": list(row.face) if row.face is not None else None,
                 "faceCount": row.face_count,
                 "captions": row.captions,
@@ -267,6 +310,7 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
 
 def run(args: argparse.Namespace, model: ModelLike) -> dict[str, object]:
     width, height, rate = probe_video(args.source, args.ffprobe)
+    clock = presentation_clock(args.source, args.ffprobe)
     started = time.monotonic()
     rows, inference = track(
         video_frames(
@@ -283,7 +327,8 @@ def run(args: argparse.Namespace, model: ModelLike) -> dict[str, object]:
         "framesPerSecond": len(rows) / wall if wall > 0 else 0.0,
     }
     return document(
-        rows,
+        timed_rows(rows, clock, start=Fraction(args.start, rate), step=args.step),
+        clock=clock,
         weights=(args.weights, args.weights_sha256),
         source=(args.source, sha256(args.source)),
         size=(width, height),
@@ -304,7 +349,8 @@ def main(argv: list[str] | None = None) -> int:
     from ultralytics.engine.results import Results
     from ultralytics.models.yolo.model import YOLO
 
-    result = run(args, Adapter(YOLO(str(args.weights)), Results))
+    with released_mps_graphs():
+        result = run(args, Adapter(YOLO(str(args.weights)), Results))
     args.output.write_text(json.dumps(result, indent=1), encoding="utf-8")
     print(json.dumps(result["timing"]))
     return 0

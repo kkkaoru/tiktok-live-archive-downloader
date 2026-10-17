@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -136,6 +137,7 @@ def test_the_default_training_arguments_are_deterministic_uncached_and_validated
     assert options["deterministic"] is True and options["cache"] is False
     assert options["fraction"] == 1.0 and options["val"] is True and options["patience"] == 100
     assert options["device"] == "mps" and options["amp"] is False and options["exist_ok"] is False
+    assert options["project"] == str(Path("runs").resolve())
 
 
 def test_speed_options_change_only_what_they_name() -> None:
@@ -170,3 +172,85 @@ def test_main_refuses_unsafe_epochs_after_the_other_checks(tmp_path: Path) -> No
              "--config-directory", str(config), "--work", str(work), "--name", "x",
              "--epochs", "0"]
         )  # fmt: skip
+
+
+def test_a_resumed_run_needs_the_interrupted_run_directory(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    data = work / "data.yaml"
+    data.write_text("names: {}\n", encoding="utf-8")
+    with pytest.raises(ReplayError, match="no interrupted run to resume"):
+        train.check_paths(data, work / "runs", work, resume=True)
+    (work / "runs").mkdir()
+    train.check_paths(data, work / "runs", work, resume=True)
+
+
+def test_the_resume_checkpoint_is_the_runs_last_weights(tmp_path: Path) -> None:
+    weights = tmp_path / "runs" / "train" / "weights"
+    weights.mkdir(parents=True)
+    with pytest.raises(ReplayError, match="no last checkpoint"):
+        train.resume_checkpoint(tmp_path / "runs", "train")
+    (weights / "last.pt").write_bytes(b"last")
+    assert train.resume_checkpoint(tmp_path / "runs", "train") == weights / "last.pt"
+
+
+def test_a_linked_resume_checkpoint_is_refused(tmp_path: Path) -> None:
+    weights = tmp_path / "runs" / "train" / "weights"
+    weights.mkdir(parents=True)
+    (tmp_path / "elsewhere.pt").write_bytes(b"last")
+    (weights / "last.pt").symlink_to(tmp_path / "elsewhere.pt")
+    with pytest.raises(ReplayError, match="no last checkpoint"):
+        train.resume_checkpoint(tmp_path / "runs", "train")
+
+
+class FakeYolo:
+    calls: ClassVar[list[tuple[str, dict[str, object]]]] = []
+
+    def __init__(self, weights: str) -> None:
+        self.weights = weights
+
+    def train(self, **options: object) -> None:
+        FakeYolo.calls.append((Path(self.weights).name, options))
+
+
+def test_main_resumes_from_the_last_checkpoint_with_only_the_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights = tmp_path / "w.pt"
+    weights.write_bytes(b"weights")
+    work = tmp_path / "work"
+    (work / "runs" / "x" / "weights").mkdir(parents=True)
+    (work / "runs" / "x" / "weights" / "last.pt").write_bytes(b"last")
+    (work / "data.yaml").write_text("names: {}\n", encoding="utf-8")
+    config = settings(tmp_path, datasets_dir=str(work / "d"), runs_dir=str(work / "r"))
+    monkeypatch.setattr("ultralytics.models.yolo.model.YOLO", FakeYolo)
+    FakeYolo.calls = []
+    code = train.main(
+        [str(work / "data.yaml"), str(work / "runs"), "--weights", str(weights),
+         "--weights-sha256", hashlib.sha256(b"weights").hexdigest(),
+         "--config-directory", str(config), "--work", str(work), "--name", "x",
+         "--epochs", "3", "--resume"]
+    )  # fmt: skip
+    assert code == 0
+    assert FakeYolo.calls == [("last.pt", {"resume": True, "device": "mps"})]
+
+
+def test_main_starts_a_new_run_from_the_pinned_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights = tmp_path / "w.pt"
+    weights.write_bytes(b"weights")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "data.yaml").write_text("names: {}\n", encoding="utf-8")
+    config = settings(tmp_path, datasets_dir=str(work / "d"), runs_dir=str(work / "r"))
+    monkeypatch.setattr("ultralytics.models.yolo.model.YOLO", FakeYolo)
+    FakeYolo.calls = []
+    train.main(
+        [str(work / "data.yaml"), str(work / "runs"), "--weights", str(weights),
+         "--weights-sha256", hashlib.sha256(b"weights").hexdigest(),
+         "--config-directory", str(config), "--work", str(work), "--name", "x",
+         "--epochs", "3"]
+    )  # fmt: skip
+    assert FakeYolo.calls[0][0] == "w.pt"
+    assert FakeYolo.calls[0][1]["epochs"] == 3

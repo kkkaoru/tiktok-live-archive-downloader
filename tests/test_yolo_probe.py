@@ -1,7 +1,10 @@
 """The probe summarizes detections honestly and refuses unsafe paths before loading a model."""
 
 import json
+import os
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -201,3 +204,26 @@ def test_the_adapter_refuses_an_empty_or_foreign_prediction() -> None:
         adapter = probe.Adapter(Predictor(found), Expected)
         with pytest.raises(ReplayError, match="Unexpected prediction type"):
             adapter.predict("x.jpg", imgsz=640, device="mps", conf=0.25, verbose=False)
+
+
+def test_main_runs_the_report_through_the_loaded_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    record = [{"frame": 0, "split": "val", "captions": 1, "face": True}]
+    (work / "frames.json").write_text(json.dumps(record), encoding="utf-8")
+    loaded: list[str] = []
+
+    def yolo(weights: str) -> Predictor:
+        loaded.append(weights)
+        return Predictor([Result(Boxes([0], [0.8]))])
+
+    monkeypatch.setitem(sys.modules, "ultralytics.engine.results", SimpleNamespace(Results=Result))
+    monkeypatch.setitem(sys.modules, "ultralytics.models.yolo.model", SimpleNamespace(YOLO=yolo))
+    monkeypatch.setenv("YOLO_CONFIG_DIR", "unset")
+    monkeypatch.setenv("ULTRALYTICS_OFFLINE", "unset")
+    assert probe.main(arguments(work)) == 0
+    assert len(loaded) == 1
+    assert json.loads(capsys.readouterr().out)["framesWithFace"] == 1
+    assert os.environ["ULTRALYTICS_OFFLINE"] == "1"

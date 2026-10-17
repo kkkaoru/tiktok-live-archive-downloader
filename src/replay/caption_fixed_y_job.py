@@ -192,21 +192,22 @@ def load_yolo(track: Path, *, rate: int, minimum_confidence: float) -> list[Trac
     """Face-top samples from a `yolo_track` evidence file; frames with 0 or 2+ faces are skipped.
 
     A frame with several faces is ambiguous, exactly as Vision's ambiguous frames are, and is not
-    guessed. The sample position is the face box's horizontal centre and its top edge.
+    guessed. The sample time is the frame's presentation timestamp (v2 tracks); v1 tracks derived
+    time from the frame index and drift on variable-frame-rate sources, so they are refused. The
+    sample position is the face box's horizontal centre and its top edge.
     """
     data = json.loads(track.read_text(encoding="utf-8"))
-    if data.get("protocol") != "yolo-face-caption-track-v1" or data.get("provenance") != "yolo":
-        raise ReplayError("Not a YOLO face track")
+    if data.get("protocol") != "yolo-face-caption-track-v2" or data.get("provenance") != "yolo":
+        raise ReplayError("Not a timestamped (v2) YOLO face track")
     if data.get("rate") != rate:
         raise ReplayError("The YOLO track was made at a different frame rate")
+    base = Fraction(str(data["timeBase"]))
     samples: list[TrackingPosition] = []
     for row in data["frames"]:
         box = row["face"]
         if box is None or row["faceCount"] != 1 or box[4] < minimum_confidence:
             continue
-        samples.append(
-            TrackingPosition(Fraction(int(row["frame"]), rate), (box[0] + box[2]) / 2, box[1])
-        )
+        samples.append(TrackingPosition(int(row["pts"]) * base, (box[0] + box[2]) / 2, box[1]))
     return sorted(samples, key=lambda sample: sample.time)
 
 

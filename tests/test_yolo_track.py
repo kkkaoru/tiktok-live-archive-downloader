@@ -7,6 +7,7 @@ import subprocess
 import sys
 import types
 from collections.abc import Iterator, Sequence
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -162,8 +163,10 @@ def test_the_scaled_height_matches_the_training_images() -> None:
 
 def test_the_document_names_weights_video_rule_and_timing() -> None:
     rows = [Row(0, (1.0, 2.0, 3.0, 4.0, 0.5), 1, 2), Row(30, None, 0, 0)]
+    clock = tracking.Clock(tuple(range(0, 3000 * 40, 3000)), Fraction(1, 90000))
     result = tracking.document(
         rows,
+        clock=clock,
         weights=(Path("w.pt"), "aa"),
         source=(Path("v.mp4"), "bb"),
         size=(1080, 1920),
@@ -171,14 +174,43 @@ def test_the_document_names_weights_video_rule_and_timing() -> None:
         step=30,
         timing={"wallSeconds": 2.0},
     )
-    assert result["protocol"] == "yolo-face-caption-track-v1"
+    assert result["protocol"] == "yolo-face-caption-track-v2"
+    assert result["timeBase"] == "1/90000"
     assert result["provenance"] == "yolo"
     assert result["weights"] == {"path": "w.pt", "sha256": "aa"}
     assert result["source"] == {"path": "v.mp4", "sha256": "bb"}
     assert result["frames"] == [
-        {"frame": 0, "face": [1.0, 2.0, 3.0, 4.0, 0.5], "faceCount": 1, "captions": 2},
-        {"frame": 30, "face": None, "faceCount": 0, "captions": 0},
+        {"frame": 0, "pts": 0, "face": [1.0, 2.0, 3.0, 4.0, 0.5], "faceCount": 1, "captions": 2},
+        {"frame": 30, "pts": 90000, "face": None, "faceCount": 0, "captions": 0},
     ]
+
+
+def test_rows_are_renumbered_from_the_frame_the_seek_lands_on() -> None:
+    # A variable-rate stream: frame 2 is shown late, so a seek to 0.1 s lands on frame 2.
+    clock = tracking.Clock((0, 3000, 30000, 33000, 36000), Fraction(1, 90000))
+    rows = [Row(3, None, 0, 0), Row(5, None, 0, 0)]
+    assert [
+        row.frame for row in tracking.timed_rows(rows, clock, start=Fraction(1, 10), step=2)
+    ] == [
+        2,
+        4,
+    ]
+    with pytest.raises(ReplayError, match="More decoded frames"):
+        tracking.timed_rows(rows, clock, start=Fraction(1, 10), step=3)
+
+
+@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="ffprobe is required")
+def test_the_presentation_clock_reads_sorted_packet_timestamps(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=1",
+         "-pix_fmt", "yuv420p", "-video_track_timescale", "90000", str(video)],
+        check=True,
+    )  # fmt: skip
+    clock = tracking.presentation_clock(video, "ffprobe")
+    assert clock.time_base == Fraction(1, 90000)
+    assert clock.pts == tuple(range(0, 90000, 9000))
+    assert clock.first_index(Fraction(1, 2)) == 5
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required for the stream test")

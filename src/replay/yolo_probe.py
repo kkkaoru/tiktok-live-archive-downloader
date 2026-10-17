@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from replay.core import ReplayError
+from replay.mps_graph_cache import released_mps_graphs
 from replay.yolo_labels import CAPTION, FACE
 
 CONFIDENCE_FLOOR = 0.25
@@ -199,8 +200,9 @@ def main(argv: list[str] | None = None) -> int:
     from ultralytics.engine.results import Results
     from ultralytics.models.yolo.model import YOLO
 
-    model = Adapter(YOLO(str(args.weights)), Results)
-    print(json.dumps(report(model, args, chosen)))
+    with released_mps_graphs():
+        model = Adapter(YOLO(str(args.weights)), Results)
+        print(json.dumps(report(model, args, chosen)))
     return 0
 
 
