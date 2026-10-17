@@ -56,7 +56,7 @@ def test_native_runner_uses_shared_source_and_local_working_storage(
         "--scratch-path",
         str(work / "build"),
         "--cache-path",
-        str(work / "cache"),
+        str(root / "edits/work/swiftpm-shared/cache"),
         "--config-path",
         str(work / "config"),
         "--security-path",
@@ -71,9 +71,9 @@ def test_native_runner_uses_shared_source_and_local_working_storage(
         str(work / "tmp"),
         str(work / "tmp"),
         str(work / "tmp"),
-        str(work / "cache"),
-        str(work / "module-cache"),
-        str(work / "module-cache"),
+        str(root / "edits/work/swiftpm-shared/cache"),
+        str(root / "edits/work/swiftpm-shared/module-cache"),
+        str(root / "edits/work/swiftpm-shared/module-cache"),
         str(work / "profiles/%p-%m.profraw"),
     ]
 
