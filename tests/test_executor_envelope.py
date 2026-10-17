@@ -58,3 +58,18 @@ def test_rejects_failed_and_malformed_envelopes() -> None:
             {"ok": True, "data": {"content": [{"type": "text", "text": json.dumps(changed)}]}}
         )
         executor_measurement(tampered)
+
+
+def test_rejects_a_native_error_flag() -> None:
+    with pytest.raises(ValueError, match="returned an error"):
+        normalize_envelope({"ok": True, "data": {"isError": True, "content": []}})
+
+
+def test_rejects_content_that_is_not_text() -> None:
+    with pytest.raises(ValueError, match="not text"):
+        normalize_envelope({"ok": True, "data": {"content": [{"type": "image", "text": "{}"}]}})
+
+
+def test_rejects_text_that_is_not_a_string() -> None:
+    with pytest.raises(ValueError, match="exceeds its budget"):
+        normalize_envelope({"ok": True, "data": {"content": [{"type": "text", "text": 5}]}})
