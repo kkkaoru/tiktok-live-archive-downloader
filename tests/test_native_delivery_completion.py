@@ -283,6 +283,21 @@ def test_duplicate_identity_and_link_rejected(case: Case) -> None:
         c.assess(case.bind(), root=case.root, delivery=case.delivery)
 
 
+def test_identity_survives_a_renumbered_device(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.write_bytes(b"real")
+    renumbered = row(target) | {"device": 1}
+    c.observe_identity(renumbered)
+
+
+def test_identity_still_rejects_a_changed_inode(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.write_bytes(b"real")
+    changed = row(target) | {"inode": 1}
+    with pytest.raises(ValueError, match="differs"):
+        c.observe_identity(changed)
+
+
 def test_identity_link_cannot_replace_retained_file(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.write_bytes(b"real")

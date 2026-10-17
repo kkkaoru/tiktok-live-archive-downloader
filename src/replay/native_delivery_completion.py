@@ -82,10 +82,10 @@ def observe_identity(row: dict[str, object]) -> None:
     require(path.resolve(strict=True) == path, "Current identity path is linked")
     info = path.stat()
     require(stat.S_ISREG(info.st_mode), "Current identity is not a regular file")
-    actual = (info.st_size, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
-    expected = tuple(
-        evidence.integer(row[key]) for key in ("bytes", "device", "inode", "mtimeNs", "ctimeNs")
-    )
+    # The device number is renumbered by remounts and differs on another volume, so it is
+    # recorded as evidence but not compared; size, inode and both times still bind the file.
+    actual = (info.st_size, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+    expected = tuple(evidence.integer(row[key]) for key in ("bytes", "inode", "mtimeNs", "ctimeNs"))
     require(actual == expected, "Current file identity differs from retained evidence")
 
 
