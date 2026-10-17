@@ -41,8 +41,9 @@ def identity(path: Path) -> dict[str, int]:
     canonical(str(path))
     info = path.lstat()
     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "Expected regular singlelink file")
+    # The device number is renumbered by remounts and differs on another volume, so it is not
+    # recorded; size, inode and both times still bind the file.
     return {
-        "device": info.st_dev,
         "inode": info.st_ino,
         "bytes": info.st_size,
         "mtime_ns": info.st_mtime_ns,
@@ -56,7 +57,7 @@ def pin(path: Path) -> dict[str, object]:
     with path.open("rb") as stream:
         opened = os.fstat(stream.fileno())
         require(
-            (opened.st_dev, opened.st_ino) == (before["device"], before["inode"]),
+            (opened.st_dev, opened.st_ino) == (path.lstat().st_dev, before["inode"]),
             "File replaced before hashing",
         )
         sha = hashlib.file_digest(stream, "sha256").hexdigest()

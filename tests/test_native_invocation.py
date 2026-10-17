@@ -369,3 +369,25 @@ def test_cli_error_retains_outcome(native_request: Path) -> None:
         )
         == 1
     )
+
+
+def test_identity_ignores_the_device_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "file.bin"
+    target.write_bytes(b"synthetic bytes")
+    first = invocation.identity(target)
+    real = Path.lstat
+
+    def renumbered(self: Path) -> object:
+        info = real(self)
+        return type(
+            "Info",
+            (),
+            {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+            | {"st_dev": info.st_dev + 7},
+        )()
+
+    monkeypatch.setattr(Path, "lstat", renumbered)
+    assert "device" not in first
+    assert invocation.identity(target) == first
