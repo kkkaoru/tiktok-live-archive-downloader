@@ -146,6 +146,7 @@ def recording(root: Path) -> tuple[Path, Path, Path, Path]:
             "audioClock": {"path": "old", "sha256": "old"},
             "audioClockProducer": {"path": "old", "sha256": "old"},
             "completedExtraction": {"x": 1},
+            "mediaRoot": str(root),
         }
     )
     config.write_text(json.dumps(base))
@@ -194,8 +195,28 @@ def test_a_new_recording_namespace_takes_its_source_clocks_and_sample_budget(
     assert written["audioClockProducer"]["sha256"] == digest(b"producer")
     assert written["completedExtraction"] is None
     assert written["directory"] == str(new)
+    assert written["mediaRoot"] == str(root)
     assert shaped["budget"]["max_samples"] == 26460000
     assert shaped["budget"]["max_saved_bytes"] == 52920000
+
+
+def test_a_derived_source_outside_the_originals_takes_its_own_media_root(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, template, work, _ = recording(root)
+    base = json.loads(config.read_text())
+    base["mediaRoot"] = str(root / "edits")
+    config.write_text(json.dumps(base))
+    source = root / "media.mp4"
+
+    def fake_produce(directory: Path, *arguments: str) -> None:
+        (directory / "pcm-preparation.json").write_text(json.dumps({"outputSampleCount": 1}))
+
+    monkeypatch.setattr(refresh, "produce", fake_produce)
+    new = root / "edits" / "work" / "derived"
+    refresh.for_recording(config, template, work, source, new)
+    written = json.loads((new / "PCM-PREPARATION-CONFIG-v1.json").read_text())
+    assert written["mediaRoot"] == str(root.resolve())
 
 
 def test_a_source_the_preparation_does_not_pin_is_refused(root: Path) -> None:

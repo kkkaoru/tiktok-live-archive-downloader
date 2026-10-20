@@ -161,6 +161,9 @@ def for_recording(
     template = json.loads(reference_template.read_text(encoding="utf-8"))
     preparation = work / "preparation.json"
     config["source"] = {"path": str(source), "sha256": source_digest(preparation, source)}
+    if not source.resolve().is_relative_to(Path(config["mediaRoot"]).resolve()):
+        # A derived source (a lead-in copy) lives beside its deliveries, not among the originals.
+        config["mediaRoot"] = str(source.resolve().parent)
     config["preparation"] = pin(preparation)
     config["audioClock"] = pin(work / "audio-clock.json")
     config["audioClockProducer"] = pin(work / "audio-clock.producer.json")
