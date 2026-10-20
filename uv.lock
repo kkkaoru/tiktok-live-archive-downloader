@@ -5522,6 +5522,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "regex" },
+    { name = "zstandard" },
 ]
 
 [package.optional-dependencies]
@@ -5650,6 +5651,7 @@ requires-dist = [
     { name = "ultralytics", marker = "extra == 'yolo'", specifier = "==8.4.177" },
     { name = "vibrato", marker = "extra == 'editing'", specifier = "==0.2.3" },
     { name = "yt-dlp", extras = ["default"], marker = "extra == 'youtube'", specifier = ">=2026.8.19" },
+    { name = "zstandard", specifier = ">=0.25,<0.26" },
 ]
 provides-extras = ["editing", "separation", "roformer", "dialogue-separation", "ja-alignment", "ctc-alignment", "coreml-extraction", "yolo", "usef-extraction", "speaker-extraction", "capture", "device", "web", "youtube"]
 

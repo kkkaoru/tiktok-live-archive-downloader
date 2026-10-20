@@ -3,7 +3,11 @@ name = "tiktok-live-archive-downloader"
 version = "0.1.0"
 description = "Local downloader for authorized, observed replay media"
 requires-python = ">=3.12"
-dependencies = ["httpx>=0.28,<0.29", "regex>=2024.11.6"]
+dependencies = [
+    "httpx>=0.28,<0.29",
+    "regex>=2024.11.6",
+    "zstandard>=0.25,<0.26",
+]
 
 [project.optional-dependencies]
 editing = [
