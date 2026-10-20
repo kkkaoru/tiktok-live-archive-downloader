@@ -46,6 +46,44 @@ def _scalar(node: ET.Element, path: str) -> float:
     return value
 
 
+def _path(channel: str) -> str:
+    return "/".join(f"parameter[@id='{part}']" for part in channel.split("/"))
+
+
+def expected_geometry(name: str, stroke: float, size: float) -> list[tuple[str, str, float]]:
+    """A style20 layer's scalar controls at ``size`` from the shared caption defaults."""
+    scale = size / defaults.REFERENCE_FONT_SIZE
+    geometry = [("Font Size", "3", size), ("Outline Width", "30/36", stroke * scale / 2)]
+    if name == "Caption Outer Rim":
+        blur = defaults.SHADOW_BLUR_STD_DEVIATION * scale
+        geometry += [
+            ("Shadow Distance", "21/27", defaults.SHADOW_OFFSET_Y * scale),
+            ("Shadow Blur X", "21/75/1", blur),
+            ("Shadow Blur Y", "21/75/2", blur),
+        ]
+    return geometry
+
+
+def restyle_geometry(document: str) -> str:
+    """The template with its outline and shadow scalars set to the current caption defaults.
+
+    A style change (stroke widths, shadow) is applied to templates here instead of by hand; text,
+    font size, layout and published controls are unchanged and re-validated.
+    """
+    root = _parse(document)
+    layer = _one(root, "scene/layer")
+    for name, stroke in LAYERS:
+        style = _one(_one(layer, f"scenenode[@name='{name}']"), "style")
+        size = _scalar(style, "parameter[@id='3']")
+        for _label, channel, expected in expected_geometry(name, stroke, size):
+            _scalar(style, _path(channel))  # the control must already be a static scalar
+            _one(style, _path(channel)).set("value", repr(expected))
+    header, _, _ = document.partition("<ozml")
+    result = header + ET.tostring(root, encoding="unicode") + "\n"
+    geometry_controls(result)
+    return result
+
+
 def geometry_controls(document: str) -> tuple[GeometryControl, ...]:
     """Read observed style20 scalar controls without changing text or layout."""
     root = _parse(document)
@@ -74,33 +112,8 @@ def geometry_controls(document: str) -> tuple[GeometryControl, ...]:
         if font_size is not None and size != font_size:
             raise ReplayError("Text layers use different font sizes")
         font_size = size
-        geometry = [
-            ("Font Size", "3", size),
-            ("Outline Width", "30/36", stroke * size / defaults.REFERENCE_FONT_SIZE / 2),
-        ]
-        if name == "Caption Outer Rim":
-            geometry.extend(
-                [
-                    (
-                        "Shadow Distance",
-                        "21/27",
-                        defaults.SHADOW_OFFSET_Y * size / defaults.REFERENCE_FONT_SIZE,
-                    ),
-                    (
-                        "Shadow Blur X",
-                        "21/75/1",
-                        defaults.SHADOW_BLUR_STD_DEVIATION * size / defaults.REFERENCE_FONT_SIZE,
-                    ),
-                    (
-                        "Shadow Blur Y",
-                        "21/75/2",
-                        defaults.SHADOW_BLUR_STD_DEVIATION * size / defaults.REFERENCE_FONT_SIZE,
-                    ),
-                ]
-            )
-        for label, channel, expected in geometry:
-            path = "/".join(f"parameter[@id='{part}']" for part in channel.split("/"))
-            base = _scalar(style, path)
+        for label, channel, expected in expected_geometry(name, stroke, size):
+            base = _scalar(style, _path(channel))
             if not math.isclose(base, expected, rel_tol=1e-9, abs_tol=1e-9):
                 raise ReplayError("Motion style geometry differs from caption defaults")
             style_channel = f"5/{_attribute(style, 'id')}/{channel}"
@@ -251,7 +264,13 @@ def main() -> None:
     parser.add_argument("receipt", type=Path, nargs="?")
     parser.add_argument("--inspect", action="store_true")
     parser.add_argument("--group-scale", action="store_true")
+    parser.add_argument("--restyle", action="store_true", help="apply the current style geometry")
     args = parser.parse_args()
+    if args.restyle:
+        if args.output.exists():
+            raise ReplayError("Refusing to overwrite the Motion template")
+        args.output.write_text(restyle_geometry(args.source.read_text(encoding="utf-8")), "utf-8")
+        return
     if args.inspect:
         if args.receipt is not None:
             raise ReplayError("Inspection takes only source and output receipt")

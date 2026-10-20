@@ -237,3 +237,37 @@ def test_inspect_saved_contract(
     else:
         with pytest.raises(ReplayError):
             layout.main()
+
+
+def test_restyle_sets_outline_and_shadow_scalars_to_the_style_defaults(source: str) -> None:
+    old = (
+        source.replace('value="10.08"', 'value="14.4"')
+        .replace('value="13.08"', 'value="17.4"')
+        .replace('<parameter id="27" value="16"/>', '<parameter id="27" value="7"/>')
+    )
+    with pytest.raises(ReplayError, match="geometry differs"):
+        layout.geometry_controls(old)
+    result = layout.restyle_geometry(old)
+    assert [(item.name, item.base) for item in layout.geometry_controls(result)] == [
+        ("Caption Keyline Face Font Size", 88.0),
+        ("Caption Keyline Face Outline Width", 2.0),
+        ("Caption Face Font Size", 88.0),
+        ("Caption Face Outline Width", 10.08),
+        ("Caption Outer Rim Font Size", 88.0),
+        ("Caption Outer Rim Outline Width", 13.08),
+        ("Caption Outer Rim Shadow Distance", 16.0),
+        ("Caption Outer Rim Shadow Blur X", 8.0),
+        ("Caption Outer Rim Shadow Blur Y", 8.0),
+    ]
+
+
+def test_restyle_cli_writes_a_new_template_only(
+    source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original, output = tmp_path / "old.moti", tmp_path / "new.moti"
+    original.write_text(source.replace('value="10.08"', 'value="14.4"'), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["pre-layout", str(original), str(output), "--restyle"])
+    layout.main()
+    assert len(layout.geometry_controls(output.read_text(encoding="utf-8"))) == 9
+    with pytest.raises(ReplayError, match="overwrite"):
+        layout.main()
