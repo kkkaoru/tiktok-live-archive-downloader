@@ -11,7 +11,13 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@100..900&display=swap">
 <script>try { const t = localStorage.getItem("theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
-<script>window.__catalog = fetch("/api/catalog").then(r => r.json());</script>
+<script>
+// A share link (/s/<token>) shows one video without login; every API path gets its prefix.
+window.__api = (location.pathname.match(/^\/s\/[A-Za-z0-9_-]+/) || [""])[0];
+// Set before first paint so list-page text never flashes on a share link.
+if (window.__api) document.documentElement.dataset.share = "";
+window.__catalog = fetch(window.__api + "/api/catalog", { cache: "no-cache" }).then(r => r.json());  // always revalidate: syncs replace it
+</script>
 <style>
   :root { color-scheme: dark; --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --line:#2a2f3a; --text:#e8eaed; --muted:#9aa3b2; --accent:#6ea8ff; --accent-bg:#1f3a63; --on-accent:#fff; --bar:#4a5468; --playhead:#fff; --radius:10px;
     --tk:#ff7aa8; --tk-line:#6b2a44; --tk-bg:#2a141d; --yt:#ff8a80; --yt-line:#6b2a2a; --yt-bg:#2a1515; --sm:#8ee6a8; --sm-line:#27573a; --sm-bg:#13251a; --err:#ff8a8a; }
@@ -93,10 +99,14 @@
   #nearby { display:flex; gap:8px; overflow-x:auto; padding:6px 0; min-height:96px; }
   .near { min-width:280px; max-width:360px; text-align:left; white-space:normal; flex:none; }
   .near.sel { border-color:var(--accent); background:var(--accent-bg); }
-  #utts { border:1px solid var(--line); border-radius:var(--radius); overflow:hidden; }
+  /* Each list scrolls inside its own box, sized to the visible pane minus the header and tab row. */
+  #utts, #sumBody { max-height:calc(100dvh - 56px - 96px); overflow-y:auto; }
+  #utts { border:1px solid var(--line); border-radius:var(--radius); }
+  #videoSlot.floating video { position:fixed; right:16px; top:72px; width:min(360px,calc(100vw - 32px)); height:auto; max-height:none; z-index:10; box-shadow:0 8px 24px rgba(0,0,0,.5); }
   .utt { display:flex; gap:14px; padding:9px 12px; cursor:pointer; width:100%; text-align:left; background:none; border:none; border-bottom:1px solid var(--line); border-radius:0; color:var(--text); content-visibility:auto; contain-intrinsic-size:auto 44px; }
   .utt:hover { background:var(--panel2); } .utt.sel { background:var(--accent-bg); }
   .utt .ts { font-variant-numeric:tabular-nums; color:var(--accent); white-space:nowrap; }
+  .spk { display:inline-block; padding:1px 8px; margin-right:6px; border-radius:10px; font-size:.8em; font-weight:700; color:#1d1d1f; white-space:nowrap; vertical-align:middle; }
   .tab { display:none; } .tab.on { display:block; }
   dialog { background:var(--panel); color:var(--text); width:min(760px,92vw); max-height:84dvh; border:1px solid var(--line); border-radius:14px; }
   dialog::backdrop { background:rgba(0,0,0,.6); }
@@ -104,7 +114,15 @@
   .sect { margin:14px 0; padding:12px 14px; border:1px solid var(--line); border-radius:var(--radius); background:var(--panel); }
   .sect p { margin:8px 0 0; } .sect button { font-variant-numeric:tabular-nums; }
   canvas { width:100%; height:28px; display:block; background:var(--panel2); border-radius:6px; cursor:pointer; }
+  #exBar { height:48px; }
+  #exInfo { min-height:24px; font-variant-numeric:tabular-nums; }
   .note { color:var(--muted); font-size:13px; }
+  a.btn { display:inline-block; font-size:14px; padding:7px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel2); color:var(--text); text-decoration:none; }
+  a.btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  input[type=number] { font:inherit; font-size:14px; width:6em; padding:7px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel2); color:var(--text); }
+  #shareList { padding:0; } #shareList li { list-style:none; display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); }
+  #shareList input { flex:1; min-width:12em; }
+  [data-share] #list, [data-share] #backBtn, [data-share] #logoutLink, [data-share] #scopeGroup, [data-share] #empty { display:none !important; }
   @media (max-width: 760px) {
     header { padding:0 12px; gap:8px; } header a { display:none; }
     .mobile-only { display:inline-block; } body[data-view="list"] #backBtn { display:none; }
@@ -126,7 +144,7 @@
   <form id="hsearch" role="search"><input id="q" type="search" placeholder="文字起こし・要約を検索（すべての動画）" autocomplete="off" aria-label="検索"><button>検索</button></form>
   <a id="adminLink" href="/admin" hidden>許可管理</a>
   <button id="settingsBtn" aria-label="設定">設定</button>
-  <a href="/auth/logout">ログアウト</a>
+  <a id="logoutLink" href="/auth/logout">ログアウト</a>
 </header>
 <section id="streamersPage" aria-label="配信者一覧"><h2>配信者</h2><div id="streamerGrid"></div></section>
 <main>
@@ -137,21 +155,38 @@
     <p id="empty">左の一覧から動画を選んでください</p>
     <div id="player" hidden>
       <h2 id="title"></h2><div id="titleTags"></div>
-      <video id="video" controls preload="metadata" playsinline></video>
+      <div id="videoSlot"><video id="video" controls preload="metadata" playsinline></video></div>
       <div class="seg" role="group" aria-label="素材の切り替え">
         素材:
         <button id="srcEdited" class="on">編集済み</button><button id="srcOriginal">元動画</button>
         <span class="note" id="srcNote"></span>
       </div>
+      <div class="seg" role="group" aria-label="ダウンロードと共有">
+        ダウンロード:
+        <a id="dlVideo" class="btn" href="#">動画データ</a><button id="dlText">文字起こし・要約</button>
+        <button id="shareBtn" hidden>共有</button>
+        <span class="note" id="shareNote"></span>
+      </div>
       <h3>タイムライン</h3>
       <div id="cur">発話なし</div><div id="curTime"></div>
       <input id="seek" type="range" min="0" max="0" step="0.1" value="0" aria-label="再生位置">
       <canvas id="bar" width="1200" height="28"></canvas>
+      <div id="excite" hidden>
+        <div class="seg" role="group" aria-label="盛り上がりの表示">
+          盛り上がり（この動画内の相対値）:
+          <span id="exModes"><button id="exCombined">合算</button><button id="exSplit">別々</button></span>
+          <span class="note" id="exNote"></span>
+        </div>
+        <canvas id="exBar" aria-label="盛り上がりのタイムライン。クリックでその位置へ移動"></canvas>
+        <div id="exInfo" class="note"></div>
+        <div class="seg" id="exPeaks" role="group" aria-label="盛り上がり箇所へ移動"></div>
+      </div>
       <div id="nearby" aria-label="付近の発話"></div>
       <div class="seg" role="group" aria-label="表示内容">
         <button id="tabSumBtn">要約</button><button id="tabUttBtn" class="on">認識結果</button>
+        <button id="popSum">要約を別ウィンドウで開く</button><button id="popUtt">認識結果を別ウィンドウで開く</button>
       </div>
-      <div id="tabSummary" class="tab"></div>
+      <div id="tabSummary" class="tab"><div id="sumBody"></div></div>
       <div id="tabUtter" class="tab on"><div id="utts"></div></div>
     </div>
   </section>
@@ -165,13 +200,28 @@
     <label><input type="radio" name="mode" value="summary"> 要約</label>
     <label><input type="radio" name="mode" value="both"> 文字起こしと要約</label>
   </div>
-  <div class="seg" role="group" aria-label="検索範囲">
+  <div class="seg" id="scopeGroup" role="group" aria-label="検索範囲">
     範囲:
     <label><input type="radio" name="scope" value="current"> この動画</label>
     <label><input type="radio" name="scope" value="all" checked> すべての動画</label>
   </div>
   <p id="searchStatus" class="note"></p>
   <div id="hits"></div>
+</dialog>
+<dialog id="shareDlg">
+  <form method="dialog"><button style="float:right">閉じる</button></form>
+  <h3>共有リンク</h3>
+  <p class="note">リンクを知っている人は、ログインなしでこの動画だけを表示・ダウンロードできます。</p>
+  <form id="shareForm">
+    <div class="seg" role="group" aria-label="共有する動画">
+      共有する動画:
+      <label><input type="checkbox" id="shEdited"> 編集済み</label>
+      <label><input type="checkbox" id="shOriginal"> 元動画</label>
+    </div>
+    <div class="seg"><label>表示期間 <input type="number" id="shDays" min="1" max="365" value="7" required> 日</label><button>リンクを発行</button></div>
+  </form>
+  <p id="shareMsg" class="note" role="status"></p>
+  <ul id="shareList"></ul>
 </dialog>
 <dialog id="settingsDlg">
   <form method="dialog"><button style="float:right">閉じる</button></form>
@@ -185,6 +235,10 @@
 </dialog>
 <script>
 const $ = s => document.querySelector(s);
+const API = window.__api, SHARE = Boolean(API);
+// Kept as element references: a pop-out window adopts these nodes, so $() would miss them.
+const UTTS = $("#utts"), SUMMARY = $("#sumBody");
+const mediaSrc = (v, kind) => kind === "original" ? `${API}/media-original/${v.original.movie}` : `${API}/media/${v.movie}`;
 const state = { date: "", month: null, navs: 0, streamer: "", filter: "all", videos: [], current: null, data: new Map(), utterances: [], curIdx: -2, source: "edited" };
 const fmt = s => { s = Math.max(0, Math.floor(s)); const h = s/3600|0, m = s%3600/60|0, r = s%60;
   return `${h}時間${m}分${r}秒`; };
@@ -194,11 +248,19 @@ function utterancesFrom(cues) {
   const out = [];
   for (const cue of cues) {
     const last = out[out.length - 1];
-    if (last && cue.start <= last.end + 1.5 && last.text && cue.text.startsWith(last.text)) {
+    if (last && cue.start <= last.end + 1.5 && last.text && cue.text.startsWith(last.text) && cue.speaker === last.speaker) {
       out[out.length - 1] = { ...last, end: Math.max(last.end, cue.end), endLabel: cue.endLabel, text: cue.text };
     } else out.push({ ...cue });
   }
   return out;
+}
+// A multi-speaker transcript names each cue's speaker; shown as a chip in that speaker's colour.
+function speakerChip(u) {
+  if (!u.speaker) return [];
+  const info = state.speakers?.[u.speaker], chip = document.createElement("span");
+  chip.className = "spk"; chip.textContent = info?.label ?? u.speaker;
+  chip.style.background = info?.color ?? "var(--panel2)";
+  return [chip];
 }
 // Same lookup as CueTimeline.index.
 function indexAt(sec, cues) {
@@ -209,7 +271,7 @@ function indexAt(sec, cues) {
   return (sec < cue.end || (i === cues.length - 1 && sec === cue.end)) ? i : -1;
 }
 async function getData(id) {
-  if (!state.data.has(id)) state.data.set(id, fetch(`/api/videos/${id}.json`).then(r => r.json()));
+  if (!state.data.has(id)) state.data.set(id, fetch(`${API}/api/videos/${id}.json`, { cache: "no-cache" }).then(r => r.json()));
   return state.data.get(id);
 }
 const streamerOf = v => v.streamer;
@@ -262,34 +324,37 @@ function loadList() {
   nav.replaceChildren(frag);
 }
 async function select(v, seekTo = 0) {
-  state.current = v; state.source = "edited"; syncSourceButtons(); loadList();
+  // A recording not edited yet has only its original movie.
+  state.current = v; state.source = v.movie ? "edited" : "original"; syncSourceButtons(); loadList();
   const data = await getData(v.id);
   if (state.current !== v) return;
-  state.utterances = utterancesFrom(data.cues);
+  state.utterances = utterancesFrom(data.cues); state.speakers = data.speakers || {};
   $("#empty").hidden = true; $("#player").hidden = false;
   $("#title").textContent = `${v.broadcastStartJST ?? ""} ${v.title}`;
   $("#titleTags").replaceChildren(...tagsFor(v));
   const video = $("#video");
-  video.src = `/media/${v.movie}`;
+  video.src = mediaSrc(v, state.source);
   $("#srcOriginal").disabled = !v.original;
+  $("#srcEdited").disabled = !v.movie;
   video.onloadedmetadata = () => { $("#seek").max = video.duration || v.duration || 0; drawBar(); if (seekTo) video.currentTime = seekTo; };
-  renderUtterances(); renderSummary(data.summary); state.curIdx = -2; updateCurrent();
+  state.excite = data.excitement || null; renderExcite();
+  renderUtterances(); renderSummary(data.summary); state.curIdx = -2; updateCurrent(); syncDownload();
 }
 function seek(sec) { const v = $("#video"); v.currentTime = sec; v.play().catch(() => {}); }
 function renderUtterances() {
-  const box = $("#utts"), frag = document.createDocumentFragment();
+  const box = UTTS, frag = document.createDocumentFragment();
   for (const u of state.utterances) {
     const b = document.createElement("button");
     b.className = "utt"; b.dataset.id = u.id;
     b.innerHTML = `<span class="ts"></span><span></span>`;
-    b.children[0].textContent = u.startLabel; b.children[1].textContent = u.text;
+    b.children[0].textContent = u.startLabel; b.children[1].replaceChildren(...speakerChip(u), u.text);
     b.onclick = () => seek(u.start);
     frag.appendChild(b);
   }
   box.replaceChildren(frag);
 }
 function renderSummary(summary) {
-  const box = $("#tabSummary"); box.textContent = "";
+  const box = SUMMARY; box.textContent = "";
   if (!summary) { box.innerHTML = `<p class="note">保存済み要約がありません。Web版はApple Intelligence要約を新規生成しません。Mac版TranscriptViewerで生成すると表示されます。</p>`; return; }
   const h = document.createElement("h3"); h.textContent = "動画全体の要約"; box.appendChild(h);
   const p = document.createElement("p"); p.textContent = summary.overview; box.appendChild(p);
@@ -306,6 +371,7 @@ function renderSummary(summary) {
 // The utterance track is static per video; paint it once and only redraw the playhead.
 let barLayer = null, barKey = "";
 function drawBar() {
+  drawExcite();
   const c = $("#bar"), ctx = c.getContext("2d"), v = $("#video");
   const dur = v.duration || state.current?.duration || 0; if (!dur) return;
   const key = `${state.current?.id}|${dur}|${state.utterances.length}`;
@@ -325,15 +391,15 @@ function updateCurrent() {
   if (idx === state.curIdx) { drawBar(); return; }
   state.curIdx = idx;
   const u = state.utterances[idx];
-  $("#cur").textContent = u ? u.text : "発話なし";
+  $("#cur").replaceChildren(...(u ? [...speakerChip(u), u.text] : ["発話なし"]));
   $("#curTime").textContent = u ? `${u.startLabel} – ${u.endLabel}` : "";
-  document.querySelectorAll(".utt").forEach(el => el.classList.toggle("sel", u && +el.dataset.id === u.id));
+  UTTS.querySelectorAll(".utt").forEach(el => el.classList.toggle("sel", Boolean(u) && +el.dataset.id === u.id));
   const near = $("#nearby"); near.textContent = "";
   const center = idx >= 0 ? idx : 0;
   for (const n of state.utterances.slice(Math.max(0, center - 8), center + 9)) {
     const b = document.createElement("button");
     b.className = "near" + (u && n.id === u.id ? " sel" : "");
-    b.textContent = `${n.startLabel} ${n.text}`;
+    b.replaceChildren(`${n.startLabel} `, ...speakerChip(n), n.text);
     b.onclick = () => seek(n.start);
     near.appendChild(b);
   }
@@ -357,19 +423,128 @@ function syncSourceButtons() {
     ? "元動画を表示中。字幕・要約の時刻は編集済み基準のため、元動画とはずれる場合があります。元動画はHEVC等のため端末によっては再生できません。" : "";
 }
 function setSource(kind) {
-  const v = state.current; if (!v || (kind === "original" && !v.original)) return;
+  const v = state.current; if (!v || (kind === "original" && !v.original) || (kind === "edited" && !v.movie)) return;
   const video = $("#video"), t = video.currentTime || 0, wasPlaying = !video.paused;
   state.source = kind; syncSourceButtons();
-  video.src = kind === "original" ? `/media-original/${v.original.movie}` : `/media/${v.movie}`;
+  video.src = mediaSrc(v, kind); syncDownload();
   video.onloadedmetadata = () => { video.currentTime = t; if (wasPlaying) video.play().catch(() => {}); };
 }
 $("#srcEdited").onclick = () => setSource("edited");
 $("#srcOriginal").onclick = () => setSource("original");
+// Excitement (盛り上がり): scores are computed by `python -m replay.excitement`, relative to
+// this video (its peak is 1); raw per-bin values are only shown as details on hover.
+function exRows() {
+  const e = state.excite; if (!e) return [];
+  const speech = { label: "発話", color: "--accent", series: e.speech };
+  if (!e.comments) return [speech];
+  const comments = { label: "コメント", color: "--sm", series: e.comments };
+  return state.exMode === "split" ? [speech, comments] : [{ label: "合算", color: "--yt", series: e.combined }];
+}
+function renderExcite() {
+  const e = state.excite; $("#excite").hidden = !e; if (!e) return;
+  try { state.exMode = localStorage.getItem("exciteMode") === "split" ? "split" : "combined"; } catch { state.exMode = "combined"; }
+  $("#exModes").hidden = !e.comments;
+  $("#exNote").textContent = e.comments ? "" : "発話（文字認識量" + (e.speech.loudnessDb ? "・音量" : "") + "）から推定";
+  $("#exCombined").classList.toggle("on", state.exMode !== "split"); $("#exSplit").classList.toggle("on", state.exMode === "split");
+  $("#exBar").style.height = `${48 * exRows().length}px`;
+  $("#exPeaks").replaceChildren("盛り上がり箇所:", ...exRows().flatMap(r => r.series.peaks.map(t => {
+    const b = document.createElement("button"); b.textContent = `${exRows().length > 1 ? r.label + " " : ""}${fmt(t)}`;
+    b.onclick = () => seek(t); return b;
+  })));
+  $("#exInfo").textContent = ""; drawExcite();
+}
+function drawExcite() {
+  const e = state.excite; if (!e || $("#excite").hidden) return;
+  const c = $("#exBar"), ctx = c.getContext("2d"), css = getComputedStyle(document.documentElement), rows = exRows();
+  // Backing store follows the displayed size so bars and labels stay sharp and unstretched.
+  const dpr = devicePixelRatio || 1, cw = Math.round(c.clientWidth * dpr), ch = Math.round(c.clientHeight * dpr);
+  if (cw && (c.width !== cw || c.height !== ch)) { c.width = cw; c.height = ch; }
+  const n = rows[0].series.score.length, w = c.width / n, h = c.height / rows.length;
+  ctx.clearRect(0, 0, c.width, c.height);
+  rows.forEach((r, i) => {
+    ctx.fillStyle = css.getPropertyValue(r.color).trim();
+    r.series.score.forEach((v, k) => { const bh = v * (h - 6); ctx.fillRect(k * w, (i + 1) * h - bh, Math.max(w - 1, 1), bh); });
+    ctx.fillStyle = css.getPropertyValue("--muted").trim(); ctx.font = `${12 * dpr}px sans-serif`; ctx.fillText(r.label, 6 * dpr, i * h + 14 * dpr);
+  });
+  const t = $("#video").currentTime || 0;
+  ctx.fillStyle = css.getPropertyValue("--playhead").trim(); ctx.fillRect(t / e.duration * c.width, 0, 2, c.height);
+}
+function exBinAt(ev) {
+  const e = state.excite, r = ev.target.getBoundingClientRect(), n = e.speech.score.length;
+  return Math.min(n - 1, Math.max(0, Math.floor((ev.clientX - r.left) / r.width * n)));
+}
+// Touch screens have no hover, so a click also shows the details of the bin it jumps to.
+$("#exBar").addEventListener("click", ev => { if (state.excite) { showExInfo(ev); seek(exBinAt(ev) * state.excite.binSeconds); } });
+$("#exBar").addEventListener("mousemove", ev => showExInfo(ev));
+function showExInfo(ev) {
+  const e = state.excite; if (!e) return;
+  const k = exBinAt(ev), pct = v => `${Math.round(v * 100)}%`, sp = e.speech, parts = [`${fmt(k * e.binSeconds)}〜`];
+  if (e.combined) parts.push(`合算 ${pct(e.combined.score[k])}`);
+  parts.push(`発話 ${pct(sp.score[k])}（${Math.round(sp.characters[k])}文字` + (sp.loudnessDb && sp.loudnessDb[k] != null ? `・${sp.loudnessDb[k]}dB` : "") + "）");
+  if (e.comments) parts.push(`コメント ${pct(e.comments.score[k])}（${e.comments.count[k]}件・${e.comments.characters[k]}文字）`);
+  $("#exInfo").textContent = parts.join(" / ");
+}
+const setExMode = mode => { try { localStorage.setItem("exciteMode", mode); } catch {} renderExcite(); };
+$("#exCombined").onclick = () => setExMode("combined");
+$("#exSplit").onclick = () => setExMode("split");
 const showTab = sum => {
   $("#tabSummary").classList.toggle("on", sum); $("#tabUtter").classList.toggle("on", !sum);
   $("#tabSumBtn").classList.toggle("on", sum); $("#tabUttBtn").classList.toggle("on", !sum);
 };
 $("#tabSumBtn").onclick = () => showTab(true);
+// Pop-out: the live list node moves into a same-origin popup, so its click handlers still seek
+// this page's video and re-renders/highlights keep reaching it; closing the popup moves it back.
+const popups = new Set();
+function popOut(el, title) {
+  if (el.ownerDocument !== document) { el.ownerDocument.defaultView.focus(); return; }
+  const w = open("", `tv-${el.id}`, "popup,width=560,height=820"); if (!w) return;
+  const d = w.document, marker = document.createElement("p");
+  d.documentElement.lang = "ja";
+  if (document.documentElement.dataset.theme) d.documentElement.dataset.theme = document.documentElement.dataset.theme;
+  d.head.innerHTML = [...document.querySelectorAll("style, link[rel=stylesheet]")].map(n => n.outerHTML).join("")
+    + "<style>body{padding:12px} #utts,#sumBody{max-height:none}</style>";
+  d.title = title; // after head is replaced, which would drop the <title>
+  marker.className = "note"; marker.textContent = `${title}は別ウィンドウで表示中です。`;
+  el.replaceWith(marker); d.body.replaceChildren(el); popups.add(w);
+  const timer = setInterval(() => { if (w.closed) { clearInterval(timer); popups.delete(w); marker.replaceWith(el); } }, 500);
+}
+// Wheel over the transcript or summary drives one combined scroll: the page goes first until it can go
+// no further, then the list; at the list's top, scrolling up moves the page again. Without
+// this, scroll latching traps a wheel gesture in the list after it reaches an end.
+for (const box of [UTTS, SUMMARY]) box.addEventListener("wheel", e => {
+  if (box.ownerDocument !== document || !e.deltaY || e.ctrlKey) return;
+  const page = $("#detail"), dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+  const toPage = dy < 0 ? box.scrollTop <= 0
+    : page.scrollTop + page.clientHeight < page.scrollHeight - 1 || box.scrollTop + box.clientHeight >= box.scrollHeight - 1;
+  if (!toPage) return;
+  e.preventDefault(); page.scrollTop += dy;
+}, { passive: false });
+$("#popSum").onclick = () => popOut(SUMMARY, "要約");
+$("#popUtt").onclick = () => popOut(UTTS, "認識結果");
+addEventListener("pagehide", () => popups.forEach(w => w.close()));
+// Auto picture-in-picture: when the player scrolls out of view, try native PiP (browsers may
+// refuse it without a recent click) and otherwise float the video in a corner; returning to
+// view undoes only what this code started.
+let autoPip = null;
+new IntersectionObserver(([e]) => {
+  const video = $("#video"), slot = $("#videoSlot");
+  if (!e.isIntersecting) {
+    if (autoPip || document.pictureInPictureElement || $("#player").hidden || !video.readyState) return;
+    const float = () => { slot.style.height = `${e.boundingClientRect.height}px`; slot.classList.add("floating"); autoPip = "float"; };
+    autoPip = "pending";
+    // Scrolling back before the request settles cancels it (autoPip is no longer "pending").
+    (video.requestPictureInPicture ? video.requestPictureInPicture() : Promise.reject()).then(
+      () => { if (autoPip === "pending") autoPip = "native"; else document.exitPictureInPicture().catch(() => {}); },
+      () => { if (autoPip === "pending") float(); });
+  } else if (autoPip === "pending") {
+    autoPip = null;
+  } else if (autoPip === "native") {
+    autoPip = null; if (document.pictureInPictureElement === video) document.exitPictureInPicture().catch(() => {});
+  } else if (autoPip === "float") {
+    autoPip = null; slot.classList.remove("floating"); slot.style.height = "";
+  }
+}).observe($("#videoSlot"));
+$("#video").addEventListener("leavepictureinpicture", () => { if (autoPip === "native") autoPip = null; });
 $("#tabUttBtn").onclick = () => showTab(false);
 // Lazy thumbnails: a hidden <video> seeks to the hit time once its row is near the
 // viewport; two at a time so ranged fetches do not starve the main player.
@@ -397,7 +572,7 @@ function makeThumb(box) {
       box.replaceChildren(c); clearTimeout(timer); done();
     };
     vid.onerror = () => { clearTimeout(timer); done(); };
-    vid.src = `/media/${box.dataset.movie}`;
+    vid.src = box.dataset.src;
   });
 }
 const HIT_LIMIT = 200;
@@ -475,6 +650,7 @@ function link(a, path) {
   a.onclick = e => { if (e.button || e.metaKey || e.ctrlKey || e.shiftKey) return; e.preventDefault(); navigate(path); };
 }
 function go(v, seekTo = 0) {
+  if (SHARE) { seek(seekTo); return; }
   state.pendingSeek = seekTo;
   if (state.date && dateOf(v) !== state.date) state.date = ""; // a search hit may fall outside the filtered day
   navigate(pathFor(v) + dateQuery());
@@ -495,6 +671,13 @@ function showStreamers() {
   $("#streamerGrid").replaceChildren(grid);
 }
 function route() {
+  if (SHARE) {
+    const v = state.videos[0];
+    document.body.dataset.page = "videos"; document.body.dataset.view = "player";
+    document.title = `${v.broadcastStartJST ?? ""} ${v.streamer}`;
+    $("#q").placeholder = "文字起こし・要約を検索（この動画）";
+    select(v); return;
+  }
   const parts = location.pathname.split("/").filter(Boolean).map(decodeURIComponent);
   if (parts[0] !== "streamers") { navigate(STREAMERS, { replace: true }); return; }
   if (parts.length === 1) { showStreamers(); return; }
@@ -561,7 +744,7 @@ async function runSearch() {
       if (count > HIT_LIMIT) continue;
       const b = document.createElement("button");
       b.className = "hit";
-      const thumb = document.createElement("span"); thumb.className = "thumb"; thumb.dataset.t = h.start; thumb.dataset.movie = v.movie;
+      const thumb = document.createElement("span"); thumb.className = "thumb"; thumb.dataset.t = h.start; thumb.dataset.src = mediaSrc(v, v.movie ? "edited" : "original");
       const meta = document.createElement("span"); meta.className = "meta";
       const when = document.createElement("span"); when.className = "when"; when.textContent = `${v.broadcastStartJST ?? ""} ${h.label}`;
       const text = document.createElement("span"); text.style.display = "block"; text.textContent = h.text;
@@ -575,7 +758,63 @@ async function runSearch() {
   hits.replaceChildren(frag);
   $("#searchStatus").textContent = count > HIT_LIMIT ? `${count}件（先頭${HIT_LIMIT}件を表示）` : `${count}件`;
 }
-fetch("/api/me").then(r => r.json()).then(m => { $("#adminLink").hidden = !m.admin; }).catch(() => {});
+if (!SHARE) fetch("/api/me").then(r => r.json()).then(m => { $("#adminLink").hidden = !m.admin; $("#shareBtn").hidden = !m.admin; }).catch(() => {});
+// Downloads are two files on purpose: a multi-GB movie streams straight from R2 (resumable
+// via Range), while the transcript and summary are a small text built here from the data.
+function syncDownload() {
+  const v = state.current; if (!v) return;
+  $("#dlVideo").href = mediaSrc(v, state.source) + "?download=1";
+  getData(v.id).then(d => { $("#dlText").hidden = !d.cues.length && !d.summary; });
+}
+async function transcriptText(v) {
+  const d = await getData(v.id), out = [`${v.broadcastStartJST ?? ""} ${v.title}`, ""];
+  if (d.summary) {
+    out.push("■ 要約", d.summary.overview, "");
+    for (const s of d.summary.sections) out.push(`[${fmt(s.start)} – ${fmt(s.end)}]`, s.text, "");
+  }
+  if (d.cues.length) out.push("■ 文字起こし", ...utterancesFrom(d.cues).map(u => `[${u.startLabel}] ${u.text.replace(/\n/g, " ")}`));
+  return out.join("\n") + "\n";
+}
+$("#dlText").onclick = async () => {
+  const v = state.current; if (!v) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([await transcriptText(v)], { type: "text/plain;charset=utf-8" }));
+  a.download = `${v.id}-transcript-summary.txt`; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+const shareUrl = s => `${location.origin}/s/${s.token}`;
+async function shareCall(method, body) {
+  const r = await fetch("/api/admin/shares", { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || "失敗しました");
+  return d;
+}
+async function loadShares() {
+  const v = state.current, now = Date.now() / 1000;
+  const { shares } = await (await fetch(`/api/admin/shares?video=${encodeURIComponent(v.id)}`)).json();
+  $("#shareList").replaceChildren(...shares.map(s => {
+    const li = document.createElement("li"), url = document.createElement("input"), copy = document.createElement("button"), off = document.createElement("button"), info = document.createElement("span");
+    url.type = "text"; url.readOnly = true; url.value = shareUrl(s); url.setAttribute("aria-label", "共有URL");
+    info.className = "note";
+    info.textContent = [s.video.movie && "編集済み", s.video.original && "元動画"].filter(Boolean).join("・") + " / " + (s.expiresAt > now ? `${new Date(s.expiresAt * 1000).toLocaleString("ja-JP")}まで` : "期限切れ");
+    copy.textContent = "コピー"; copy.onclick = () => navigator.clipboard.writeText(url.value).then(() => { $("#shareMsg").textContent = "コピーしました"; });
+    off.textContent = "オフにする"; off.onclick = () => shareCall("DELETE", { token: s.token }).then(loadShares, e => { $("#shareMsg").textContent = e.message; });
+    li.append(url, copy, off, info); return li;
+  }));
+}
+$("#shareBtn").onclick = () => {
+  const v = state.current;
+  $("#shEdited").disabled = !v.movie; $("#shEdited").checked = Boolean(v.movie);
+  $("#shOriginal").disabled = !v.original; $("#shOriginal").checked = !v.movie && Boolean(v.original);
+  $("#shareMsg").textContent = ""; $("#shareDlg").showModal(); loadShares();
+};
+$("#shareForm").onsubmit = async e => {
+  e.preventDefault();
+  try {
+    const { share } = await shareCall("POST", { videoId: state.current.id, edited: $("#shEdited").checked, original: $("#shOriginal").checked, days: +$("#shDays").value });
+    $("#shareMsg").textContent = `発行しました: ${shareUrl(share)}`; loadShares();
+  } catch (err) { $("#shareMsg").textContent = err.message; }
+};
 window.__catalog.then(c => { state.videos = c.videos; route(); });
 </script>
 </body>
