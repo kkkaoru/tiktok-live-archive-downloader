@@ -43,6 +43,21 @@ struct CatalogScanMergeTests {
         #expect(first.issues.count == 10)
     }
 
+    @Test func aMoviePairedByAnotherLibraryIsNotReportedWithoutTranscript() {
+        var store = CatalogScan()
+        store.moviesWithoutTranscript = [
+            URL(fileURLWithPath: "/library/old.mp4"), URL(fileURLWithPath: "/library/lone.mp4"),
+        ]
+        var edits = CatalogScan()
+        edits.videos = [video("old", start: "2026-09-01 18:00:00 JST")]
+        var reversed = edits
+        edits.merge(store)
+        store.merge(reversed)
+        reversed = store
+        #expect(edits.moviesWithoutTranscript.map(\.lastPathComponent) == ["lone.mp4"])
+        #expect(reversed.moviesWithoutTranscript.map(\.lastPathComponent) == ["lone.mp4"])
+    }
+
     private func recordingVideo(_ revision: String, date: String, candidate: Bool)
         -> VideoTranscript
     {

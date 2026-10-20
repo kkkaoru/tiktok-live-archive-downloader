@@ -63,7 +63,10 @@ public struct CatalogScan: Equatable, Sendable {
                 ? left.movieURL.path < right.movieURL.path : leftDate > rightDate
         }
         pendingMovieLabels += other.pendingMovieLabels
-        moviesWithoutTranscript += other.moviesWithoutTranscript
+        // A movie another library pairs with its transcript (an offloaded store) is not missing one.
+        let paired = Set(videos.map { $0.movieURL.standardizedFileURL.path })
+        moviesWithoutTranscript = (moviesWithoutTranscript + other.moviesWithoutTranscript)
+            .filter { !paired.contains($0.standardizedFileURL.path) }
         unreadableTranscriptLabels += other.unreadableTranscriptLabels
         unknownBroadcastDateLabels += other.unknownBroadcastDateLabels
         ambiguousDeliveryLabels += other.ambiguousDeliveryLabels
@@ -77,6 +80,17 @@ public enum TranscriptCatalog {
     private struct SourceProbe: Decodable {
         struct Format: Decodable { let filename: String }
         let format: Format
+    }
+
+    /// The fields of a record mirror's `edit-config.json` that locate its delivery.
+    private struct EditConfig: Decodable {
+        let source: String?
+        let storageRoot: String?
+
+        enum CodingKeys: String, CodingKey {
+            case source
+            case storageRoot = "storage_root"
+        }
     }
 
     /// A delivery that `replay.edit_completion supersede` recorded as missing a
@@ -154,6 +168,12 @@ public enum TranscriptCatalog {
                         && isDirectory.boolValue)
             else { continue }
             let title = folder.lastPathComponent
+            // A folder of recording folders is another library's media store, not a delivery.
+            if folder != root, !RecordingIdentity.isRecordingID(title),
+                holdsRecordingFolders(folder, fileManager: fileManager)
+            {
+                continue
+            }
             if root.lastPathComponent == "edits",
                 folder == root || (!title.hasPrefix("replay-") && !title.hasPrefix("youtube-"))
             {
@@ -169,6 +189,13 @@ public enum TranscriptCatalog {
                     // Report invalid evidence only for folders that actually contain deliveries.
                     broadcastStartJST = nil
                 }
+            }
+            let config = editConfig(in: folder)
+            if broadcastStartJST == nil, title.hasPrefix("replay-"), let source = config?.source {
+                broadcastStartJST = sourceStartJST(source, folder: folder)
+            }
+            let store = config?.storageRoot.flatMap {
+                offloadedStore($0, for: folder, fileManager: fileManager)
             }
             let candidate: CandidateSelection.Selection?
             do {
@@ -191,6 +218,30 @@ public enum TranscriptCatalog {
                 continue
             }
             let transcripts = try transcriptURLs(in: folder, fileManager: fileManager)
+            var storedTranscripts: [URL: URL] = [:]
+            if let store, candidate == nil {
+                for transcript in try movieCandidates(
+                    in: folder, extensions: ["csv", "srt"], fileManager: fileManager)
+                {
+                    let movie = store.appending(
+                        path: transcript.pathComponents.dropFirst(folder.pathComponents.count)
+                            .joined(separator: "/")
+                    ).deletingPathExtension().appendingPathExtension("mp4")
+                    var isDirectory: ObjCBool = false
+                    if fileManager.fileExists(
+                        atPath: movie.path(percentEncoded: false), isDirectory: &isDirectory),
+                        !isDirectory.boolValue,
+                        !movie.resolvingSymlinksInPath().pathComponents.contains(where: {
+                            ["private", "downloads"].contains($0)
+                        })
+                    {
+                        // Sorted paths put .srt after .csv, so the SRT wins as in transcriptURL.
+                        storedTranscripts[movie] = transcript
+                    }
+                }
+            }
+            let base = { (movie: URL) in storedTranscripts[movie] == nil ? folder : store ?? folder
+            }
             let discoveredMovies: [URL]
             if let candidate {
                 discoveredMovies = [candidate.movie]
@@ -204,7 +255,9 @@ public enum TranscriptCatalog {
                         && !isDirectory.boolValue
                 }
             } else {
-                discoveredMovies = try movieCandidates(in: folder, fileManager: fileManager)
+                discoveredMovies =
+                    try movieCandidates(in: folder, fileManager: fileManager)
+                    + storedTranscripts.keys.sorted { $0.path < $1.path }
             }
             if title.hasPrefix("replay-"), broadcastStartJST == nil, !discoveredMovies.isEmpty {
                 scan.unknownBroadcastDateLabels.append(title)
@@ -227,7 +280,7 @@ public enum TranscriptCatalog {
                 }
                 let canonical = eligible.filter {
                     $0.lastPathComponent == "\(stamp ?? "")_JST_\(title)-review.mp4"
-                        && !superseded.matches($0, in: folder, fileManager: fileManager)
+                        && !superseded.matches($0, in: base($0), fileManager: fileManager)
                 }
                 let selected = canonical.isEmpty ? eligible : canonical
                 if selected.count > 1 {
@@ -259,7 +312,7 @@ public enum TranscriptCatalog {
             }
             for movieURL in movies {
                 guard
-                    let transcript = candidate?.transcript
+                    let transcript = candidate?.transcript ?? storedTranscripts[movieURL]
                         ?? transcriptURL(
                             for: movieURL, in: folder, fileManager: fileManager)
                 else {
@@ -272,7 +325,7 @@ public enum TranscriptCatalog {
                         ? TranscriptSRT.cues(contentsOf: transcript)
                         : TranscriptCSV.cues(contentsOf: transcript)
                     let relative = Array(
-                        movieURL.pathComponents.dropFirst(folder.pathComponents.count))
+                        movieURL.pathComponents.dropFirst(base(movieURL).pathComponents.count))
                     let revision = zip(relative, relative.dropFirst())
                         .first { $0.0 == "revisions" }?.1
                     let label = revision.map { "\(title)/\($0)" } ?? title
@@ -296,7 +349,9 @@ public enum TranscriptCatalog {
                 }
             }
             if folder != root, candidate == nil, transcripts.isEmpty, discoveredMovies.isEmpty,
-                !(root.lastPathComponent == "edits" && title.hasPrefix("replay-"))
+                !(root.lastPathComponent == "edits" && title.hasPrefix("replay-")),
+                // A record mirror's deliveries are reported by the library that stores them.
+                config == nil
             {
                 scan.emptyFolders.append(title)
             }
@@ -355,6 +410,11 @@ public enum TranscriptCatalog {
         let source = try JSONDecoder().decode(
             SourceProbe.self, from: Data(contentsOf: probeURL)
         ).format.filename
+        return sourceStartJST(source, folder: folder)
+    }
+
+    /// The broadcast time named by the original's canonical download filename.
+    private static func sourceStartJST(_ source: String, folder: URL) -> String? {
         let name = URL(fileURLWithPath: source).lastPathComponent
         guard source.hasPrefix("/") || source == "downloads/\(name)" else { return nil }
         let suffix = "_JST_\(folder.lastPathComponent).mp4"
@@ -388,6 +448,41 @@ public enum TranscriptCatalog {
             name[range.upperBound...].isEmpty || name[range.upperBound...].hasPrefix("-")
         else { return nil }
         return jstLabel(stamp: String(name[..<range.lowerBound]))
+    }
+
+    private static func editConfig(in folder: URL) -> EditConfig? {
+        let url = folder.appending(path: "edit-config.json")
+        guard url.resolvingSymlinksInPath() == url.standardizedFileURL,
+            let data = try? Data(contentsOf: url), data.count <= 1_048_576
+        else { return nil }
+        return try? JSONDecoder().decode(EditConfig.self, from: data)
+    }
+
+    /// A record mirror's storage root that holds only media: its own evidence would make
+    /// its library scan authoritative, so a mirror never re-selects one of its revisions.
+    private static func offloadedStore(_ path: String, for folder: URL, fileManager: FileManager)
+        -> URL?
+    {
+        let store = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard path.hasPrefix("/"), store.lastPathComponent == folder.lastPathComponent,
+            store.resolvingSymlinksInPath() != folder.resolvingSymlinksInPath(),
+            !store.resolvingSymlinksInPath().pathComponents.contains(where: {
+                ["private", "downloads"].contains($0)
+            }),
+            fileManager.fileExists(
+                atPath: store.path(percentEncoded: false), isDirectory: &isDirectory),
+            isDirectory.boolValue,
+            !fileManager.fileExists(
+                atPath: store.appending(path: "evidence").path(percentEncoded: false))
+        else { return nil }
+        return store
+    }
+
+    private static func holdsRecordingFolders(_ folder: URL, fileManager: FileManager) -> Bool {
+        let names =
+            (try? fileManager.contentsOfDirectory(atPath: folder.path(percentEncoded: false))) ?? []
+        return names.contains(where: RecordingIdentity.isRecordingID)
     }
 
     private static func transcriptURLs(in folder: URL, fileManager: FileManager) throws -> [URL] {
@@ -479,7 +574,9 @@ public enum TranscriptCatalog {
         return result
     }
 
-    private static func movieCandidates(in folder: URL, fileManager: FileManager) throws -> [URL] {
+    private static func movieCandidates(
+        in folder: URL, extensions: Set<String> = ["mov", "mp4"], fileManager: FileManager
+    ) throws -> [URL] {
         let enumerator = fileManager.enumerator(
             at: folder,
             includingPropertiesForKeys: nil,
@@ -498,7 +595,7 @@ public enum TranscriptCatalog {
                 continue
             }
             var isDirectory: ObjCBool = false
-            guard ["mov", "mp4"].contains(item.pathExtension.lowercased()),
+            guard extensions.contains(item.pathExtension.lowercased()),
                 !item.deletingPathExtension().lastPathComponent.hasSuffix(".incomplete"),
                 !item.resolvingSymlinksInPath().pathComponents.contains(where: {
                     ["private", "downloads"].contains($0)

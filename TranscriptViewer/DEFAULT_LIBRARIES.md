@@ -15,6 +15,14 @@ An invalid configuration leaves the primary library available and reports the
 problem. Explicit `--library`, Open Document and folder selection remain scoped
 to that chosen library and do not change the default configuration.
 
+A record mirror (for example `replay-records-backup`) can be a library: a
+`replay-<id>` folder whose `edit-config.json` names a `storage_root` without its
+own `evidence/` pairs each delivery SRT (and its `.srt.summaries`) with the movie
+at the same relative path in that store, dated by the config's `source` filename.
+A store that has `evidence/` is left to its own library, so a mirror never
+re-selects an older revision. Summary stores must stay 0700; `replay.record_mirror`
+keeps the source directory modes.
+
 The default view rereads configuration and candidate selections every 30 seconds,
 on activation and with Refresh. A newly published movie appears only after the
 existing catalog's candidate, media identity, source date and SRT checks pass.
