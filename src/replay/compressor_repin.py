@@ -31,7 +31,8 @@ def repin(state: Path, old_sha256: str, *, apply: bool) -> list[str]:
             live[key] = batch._pin(path)
         return live[key]
 
-    for receipt in sorted(state.glob("alpha-*.json")):
+    # Every job receipt (alpha-*, or part names of the recording pipeline); monitor snapshots skip.
+    for receipt in sorted(path for path in state.glob("*.json") if path.name[:8] != "monitor-"):
         saved = json.loads(receipt.read_text(encoding="utf-8"))
         pins = saved.get("runtimeInputs")
         command = saved.get("command")
