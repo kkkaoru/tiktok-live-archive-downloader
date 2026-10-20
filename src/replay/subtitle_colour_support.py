@@ -15,11 +15,13 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
 
 from replay.subtitle_inpaint import Image
 
 Box = tuple[int, int, int, int]
 Detector = Callable[[Sequence[Image]], tuple[Image, ...]]
+Components = tuple[int, NDArray[np.int32], NDArray[np.int32]]  # count, labels, stats
 
 HUE_RANGE = (150, 172)
 MIN_SATURATION = 90
@@ -55,7 +57,13 @@ def box_mask(shape: tuple[int, int], origin: tuple[int, int], boxes: Sequence[Bo
     return mask
 
 
-def clipped_lines(roi: Image, frame: FrameBoxes) -> Image:
+def components(mask: Image) -> Components:
+    """8-connected components of a 0/1 caption-colour mask: count, labels and stats."""
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    return int(count), np.asarray(labels, dtype=np.int32), np.asarray(stats, dtype=np.int32)
+
+
+def clipped_lines(roi: Image, frame: FrameBoxes, found: Components | None = None) -> Image:
     """0/1 mask of caption-coloured components clipped by the band edge beside a recognised line.
 
     A component qualifies when it touches the top or bottom row of ``roi``, is no taller than the
@@ -71,17 +79,19 @@ def clipped_lines(roi: Image, frame: FrameBoxes) -> Image:
         (max(0, left - frame.origin[0] - BOX_MARGIN), right - frame.origin[0] + BOX_MARGIN)
         for left, _, right, _ in frame.boxes
     ]
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(pink(roi), connectivity=8)
+    count, labels, stats = components(pink(roi)) if found is None else found
+    keep = np.zeros(count, dtype=np.uint8)
     for label in range(1, count):
         x, y, w, h = (int(stats[label, k]) for k in range(4))
         clipped = y == 0 or y + h == height
         aligned = max(max(0, min(x + w, end) - max(x, start)) for start, end in spans)
         if clipped and h <= line_height and aligned >= MINIMUM_ALIGNED_SHARE * w:
-            result[labels == label] = 1
-    return result
+            keep[label] = 1
+    # One lookup over the labels instead of a full-ROI comparison per kept component.
+    return np.asarray(keep[labels], dtype=np.uint8)
 
 
-def crossing_lines(roi: Image, frame: FrameBoxes) -> Image:
+def crossing_lines(roi: Image, frame: FrameBoxes, found: Components | None = None) -> Image:
     """0/1 mask of caption-coloured components that cross out of the recognised line boxes.
 
     A scrolling line is only partly recognised: the detector reads the part inside its zone and
@@ -98,25 +108,29 @@ def crossing_lines(roi: Image, frame: FrameBoxes) -> Image:
     top = max(0, min(box[1] for box in frame.boxes) - frame.origin[1] - line_height)
     bottom = max(top, max(box[3] for box in frame.boxes) - frame.origin[1] + line_height)
     inside = box_mask(roi.shape[:2], frame.origin, frame.boxes)
-    outside_reach = np.ones((height, width), dtype=bool)
-    outside_reach[top:bottom] = False
-    count, labels, _, _ = cv2.connectedComponentsWithStats(pink(roi), connectivity=8)
-    for label in range(1, count):
-        member = labels == label
-        if inside[member].any() and not (member & outside_reach).any():
-            result[member] = 1
-    return result
+    count, labels, _ = components(pink(roi)) if found is None else found
+    # Per component, in one pass each: does it touch a box, and does it reach the rows outside
+    # one line height around the boxes (instead of a full-ROI comparison per component).
+    touches = np.bincount(labels.ravel(), weights=inside.ravel(), minlength=count) > 0
+    escapes = np.zeros(count, dtype=bool)
+    escapes[labels[:top]] = True
+    escapes[labels[bottom:]] = True
+    keep = touches & ~escapes
+    keep[0] = False
+    return np.asarray(keep[labels], dtype=np.uint8)
 
 
 def key_mask(roi: Image, frame: FrameBoxes) -> Image:
     """Caption-coloured pixels (plus their outline) inside the frame's line boxes, as 0/255."""
     kernel = np.ones((OUTLINE_KERNEL, OUTLINE_KERNEL), np.uint8)
-    edge = np.maximum(clipped_lines(roi, frame), crossing_lines(roi, frame))
+    pinked = pink(roi)  # one colour conversion and one labelling serve every step below
+    found = components(pinked)
+    edge = np.maximum(clipped_lines(roi, frame, found), crossing_lines(roi, frame, found))
     allowed = np.maximum(
         box_mask(roi.shape[:2], frame.origin, frame.boxes),
         np.asarray(cv2.dilate(edge, kernel), dtype=np.uint8),
     )
-    fill = np.minimum(pink(roi), allowed)
+    fill = np.minimum(pinked, allowed)
     grown = np.minimum(np.asarray(cv2.dilate(fill, kernel), dtype=np.uint8), allowed)
     return np.asarray(grown * 255, dtype=np.uint8)
 

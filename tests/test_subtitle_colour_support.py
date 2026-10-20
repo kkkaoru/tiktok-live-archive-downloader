@@ -132,3 +132,54 @@ def test_crossing_keys_nothing_without_recognised_boxes() -> None:
     roi = _tall_roi()
     roi[12:23, 40] = PINK
     assert int(support.crossing_lines(roi, support.FrameBoxes((0, 0), ())).sum()) == 0
+
+
+def _scattered(seed: int) -> np.ndarray:
+    """A 60x200 ROI with many caption-pink blobs, some cut by the top and bottom rows."""
+    rng = np.random.default_rng(seed)
+    roi = np.full((60, 200, 3), 90, dtype=np.uint8)
+    for _ in range(40):
+        y, x = int(rng.integers(-3, 58)), int(rng.integers(0, 195))
+        roi[max(0, y) : y + int(rng.integers(2, 9)), x : x + int(rng.integers(2, 12))] = PINK
+    return roi
+
+
+def test_line_selection_equals_a_per_component_scan() -> None:
+    import cv2
+
+    frame = support.FrameBoxes((0, 0), ((40, 20, 120, 34), (60, 36, 150, 48)))
+    roi = _scattered(3)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(support.pink(roi), connectivity=8)
+    crossing = np.zeros(labels.shape, np.uint8)
+    inside = support.box_mask(roi.shape[:2], frame.origin, frame.boxes)
+    for label in range(1, count):
+        member = labels == label
+        rows = np.flatnonzero(member.any(axis=1))
+        if inside[member].any() and rows.min() >= 6 and rows.max() < 62:
+            crossing[member] = 1
+    assert np.array_equal(support.crossing_lines(roi, frame), crossing)
+    assert int(support.clipped_lines(roi, frame).sum()) == int(
+        sum(
+            stats[label, 4]
+            for label in range(1, count)
+            if (stats[label, 1] == 0 or stats[label, 1] + stats[label, 3] == 60)
+            and stats[label, 3] <= 14
+            and max(
+                max(0, min(stats[label, 0] + stats[label, 2], end) - max(stats[label, 0], start))
+                for start, end in ((30, 130), (50, 160))
+            )
+            >= 0.5 * stats[label, 2]
+        )
+    )
+
+
+def test_shared_components_give_the_same_lines() -> None:
+    frame = support.FrameBoxes((0, 0), ((40, 20, 120, 34),))
+    roi = _scattered(5)
+    found = support.components(support.pink(roi))
+    assert np.array_equal(
+        support.clipped_lines(roi, frame, found), support.clipped_lines(roi, frame)
+    )
+    assert np.array_equal(
+        support.crossing_lines(roi, frame, found), support.crossing_lines(roi, frame)
+    )
