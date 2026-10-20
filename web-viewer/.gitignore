@@ -10,6 +10,7 @@ data/
 data.next/
 proxies/
 sync-state.json
+sync.lock
 upload-state.json
 *.log
 *.launch
