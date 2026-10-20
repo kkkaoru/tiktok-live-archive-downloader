@@ -16,15 +16,19 @@ from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
+from io import BufferedReader
 from itertools import islice
+from pathlib import Path
 from subprocess import PIPE, Popen
 from time import monotonic
 
 import numpy as np
+from numpy.typing import NDArray
 
 from replay.subtitle_inpaint import Image, ramp_softness
 from replay.subtitle_repair import QualityMeasure, RepairedFrame, TextDetector, repair_with_retries
 from replay.subtitle_stream import BatchDetector, EvidenceSink, ReceiptSink, SubtitleSpan
+from replay.subtitle_sttn import changed
 from replay.subtitle_video import (
     ENCODER_OPTIONS,
     VideoRepairJob,
@@ -347,8 +351,13 @@ def render_repaired_video_fast(
     detect_batch: BatchDetector | None = None,
     evidence: EvidenceSink | None = None,
     schedule: Schedule | None = None,
+    support_sink: Callable[[NDArray[np.bool_], Image], None] | None = None,
 ) -> VideoRepairReceipt:
-    """Drop-in for ``render_repaired_video`` (no ``require_quality``, no temporal context)."""
+    """Drop-in for ``render_repaired_video`` (no ``require_quality``, no temporal context).
+
+    ``support_sink`` receives, per frame, the exact pixels the repair changed and the source
+    frame; with it nothing is encoded, since only the supports are wanted.
+    """
     if job.context_frames:
         raise ValueError("Temporal-context repair uses the original renderer")
     if not job.source.is_file() or not job.output.parent.is_dir():
@@ -394,21 +403,35 @@ def render_repaired_video_fast(
         ) as clock_options,
         nullcontext(None) if job.source_clock is None else decode_log_path.open("xb") as decode_log,
         Popen(decode_command, stdout=PIPE, stderr=decode_log) as decoder,
-        Popen([*encode_command[:-1], *clock_options, encode_command[-1]], stdin=PIPE) as encoder,
+        (
+            nullcontext(None)
+            if support_sink is not None
+            else Popen([*encode_command[:-1], *clock_options, encode_command[-1]], stdin=PIPE)
+        ) as encoder,
     ):
-        if decoder.stdout is None or encoder.stdin is None:
+        if decoder.stdout is None or (encoder is not None and encoder.stdin is None):
             raise RuntimeError("Missing FFmpeg pipeline streams")
-        reader, writer = decoder.stdout, encoder.stdin
+        reader = decoder.stdout
+        writer = None if encoder is None else encoder.stdin
+
+        sources: deque[Image] = deque()
 
         def decoded_frames() -> Iterator[Image]:
             size = job.width * job.height * 3
             while data := reader.read(size):
                 if len(data) != size:
                     raise ValueError("Truncated decoded frame")
-                yield np.frombuffer(data, dtype=np.uint8).reshape(job.height, job.width, 3)
+                frame = np.frombuffer(data, dtype=np.uint8).reshape(job.height, job.width, 3)
+                if support_sink is not None:
+                    sources.append(frame)
+                yield frame
 
         def write(frame: Image) -> None:
-            writer.write(frame.tobytes())
+            if support_sink is not None:
+                source = sources.popleft()
+                support_sink(changed(frame, source), source)
+            if writer is not None:
+                writer.write(np.ascontiguousarray(frame).data)
 
         completed = False
         try:
@@ -429,11 +452,12 @@ def render_repaired_video_fast(
             )
             completed = True
         finally:
-            writer.close()
+            if writer is not None:
+                writer.close()
             reader.close()
             if not completed and decoder.poll() is None:
                 decoder.terminate()
-        if decoder.wait(timeout=30) != 0 or encoder.wait(timeout=30) != 0:
+        if decoder.wait(timeout=30) != 0 or (encoder is not None and encoder.wait(timeout=30) != 0):
             raise RuntimeError("FFmpeg repair pipeline failed")
     if job.source_clock is not None:
         observed = tuple(
@@ -456,3 +480,116 @@ def render_repaired_video_fast(
         supported_pixels=totals[2],
         unsupported_pixels=totals[3],
     )
+
+
+class SupportStore:
+    """Per-frame repaired pixels, kept compact (the changed rows' span and their packed bits),
+    with the source rows ``kept`` so the refill need not decode the source again."""
+
+    def __init__(self, width: int, kept: tuple[int, int]) -> None:
+        self._width = width
+        self._kept = kept
+        self._rows: list[tuple[int, int, NDArray[np.uint8]] | None] = []
+        self._sources: list[Image] = []
+
+    def __call__(self, support: NDArray[np.bool_], source: Image) -> None:
+        first, last = self._kept
+        self._sources.append(source[first:last].copy())
+        rows = np.nonzero(support.any(axis=1))[0]
+        if not len(rows):
+            self._rows.append(None)
+            return
+        top, bottom = int(rows.min()), int(rows.max()) + 1
+        if top < first or bottom > last:
+            raise ValueError("A repair changed pixels outside the kept source rows")
+        self._rows.append((top, bottom, np.packbits(support[top:bottom], axis=1)))
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def span(self) -> tuple[int, int] | None:
+        marked = [row for row in self._rows if row is not None]
+        if not marked:
+            return None
+        return min(row[0] for row in marked), max(row[1] for row in marked)
+
+    def bands(self, top: int, bottom: int) -> NDArray[np.bool_]:
+        """Every frame's support inside rows ``top..bottom``, unpacked into one array."""
+        result = np.zeros((len(self._rows), bottom - top, self._width), dtype=bool)
+        for band, row in zip(result, self._rows, strict=True):
+            if row is not None:
+                first, last, packed = row
+                bits = np.unpackbits(packed, axis=1, count=self._width)
+                band[first - top : last - top] = bits
+        return result
+
+    def sources(self, top: int, bottom: int) -> Iterator[Image]:
+        """Every frame's source rows ``top..bottom`` (inside the kept rows), handed over once.
+
+        Each stored block is released as it is yielded, so the consumer's stacked copy is not
+        held beside a second full copy of the chunk's band.
+        """
+        first = self._kept[0]
+        while self._sources:
+            yield self._sources.pop(0)[top - first : bottom - first]
+
+
+def render_refilled_video(
+    job: VideoRepairJob,
+    supports: SupportStore,
+    refill: Callable[[Iterator[Image], tuple[int, int]], NDArray[np.uint8]],
+) -> int:
+    """Encode the source with each frame's repaired pixels replaced by ``refill``.
+
+    ``refill`` receives the stored source rows covering every support (one band per frame, in
+    order) and returns those rows refilled. Pixels outside the supports stay the source; the
+    encoder and presentation clock are the repair renderer's own.
+    """
+    if job.output.exists():
+        raise FileExistsError(job.output)
+    if len(supports) != job.frames:
+        raise ValueError("One repair support per frame is required")
+    span = supports.span()
+    if span is None:
+        raise ValueError("No repaired pixel to refill")
+    top, bottom = span
+
+    # One reused frame buffer: each frame is decoded into it, its band rows are replaced in
+    # place and it is written from there (no per-frame copy and no ``tobytes`` copy).
+    buffer = bytearray(job.width * job.height * 3)
+    frame = np.frombuffer(buffer, dtype=np.uint8).reshape(job.height, job.width, 3)
+
+    def decoded(log: Path) -> Iterator[Image]:
+        with log.open("wb") as stream, Popen(_decode_command(job), stdout=PIPE, stderr=stream) as p:
+            if not isinstance(p.stdout, BufferedReader):
+                raise RuntimeError("Missing FFmpeg decode stream")
+            while read := p.stdout.readinto(buffer):
+                if read != len(buffer):
+                    raise ValueError("Truncated decoded frame")
+                yield frame
+        if p.returncode != 0:
+            raise RuntimeError("FFmpeg refill decode failed")
+
+    log = job.output.with_suffix(job.output.suffix + ".refill.log")
+    bands = refill(supports.sources(top, bottom), (top, bottom))
+    encode = _encode_command(job)
+    with (
+        (
+            nullcontext(("-video_track_timescale", "15360"))
+            if job.source_clock is None
+            else job.source_clock.encoding_options()
+        ) as clock_options,
+        Popen([*encode[:-1], *clock_options, encode[-1]], stdin=PIPE) as encoder,
+    ):
+        if encoder.stdin is None:
+            raise RuntimeError("Missing FFmpeg encode stream")
+        count = 0
+        for decoded_frame, band in zip(decoded(log), bands, strict=True):
+            decoded_frame[top:bottom] = band
+            encoder.stdin.write(buffer)
+            count += 1
+        encoder.stdin.close()
+        if encoder.wait(timeout=60) != 0:
+            raise RuntimeError("FFmpeg refill encode failed")
+    log.unlink(missing_ok=True)
+    return count

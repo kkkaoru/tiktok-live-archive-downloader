@@ -2,11 +2,13 @@
 
 import hashlib
 import subprocess
+from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 import pytest
+from numpy.typing import NDArray
 
 from replay.subtitle_clock import VideoFrameClock
 from replay.subtitle_inpaint import Image
@@ -14,9 +16,11 @@ from replay.subtitle_stream import SubtitleSpan, repair_stream
 from replay.subtitle_video import VideoRepairJob, render_repaired_video, spatial_evidence
 from replay.subtitle_video_fast import (
     Schedule,
+    SupportStore,
     _decode_command,
     _encode_command,
     fast_repair_stream,
+    render_refilled_video,
     render_repaired_video_fast,
 )
 
@@ -418,3 +422,79 @@ def test_encode_command_selects_hardware_and_quality_options() -> None:
     assert software[software.index("-profile:v") + 1] == "high"
     assert hevc[hevc.index("-q:v") + 1] == "60"
     assert hevc[hevc.index("-profile:v") + 1] == "main"
+
+
+def test_the_support_sink_records_exactly_the_repaired_pixels(tmp_path: Path) -> None:
+    source = tmp_path / "source.mkv"
+    make_source(source, 6)
+    spans = (SubtitleSpan(1, 5, 8, 16, 40, 24),)
+    store = SupportStore(SIZE, (16, 40))
+    render_repaired_video_fast(
+        VideoRepairJob(source, tmp_path / "fast.mp4", SIZE, SIZE, 6, spans),
+        detect_batch=batch_mask,
+        support_sink=store,
+    )
+    assert not (tmp_path / "fast.mp4").exists()
+    assert len(store) == 6
+    span = store.span()
+    assert span is not None
+    bands = store.bands(*span)
+    assert not bands[0].any()
+    assert bands[2].any()
+    rows = np.nonzero(bands[2].any(axis=1))[0] + span[0]
+    assert rows.min() >= 16 and rows.max() < 40
+    assert len(list(store.sources(*span))) == 6
+    assert list(store.sources(*span)) == []  # handed over once, then released
+
+
+def test_a_store_without_repairs_has_no_span() -> None:
+    store = SupportStore(8, (0, 8))
+    store(np.zeros((8, 8), dtype=bool), np.zeros((8, 8, 3), dtype=np.uint8))
+    assert store.span() is None
+
+
+def test_a_repair_outside_the_kept_rows_is_refused() -> None:
+    store = SupportStore(8, (2, 4))
+    support = np.zeros((8, 8), dtype=bool)
+    support[5, 1] = True
+    with pytest.raises(ValueError, match="outside the kept source rows"):
+        store(support, np.zeros((8, 8, 3), dtype=np.uint8))
+
+
+def test_refill_replaces_only_supported_rows_and_keeps_the_frame_count(tmp_path: Path) -> None:
+    source = tmp_path / "source.mkv"
+    make_source(source, 6)
+    store = SupportStore(SIZE, (10, 40))
+    for index in range(6):
+        mask = np.zeros((SIZE, SIZE), dtype=bool)
+        if index % 2:
+            mask[20:30, 10:50] = True
+        store(mask, np.full((SIZE, SIZE, 3), index, dtype=np.uint8))
+    seen: list[tuple[int, int]] = []
+    stored: list[int] = []
+
+    def refill(bands: Iterator[Image], rows: tuple[int, int]) -> NDArray[np.uint8]:
+        seen.append(rows)
+        listed = list(bands)
+        stored.extend(int(band[0, 0, 0]) for band in listed)
+        assert listed[0].shape == (10, SIZE, 3)
+        return np.stack([np.full_like(band, 255) for band in listed])
+
+    output = tmp_path / "refilled.mp4"
+    count = render_refilled_video(VideoRepairJob(source, output, SIZE, SIZE, 6, ()), store, refill)
+    assert (count, seen, stored) == (6, [(20, 30)], [0, 1, 2, 3, 4, 5])
+    assert output.stat().st_size > 0
+    with pytest.raises(FileExistsError):
+        render_refilled_video(VideoRepairJob(source, output, SIZE, SIZE, 6, ()), store, refill)
+
+
+def test_refill_needs_one_support_per_frame_and_some_repair(tmp_path: Path) -> None:
+    job = VideoRepairJob(tmp_path / "s.mkv", tmp_path / "o.mp4", SIZE, SIZE, 2, ())
+    empty = SupportStore(SIZE, (0, 0))
+    frame = np.zeros((SIZE, SIZE, 3), dtype=np.uint8)
+    empty(np.zeros((SIZE, SIZE), dtype=bool), frame)
+    with pytest.raises(ValueError, match="One repair support per frame"):
+        render_refilled_video(job, empty, lambda bands, rows: np.zeros(0, np.uint8))
+    empty(np.zeros((SIZE, SIZE), dtype=bool), frame)
+    with pytest.raises(ValueError, match="No repaired pixel"):
+        render_refilled_video(job, empty, lambda bands, rows: np.zeros(0, np.uint8))
