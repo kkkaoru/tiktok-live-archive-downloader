@@ -39,6 +39,12 @@ def test_runtime_and_dependencies_saved_before_call_and_reused(tmp_path: Path) -
     assert saved["terminalRuntimeVerified"] is True
     assert batch.verify_runtime(saved, rehash=True) is True
     assert batch.run([job], worker, in_flight=1) == 0
+    # A reboot renumbers the volume: receipts pinned under another device number still hold.
+    for pin in (*saved["inputs"], *saved["runtimeInputs"], *saved["dependencies"]):
+        pin["stat"]["device"] += 1
+    (state / "alpha-0000.json").write_text(json.dumps(saved))
+    assert batch.verify_runtime(saved, rehash=True) is True
+    assert batch.run([job], worker, in_flight=1) == 0
     dependency.write_bytes(b"changed")
     with pytest.raises(ReplayError, match="dependency changed"):
         batch.run([job], worker, in_flight=1)

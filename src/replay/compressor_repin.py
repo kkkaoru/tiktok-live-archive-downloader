@@ -43,7 +43,7 @@ def repin(state: Path, old_sha256: str, *, apply: bool) -> list[str]:
         stale = [
             index
             for index, (path, pin) in enumerate(zip(paths, pins, strict=True))
-            if pin != current(path)
+            if batch._portable(pin) != batch._portable(current(path))
         ]
         if not stale:
             continue

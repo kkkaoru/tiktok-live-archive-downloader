@@ -241,6 +241,15 @@ def _stat(path: Path) -> dict[str, int]:
     }
 
 
+def _portable(pin: object) -> object:
+    """A pin without the device number: macOS renumbers volumes at every boot."""
+    if not isinstance(pin, dict):
+        return pin
+    stat = pin.get("stat", pin)
+    kept = {key: value for key, value in stat.items() if key != "device"}
+    return {**pin, "stat": kept} if "stat" in pin else kept
+
+
 def _pin(path: Path) -> dict[str, object]:
     before = _stat(path)
     with path.open("rb") as stream:
@@ -284,12 +293,12 @@ def verify_runtime(saved: dict[str, object], *, rehash: bool) -> bool:
         raise ReplayError("Compressor runtime pins are missing or invalid")
     for path, raw in zip(runtime_paths(Path(command[0])), pins, strict=True):
         pin = record(raw)
-        if pin.get("path") != str(path) or pin.get("stat") != _stat(path):
+        if pin.get("path") != str(path) or _portable(pin.get("stat")) != _portable(_stat(path)):
             raise ReplayError(f"Compressor runtime input changed: {path}")
         digest = pin.get("sha256")
         if not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
             raise ReplayError("Invalid Compressor runtime SHA256")
-        if rehash and pin != _pin(path):
+        if rehash and _portable(pin) != _portable(_pin(path)):
             raise ReplayError(f"Compressor runtime SHA256 changed: {path}")
     return True
 
@@ -341,13 +350,13 @@ def verify_submission(job: Job, saved: dict[str, object], *, rehash: bool) -> bo
         pin = record(raw)
         if (
             pin.get("path") != str(path.absolute())
-            or pin.get("stat") != _stat(path)
+            or _portable(pin.get("stat")) != _portable(_stat(path))
             or pin.get("bytes") != path.stat().st_size
             or not isinstance(pin.get("sha256"), str)
             or re.fullmatch(r"[a-f0-9]{64}", str(pin.get("sha256"))) is None
         ):
             raise ReplayError(f"Compressor submission input changed: {path}")
-        if rehash and pin != _pin(path):
+        if rehash and _portable(pin) != _portable(_pin(path)):
             raise ReplayError(f"Compressor submission input SHA256 changed: {path}")
     verify_runtime(saved, rehash=rehash)
     if saved.get("submissionVersion") == 2:
@@ -356,9 +365,10 @@ def verify_submission(job: Job, saved: dict[str, object], *, rehash: bool) -> bo
             raise ReplayError("Compressor dependency pins are missing")
         for path, raw in zip(job.dependencies, dependencies, strict=True):
             pin = record(raw)
-            if pin.get("path") != str(path.absolute()) or pin.get("stat") != _stat(path):
+            stat = _portable(pin.get("stat"))
+            if pin.get("path") != str(path.absolute()) or stat != _portable(_stat(path)):
                 raise ReplayError("Compressor dependency changed")
-            if rehash and pin != _pin(path):
+            if rehash and _portable(pin) != _portable(_pin(path)):
                 raise ReplayError("Compressor dependency SHA256 changed")
     return True
 
