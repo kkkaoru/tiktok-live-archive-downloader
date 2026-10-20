@@ -13,6 +13,7 @@ import {
   configSchema,
   type Sources,
   type SyncConfig,
+  type SyncState,
 } from "./schemas.ts";
 import { loadState, nextState, saveState } from "./state.ts";
 import {
@@ -71,6 +72,7 @@ async function build(services: SyncServices): Promise<Built> {
     config.youtubeOriginals === null
       ? []
       : ["--youtube-originals", resolve(projectDirectory, config.youtubeOriginals)];
+  const raw = config.raw === null ? [] : ["--raw", resolve(projectDirectory, config.raw)];
   const result = await runner.run({
     command: "python3",
     args: [
@@ -81,6 +83,9 @@ async function build(services: SyncServices): Promise<Built> {
       nextDirectory,
       ...config.roots.flatMap((root) => ["--root", resolve(projectDirectory, root)]),
       ...youtube,
+      ...raw,
+      "--keep",
+      join(projectDirectory, "data"),
     ],
     cwd: projectDirectory,
   });
@@ -93,13 +98,19 @@ async function build(services: SyncServices): Promise<Built> {
   return { config, catalog, nextDirectory };
 }
 
-async function measure(args: { services: SyncServices; built: Built }): Promise<Measured> {
+async function measure(args: {
+  services: SyncServices;
+  built: Built;
+  state: SyncState;
+}): Promise<Measured> {
   const { fs } = args.services;
   const { catalog, nextDirectory } = args.built;
   const perVideo = await Promise.all(
     catalog.videos.map(async (video) => ({
       id: video.id,
-      sources: await collectSources({ fs, video }),
+      sources: video.kept
+        ? (args.state.sources[video.id] ?? {})
+        : await collectSources({ fs, video }),
       sha: await fs.sha256(join(nextDirectory, `${video.id}.json`)),
     })),
   );
@@ -182,9 +193,9 @@ async function uploadMedia({ services, config, media, onUploaded }: MediaRequest
 export async function runSync({ options, services }: SyncRequest): Promise<void> {
   const { fs, runner, logger, projectDirectory } = services;
   const built = await build(services);
-  const measured = await measure({ services, built });
   const statePath = join(projectDirectory, STATE_FILE);
   const state = await loadState({ fs, path: statePath });
+  const measured = await measure({ services, built, state });
   const proxySizes = await localProxySizes({ services, videos: built.catalog.videos });
   const remoteSizes = await listRemoteSizes({
     runner,

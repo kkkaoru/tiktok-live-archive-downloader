@@ -6,6 +6,8 @@ export const configSchema = z.object({
   streamer: z.string().min(1),
   roots: z.array(z.string().min(1)).min(1),
   youtubeOriginals: z.string().min(1).nullable(),
+  // Downloads without a delivery yet, published raw and without captions.
+  raw: z.string().min(1).nullable().default(null),
   bucket: z.string().min(1),
   uploaderWorker: z.string().min(1),
 });
@@ -16,10 +18,13 @@ export const catalogSchema = z.object({
   videos: z.array(
     z.object({
       id: z.string().regex(/^[A-Za-z0-9._-]+$/),
-      movie: z.string().min(1),
-      localPath: z.string().min(1),
+      // Both null for a recording not edited yet: only its original is published.
+      movie: z.string().min(1).nullable(),
+      localPath: z.string().min(1).nullable(),
       transcriptPath: z.string().min(1),
       original: originalSchema.nullable(),
+      // Published before and no longer found locally: carried over without re-reading files.
+      kept: z.boolean().default(false),
     }),
   ),
 });

@@ -14,6 +14,7 @@ const video: CatalogVideo = {
   movie: "a-review.mp4",
   localPath: "/lib/rev/a-review.mp4",
   transcriptPath: "/lib/rev/delivery/a-review.srt",
+  kept: false,
   original: null,
 };
 
@@ -90,4 +91,22 @@ it("recognises media labels", () => {
   expect(isMediaLabel("movie")).toBe(true);
   expect(isMediaLabel("original")).toBe(true);
   expect(isMediaLabel("summary")).toBe(false);
+});
+
+it("collects no movie for a recording not edited yet", async () => {
+  const { fs } = createFakeFs({
+    "/next/raw.json": { size: 1, mtimeNs: 2n, sha: "d" },
+    "/dl/raw.mp4": { size: 300, mtimeNs: 4n },
+  });
+  const sources = await collectSources({
+    fs,
+    video: {
+      ...video,
+      movie: null,
+      localPath: null,
+      transcriptPath: "/next/raw.json",
+      original: { movie: "raw.mp4", localPath: "/dl/raw.mp4" },
+    },
+  });
+  expect(Object.keys(sources).sort()).toStrictEqual(["original", "transcript"]);
 });

@@ -32,6 +32,7 @@ interface ScenarioOptions {
   buildExitCode: number;
   partStatus: number;
   existing: FakeFsHandle | null;
+  kept: boolean;
 }
 
 function scenario(options: ScenarioOptions): Scenario {
@@ -52,6 +53,7 @@ function scenario(options: ScenarioOptions): Scenario {
         localPath: "/lib/a-review.mp4",
         transcriptPath: "/lib/a-review.srt",
         original: options.catalogOriginal,
+        kept: options.kept,
       },
     ],
   });
@@ -113,6 +115,7 @@ const base: ScenarioOptions = {
   buildExitCode: 0,
   partStatus: 200,
   existing: null,
+  kept: false,
 };
 
 const cfSteps = (runs: RunnerCall[]) =>
@@ -228,6 +231,27 @@ it("omits the YouTube originals option when none is configured", async () => {
   const { services, runs } = scenario({ ...base, existing: handle });
   await runSync({ options: { dryRun: true, dataOnly: false }, services });
   expect(runs[0]?.args.includes("--youtube-originals")).toBe(false);
+  expect(runs[0]?.args.includes("--raw")).toBe(false);
+});
+
+it("passes the raw downloads directory to the catalog build", async () => {
+  const handle = createFakeFs({
+    "/p/sync.config.json": {
+      text: JSON.stringify({
+        streamer: "s",
+        roots: ["r"],
+        youtubeOriginals: null,
+        raw: "../downloads",
+        bucket: "b",
+        uploaderWorker: "up",
+      }),
+    },
+    "/lib/a-review.mp4": {},
+    "/lib/a-review.srt": {},
+  });
+  const { services, runs } = scenario({ ...base, existing: handle });
+  await runSync({ options: { dryRun: true, dataOnly: false }, services });
+  expect(runs[0]?.args.slice(-4)).toStrictEqual(["--raw", "/downloads", "--keep", "/p/data"]);
 });
 
 it("adopts a proxied original when the existing proxy matches the bucket", async () => {
@@ -247,4 +271,20 @@ it("adopts a proxied original when the existing proxy matches the bucket", async
   await runSync({ options: { dryRun: true, dataOnly: false }, services });
   expect(logs.some((line) => line.includes("media-original"))).toBe(true);
   expect(runs.length).toBeGreaterThan(0);
+});
+
+it("carries a kept published video without reading its retired files", async () => {
+  const handle = createFakeFs({
+    "/p/sync.config.json": { text: CONFIG },
+    "/p/sync-state.json": {
+      text: JSON.stringify({
+        sources: { "a-review": { movie: { size: 100, mtimeNs: "5", sha256: null } } },
+        data: { "data/a-review.json": "d1" },
+        catalogSha256: "c1",
+      }),
+    },
+  });
+  const { services, logs } = scenario({ ...base, existing: handle, kept: true });
+  await runSync({ options: { dryRun: true, dataOnly: false }, services });
+  expect(logs).toStrictEqual(["changed: 0"]);
 });

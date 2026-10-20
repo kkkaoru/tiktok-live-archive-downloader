@@ -52,8 +52,9 @@ async function sourceEntries({ fs, video }: SourcesRequest): Promise<SourceEntry
     .filter((name) => name.startsWith(`${stem}.`) && name !== transcriptName)
     .map((name) => ({ label: `sibling:${name}`, path: join(directory, name), required: false }));
   const original = video.original === null ? [] : [video.original];
+  const movie = video.localPath === null ? [] : [video.localPath];
   return [
-    { label: "movie", path: video.localPath, required: true },
+    ...movie.map((path) => ({ label: "movie", path, required: true })),
     { label: "transcript", path: video.transcriptPath, required: true },
     ...original.map((item) => ({ label: "original", path: item.localPath, required: true })),
     {

@@ -67,15 +67,20 @@ export function settledKey(videoId: string, label: string): string {
 }
 
 function mediaCandidates(video: CatalogVideo): MediaCandidate[] {
-  const movie: MediaCandidate = {
-    video,
-    label: "movie",
-    key: `media/${video.movie}`,
-    path: video.localPath,
-    proxy: false,
-  };
+  const movie: MediaCandidate[] =
+    video.movie === null || video.localPath === null
+      ? []
+      : [
+          {
+            video,
+            label: "movie",
+            key: `media/${video.movie}`,
+            path: video.localPath,
+            proxy: false,
+          },
+        ];
   if (video.original === null) {
-    return [movie];
+    return movie;
   }
   const original: MediaCandidate = {
     video,
@@ -84,7 +89,7 @@ function mediaCandidates(video: CatalogVideo): MediaCandidate[] {
     path: video.original.localPath,
     proxy: video.original.localPath.toLowerCase().endsWith(MKV_SUFFIX),
   };
-  return [movie, original];
+  return [...movie, original];
 }
 
 function mediaReason({ previous, remote, current }: MediaReasonRequest): string {

@@ -18,10 +18,12 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+RAW = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_JST_replay-(\d+)\.mp4$")
 STAMP = re.compile(r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})_JST_")
 
 
@@ -31,6 +33,22 @@ def stamp_label(name):
         return None
     y, mo, d, h, mi, s = m.groups()
     return f"{y}-{mo}-{d} {h}:{mi}:{s} JST"
+
+
+SPEAKER = re.compile(r"\[([A-Za-z0-9_-]{1,40})\]\s*")
+
+
+def load_speakers(transcript_path):
+    """Display names and colours of a multi-speaker transcript (<transcript>.speakers.json)."""
+    p = transcript_path + ".speakers.json"
+    if not os.path.isfile(p):
+        return None
+    rec = json.loads(Path(p).read_text(encoding="utf-8"))
+    return {
+        str(k): {"label": str(v["label"]), "color": str(v["color"])}
+        for k, v in rec.get("speakers", {}).items()
+        if re.fullmatch(r"#[0-9A-Fa-f]{6}", str(v.get("color", "")))
+    } or None
 
 
 def parse_srt(text):
@@ -50,6 +68,8 @@ def parse_srt(text):
             h, m, s = clock.split(":")
             return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
+        text = "\n".join(lines[2:]).strip()
+        speaker = SPEAKER.match(text)  # "[name] text": a multi-speaker transcript names each cue
         cues.append(
             {
                 "id": len(cues),
@@ -57,7 +77,8 @@ def parse_srt(text):
                 "end": sec(end_label),
                 "startLabel": start_label,
                 "endLabel": end_label,
-                "text": "\n".join(lines[2:]).strip(),
+                **({"speaker": speaker.group(1)} if speaker else {}),
+                "text": text[speaker.end() :] if speaker else text,
             }
         )
     return cues
@@ -105,6 +126,21 @@ def load_summary(transcript_path):
         return None
 
 
+def load_excitement(transcript_path):
+    """Per-bin excitement scores written by `python -m replay.excitement`."""
+    p = transcript_path + ".excitement.json"
+    if not os.path.isfile(p):
+        return None
+    try:
+        rec = json.loads(Path(p).read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+    if rec.get("version") != 1:
+        return None
+    rec.pop("inputs", None)  # local fingerprints only
+    return rec
+
+
 def superseded(folder):
     out, d = {}, os.path.join(folder, "evidence", "superseded")
     if os.path.isdir(d):
@@ -137,7 +173,9 @@ def candidate_selection(folder, library):
     return target, transcript, True
 
 
-def canonical_deliveries(folder, name):
+def canonical_deliveries(folder, name, roots=()):
+    """A delivery movie may live at the same relative path below another root
+    (an offloaded movie beside a mirrored transcript)."""
     sup = superseded(folder)
     found = []
     for dirpath, dirnames, filenames in os.walk(folder):
@@ -149,15 +187,21 @@ def canonical_deliveries(folder, name):
         rel_parts = os.path.relpath(dirpath, folder).split(os.sep)
         if "delivery" not in rel_parts:
             continue
-        for f in filenames:
-            if not f.endswith(".mp4") or not STAMP.match(f):
+        stems = {f[:-4] for f in filenames if f.endswith((".mp4", ".srt", ".csv"))}
+        for stem in sorted(stems):
+            if not STAMP.match(stem) or not stem.endswith(f"_JST_{name}-review"):
                 continue
-            stem = f[:-4]
-            if not stem.endswith(f"_JST_{name}-review"):
-                continue
-            movie = os.path.join(dirpath, f)
-            rel = os.path.relpath(movie, folder)
-            if sup.get(rel) == os.path.getsize(movie):
+            rel = os.path.relpath(os.path.join(dirpath, stem + ".mp4"), folder)
+            movie = next(
+                (
+                    m
+                    for m in [os.path.join(folder, rel)]
+                    + [os.path.join(r, name, rel) for r in roots]
+                    if os.path.isfile(m)
+                ),
+                None,
+            )
+            if movie is not None and sup.get(rel) == os.path.getsize(movie):
                 continue
             tr = next(
                 (
@@ -217,6 +261,8 @@ def main():
     ap.add_argument("--no-duration", action="store_true")
     ap.add_argument("--streamer", required=True, help="streamer tag for every video in these roots")
     ap.add_argument("--youtube-originals", default=None)
+    ap.add_argument("--raw", default=None, help="downloads whose recording has no delivery yet")
+    ap.add_argument("--keep", default=None, help="published catalog dir: keep entries not found")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     videos, issues = [], []
@@ -231,7 +277,7 @@ def main():
                 if sel:
                     choices, unverified = [sel[:2]], True
                 else:
-                    choices, unverified = canonical_deliveries(folder, name), False
+                    choices, unverified = canonical_deliveries(folder, name, a.root), False
                 if not choices:
                     continue
                 if len(choices) > 1:  # prefer the one carrying saved summaries
@@ -242,24 +288,36 @@ def main():
                         issues.append(f"ambiguous: {name} ({len(choices)} deliveries)")
                         continue
                 movie, transcript = choices[0]
-                base = os.path.basename(movie)
+                base = (
+                    os.path.basename(movie) if movie else os.path.basename(transcript)[:-4] + ".mp4"
+                )
                 vid = base[:-4]
                 if vid in seen_ids:
                     continue
                 seen_ids.add(vid)
                 cues = load_cues(transcript)
                 data = {"id": vid, "cues": cues, "summary": load_summary(transcript)}
+                excite = load_excitement(transcript)
+                if excite:
+                    data["excitement"] = excite
+                speakers = load_speakers(transcript)
+                if speakers:
+                    data["speakers"] = speakers
                 with open(os.path.join(a.out, vid + ".json"), "w", encoding="utf-8") as fh:
                     json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
                 original = find_original(folder, name, a.youtube_originals, a.root)
+                if movie is None and not original:
+                    continue  # a transcript alone has nothing to play
                 videos.append(
                     {
                         "id": vid,
                         "streamer": a.streamer,
-                        "title": name + (" [未検証候補]" if unverified else ""),
+                        "title": name
+                        + (" [未検証候補]" if unverified else "")
+                        + ("" if movie else " [文字起こし先行・元動画]"),
                         "broadcastStartJST": stamp_label(base),
-                        "movie": base,
-                        "size": os.path.getsize(movie),
+                        "movie": base if movie else None,
+                        "size": os.path.getsize(movie or original),
                         # MKV originals are served as a generated H.264 MP4 proxy
                         # (same basename, .mp4); the uploader creates it from localPath.
                         "original": (
@@ -273,15 +331,64 @@ def main():
                             if original
                             else None
                         ),
-                        "duration": None if a.no_duration else duration(movie),
+                        "duration": None if a.no_duration else duration(movie or original),
                         "transcriptPath": os.path.abspath(transcript),
                         "cueCount": len(cues),
                         "hasSummary": data["summary"] is not None,
-                        "localPath": os.path.abspath(movie),
+                        "localPath": os.path.abspath(movie) if movie else None,
                     }
                 )
             except Exception as e:  # fail-closed per recording, like the native scan
                 issues.append(f"unreadable: {name} ({e})")
+    delivered = {v["title"].split(" ")[0] for v in videos}
+    if a.keep and os.path.isfile(os.path.join(a.keep, "catalog.json")):
+        # A published recording whose local files were retired stays published as it is.
+        published = json.loads(Path(a.keep, "catalog.json").read_text(encoding="utf-8"))
+        for video in published["videos"]:
+            folder = video["title"].split(" ")[0]
+            data_path = os.path.join(a.keep, video["id"] + ".json")
+            raw = video["movie"] is None  # rebuilt from the downloads below
+            if (
+                raw
+                or folder in delivered
+                or video["id"] in seen_ids
+                or not os.path.isfile(data_path)
+            ):
+                continue
+            shutil.copyfile(data_path, os.path.join(a.out, video["id"] + ".json"))
+            videos.append({**video, "kept": True})
+            delivered.add(folder)
+            issues.append(f"kept published: {folder} (local delivery not found)")
+    if a.raw:
+        for base in sorted(os.listdir(a.raw)):
+            match = RAW.match(base)
+            if not match or f"replay-{match.group(1)}" in delivered:
+                continue
+            movie, vid = os.path.join(a.raw, base), base[:-4]
+            data_path = os.path.join(a.out, vid + ".json")
+            with open(data_path, "w", encoding="utf-8") as fh:
+                json.dump({"id": vid, "cues": [], "summary": None}, fh, separators=(",", ":"))
+            # Only the original is published, at the key its edited delivery will reuse.
+            videos.append(
+                {
+                    "id": vid,
+                    "streamer": a.streamer,
+                    "title": f"replay-{match.group(1)} [未編集・字幕なし]",
+                    "broadcastStartJST": stamp_label(base),
+                    "movie": None,
+                    "size": os.path.getsize(movie),
+                    "original": {
+                        "movie": base,
+                        "size": os.path.getsize(movie),
+                        "localPath": os.path.abspath(movie),
+                    },
+                    "duration": None if a.no_duration else duration(movie),
+                    "transcriptPath": os.path.abspath(data_path),
+                    "cueCount": 0,
+                    "hasSummary": False,
+                    "localPath": None,
+                }
+            )
     videos.sort(key=lambda v: (v["broadcastStartJST"] or "", v["id"]), reverse=True)
     catalog = {"version": 1, "videos": videos, "issues": issues}
     with open(os.path.join(a.out, "catalog.json"), "w", encoding="utf-8") as fh:

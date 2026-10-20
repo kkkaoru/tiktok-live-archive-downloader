@@ -22,6 +22,7 @@ function input(overrides: Partial<PlanInput>): PlanInput {
         movie: "a-review.mp4",
         localPath: "/lib/a-review.mp4",
         transcriptPath: "/lib/a-review.srt",
+        kept: false,
         original: null,
       },
     ],
@@ -119,6 +120,7 @@ it("marks an MKV original for proxy conversion", () => {
     movie: "a-review.mp4",
     localPath: "/lib/a-review.mp4",
     transcriptPath: "/lib/a-review.srt",
+    kept: false,
     original: { movie: "orig.mp4", localPath: "/orig/orig.MKV" },
   };
   const current: Sources = { ...sources, original: fp(500, "5", null) };
@@ -163,6 +165,7 @@ it("treats a catalog original without a fingerprint as settled", () => {
     movie: "a-review.mp4",
     localPath: "/lib/a-review.mp4",
     transcriptPath: "/lib/a-review.srt",
+    kept: false,
     original: { movie: "orig.mp4", localPath: "/orig/orig.mp4" },
   };
   const plan = planChanges(input({ videos: [withOriginal] }));
@@ -176,6 +179,7 @@ it("adopts a proxied original when the bucket matches the local proxy size", () 
     movie: "a-review.mp4",
     localPath: "/lib/a-review.mp4",
     transcriptPath: "/lib/a-review.srt",
+    kept: false,
     original: { movie: "orig.mp4", localPath: "/orig/orig.mkv" },
   };
   const current: Sources = { ...sources, original: fp(900, "5", null) };
@@ -197,6 +201,7 @@ it("plans a proxied original when no local proxy exists to compare", () => {
     movie: "a-review.mp4",
     localPath: "/lib/a-review.mp4",
     transcriptPath: "/lib/a-review.srt",
+    kept: false,
     original: { movie: "orig.mp4", localPath: "/orig/orig.mkv" },
   };
   const current: Sources = { ...sources, original: fp(900, "5", null) };
@@ -209,6 +214,31 @@ it("plans a proxied original when no local proxy exists to compare", () => {
   );
   expect(plan.changes.map((change) => change.key)).toStrictEqual([
     "media-original/orig.mp4",
+    "catalog.json",
+  ]);
+});
+
+it("publishes only the original of a recording not edited yet", () => {
+  const plan = planChanges(
+    input({
+      videos: [
+        {
+          id: "raw",
+          movie: null,
+          localPath: null,
+          transcriptPath: "/next/raw.json",
+          kept: false,
+          original: { movie: "raw.mp4", localPath: "/dl/raw.mp4" },
+        },
+      ],
+      current: { raw: { original: fp(300, "1", null) } },
+      dataSha: { raw: "d2" },
+      state: EMPTY_STATE,
+    }),
+  );
+  expect(plan.changes.map((change) => change.key)).toStrictEqual([
+    "media-original/raw.mp4",
+    "data/raw.json",
     "catalog.json",
   ]);
 });
