@@ -320,28 +320,30 @@ def test_yolo_samples_are_the_box_centre_and_top_of_single_confident_faces(tmp_p
         {"frame": 120, "pts": 4860000, "face": [0.0, 1.0, 2.0, 3.0, 0.3], "faceCount": 1,
          "captions": 0},
     ]  # fmt: skip
-    found = job.load_yolo(track_file(tmp_path / "t.json", rows), rate=30, minimum_confidence=0.5)
+    found = job.load_yolo(track_file(tmp_path / "t.json", rows), minimum_confidence=0.5)
     assert found == [
         TrackingPosition(Fraction(0), 210.0, 810.0),
         TrackingPosition(Fraction(52), 200.0, 800.0),
     ]
 
 
-def test_a_track_of_another_protocol_or_rate_is_refused(tmp_path: Path) -> None:
+def test_a_track_of_another_protocol_is_refused(tmp_path: Path) -> None:
     other = tmp_path / "other.json"
     other.write_text(json.dumps({"protocol": "x", "provenance": "yolo"}), encoding="utf-8")
     with pytest.raises(ReplayError, match="Not a timestamped"):
-        job.load_yolo(other, rate=30, minimum_confidence=0.5)
+        job.load_yolo(other, minimum_confidence=0.5)
     untimed = tmp_path / "v1.json"
     untimed.write_text(
         json.dumps({"protocol": "yolo-face-caption-track-v1", "provenance": "yolo"}),
         encoding="utf-8",
     )
     with pytest.raises(ReplayError, match="Not a timestamped"):
-        job.load_yolo(untimed, rate=30, minimum_confidence=0.5)
+        job.load_yolo(untimed, minimum_confidence=0.5)
+
+
+def test_a_track_of_a_source_at_another_rate_is_read_by_its_timestamps(tmp_path: Path) -> None:
     slow = track_file(tmp_path / "slow.json", [], rate=24)
-    with pytest.raises(ReplayError, match="different frame rate"):
-        job.load_yolo(slow, rate=30, minimum_confidence=0.5)
+    assert job.load_yolo(slow, minimum_confidence=0.5) == []
 
 
 def test_yolo_fills_only_the_gaps_between_vision_samples() -> None:

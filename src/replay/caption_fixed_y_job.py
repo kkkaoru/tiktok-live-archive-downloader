@@ -188,19 +188,18 @@ def load_observed(window_index: Path) -> list[TrackingPosition]:
     return observed_only(samples)
 
 
-def load_yolo(track: Path, *, rate: int, minimum_confidence: float) -> list[TrackingPosition]:
+def load_yolo(track: Path, *, minimum_confidence: float) -> list[TrackingPosition]:
     """Face-top samples from a `yolo_track` evidence file; frames with 0 or 2+ faces are skipped.
 
     A frame with several faces is ambiguous, exactly as Vision's ambiguous frames are, and is not
     guessed. The sample time is the frame's presentation timestamp (v2 tracks); v1 tracks derived
     time from the frame index and drift on variable-frame-rate sources, so they are refused. The
-    sample position is the face box's horizontal centre and its top edge.
+    source's nominal rate is therefore irrelevant (it need not equal the output rate). The sample
+    position is the face box's horizontal centre and its top edge.
     """
     data = json.loads(track.read_text(encoding="utf-8"))
     if data.get("protocol") != "yolo-face-caption-track-v2" or data.get("provenance") != "yolo":
         raise ReplayError("Not a timestamped (v2) YOLO face track")
-    if data.get("rate") != rate:
-        raise ReplayError("The YOLO track was made at a different frame rate")
     base = Fraction(str(data["timeBase"]))
     samples: list[TrackingPosition] = []
     for row in data["frames"]:
@@ -336,9 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.yolo_track is None:
         observed = vision
     else:
-        yolo = load_yolo(
-            args.yolo_track, rate=args.rate, minimum_confidence=args.yolo_minimum_confidence
-        )
+        yolo = load_yolo(args.yolo_track, minimum_confidence=args.yolo_minimum_confidence)
         observed = merge_observed(vision, yolo, gap=args.yolo_gap_seconds)
     print(json.dumps(run_plan(args, observed)))
     return 0
