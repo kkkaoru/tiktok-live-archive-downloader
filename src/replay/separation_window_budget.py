@@ -344,7 +344,7 @@ def load_array(path: Path, *, samples: int) -> NDArray[np.float32]:
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
         require(
-            (opened.st_dev, opened.st_ino) == (before["device"], before["inode"]),
+            (opened.st_dev, opened.st_ino) == (path.lstat().st_dev, before["inode"]),
             "Array replaced before read",
         )
         loaded: object = np.load(stream, allow_pickle=False)
