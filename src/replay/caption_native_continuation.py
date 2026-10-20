@@ -223,6 +223,8 @@ def prepare(config: Path, output: Path) -> Path:
             "--long-executable",
             str(paths["longExecutable"]),
             "--collect-layout-failures",
+            # The recording pipeline's Motion captions are never scaled: page instead.
+            "--split-wide",
         ]
         + options
     )

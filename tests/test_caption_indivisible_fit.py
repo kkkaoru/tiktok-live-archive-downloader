@@ -253,3 +253,40 @@ def test_vowel_chain_finds_real_base_without_crossing_owner() -> None:
         SpokenToken("ぉ" * 20, 0.2, 0.3, "b"),
     )
     assert [token.text for token in _lexical_tokens(tokens, word_mark_gap=0.25)] == ["こ", "ぉ"]
+
+
+def test_a_fine_katakana_name_too_wide_for_one_line_is_split_before_scaling() -> None:
+    tokens = tuple(
+        SpokenToken(text, index * 0.2, (index + 1) * 0.2, "u")
+        for index, text in enumerate(("マル", "コ", "フォー", "ド"))
+    )
+    cues, hidden, widened = paged_cues(tokens, layout=Measurements(), rate=30, duration=Fraction(2))
+    assert hidden == widened == 0
+    assert [(type(cue).__name__, cue.text) for cue in cues] == [("CaptionCue", "マルコ\nフォード")]
+
+
+def test_a_word_no_layout_fits_is_paged_at_full_size_when_scaling_is_off() -> None:
+    tokens = tuple(
+        SpokenToken(text, index * 0.4, (index + 1) * 0.4, "u")
+        for index, text in enumerate("こぉぉぉぉぉぉぉぉぉぉ")
+    )
+    cues, hidden, widened = paged_cues(
+        tokens, layout=Measurements(), rate=30, duration=Fraction(5), split_wide=True
+    )
+    assert hidden == widened == 0
+    assert [(cue.text, round(cue.start, 4), round(cue.end, 4)) for cue in cues] == [
+        ("こぉぉぉぉ", 0.0, 2.0364),
+        ("ぉぉぉぉぉ", 2.0364, 4.0727),
+        ("ぉ", 4.0727, 4.48),
+    ]
+    assert not any(isinstance(cue, ScaledCaptionCue) for cue in cues)
+
+
+class Narrow(Measurements):
+    width = 10.0
+
+
+def test_paging_refuses_a_region_narrower_than_one_grapheme() -> None:
+    fit = IndivisibleFit((), layout=Narrow(), maximum_height=None)
+    with pytest.raises(CaptionLayoutError, match="No grapheme fits"):
+        fit.pages("ラオ")

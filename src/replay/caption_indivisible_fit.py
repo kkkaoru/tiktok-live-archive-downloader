@@ -6,6 +6,8 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from fractions import Fraction
 
+import regex
+
 from replay import caption_linguistics
 from replay.caption_anchor_fit import anchored_groups, fit_group
 from replay.caption_measure_cache import CaptionMeasurer
@@ -74,26 +76,67 @@ class IndivisibleFit:
     def wrap_scoped(self, text: str, context: tuple[SpokenToken, ...]) -> str:
         return self._wrap(text, context)
 
-    def _wrap(self, text: str, context: tuple[SpokenToken, ...] | None) -> str:
-        def bounds(value: str) -> tuple[float, float]:
-            if self.maximum_height is not None:
-                return self.layout.measure(value)
-            lines = value.split("\n")
-            return max(self.layout.measure(line)[0] for line in lines), float(len(lines))
+    def _bounds(self, value: str) -> tuple[float, float]:
+        if self.maximum_height is not None:
+            return self.layout.measure(value)
+        lines = value.split("\n")
+        return max(self.layout.measure(line)[0] for line in lines), float(len(lines))
 
+    def _phrase_lines(self, text: str) -> str:
+        return caption_linguistics.wrap_measured_lines(
+            text,
+            measure=self._bounds,
+            width=self.layout.width,
+            height=MAX_CAPTION_LINES if self.maximum_height is None else self.maximum_height,
+            maximum_lines=MAX_CAPTION_LINES,
+            prepare_lines=self.layout.prepare_lines,
+        )
+
+    def _split_word(self, text: str) -> str:
+        return caption_linguistics.wrap_split_word(
+            text,
+            measure=self._bounds,
+            width=self.layout.width,
+            height=MAX_CAPTION_LINES if self.maximum_height is None else self.maximum_height,
+            prepare_lines=self.layout.prepare_lines,
+        )
+
+    def pages(self, text: str) -> tuple[str, ...]:
+        """Full-size pages of a text too wide for one page, in reading order.
+
+        For renderers that cannot scale a caption: each page is the longest remaining prefix
+        (at a grapheme end) that still fits the line limit at the style's size.
+        """
+        rest, result = text.replace("\n", ""), []
+        while rest:
+            ends = sorted((match.end() for match in regex.finditer(r"\X", rest)), reverse=True)
+            for end in ends:
+                try:
+                    page = self._phrase_lines(rest[:end])
+                except caption_linguistics.CaptionLayoutError:
+                    try:
+                        page = self._split_word(rest[:end])
+                    except caption_linguistics.CaptionLayoutError:
+                        continue
+                result.append(page)
+                rest = rest[end:]
+                break
+            else:
+                raise caption_linguistics.CaptionLayoutError("No grapheme fits the caption region")
+        return tuple(result)
+
+    def _wrap(self, text: str, context: tuple[SpokenToken, ...] | None) -> str:
         try:
-            return caption_linguistics.wrap_measured_lines(
-                text,
-                measure=bounds,
-                width=self.layout.width,
-                height=MAX_CAPTION_LINES if self.maximum_height is None else self.maximum_height,
-                maximum_lines=MAX_CAPTION_LINES,
-                prepare_lines=self.layout.prepare_lines,
-            )
+            return self._phrase_lines(text)
         except caption_linguistics.CaptionLayoutError:
             occurrence = self._occurrence(text, context)
             if occurrence is None:
                 raise
+        # Splitting the word keeps the style's size; scaling is the fallback when no split fits.
+        try:
+            return self._split_word(text)
+        except caption_linguistics.CaptionLayoutError:
+            pass
         if occurrence.anchored:
             rendered, evidence = fit_group(
                 text,

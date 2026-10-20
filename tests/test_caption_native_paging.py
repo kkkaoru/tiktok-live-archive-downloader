@@ -387,7 +387,12 @@ def test_collect_planning_failures_preserves_success_and_rejects_unrelated_error
     calls = 0
 
     def planned(
-        tokens: tuple[SpokenToken, ...], *, layout: CaptionMeasurer, rate: int, duration: Fraction
+        tokens: tuple[SpokenToken, ...],
+        *,
+        layout: CaptionMeasurer,
+        rate: int,
+        duration: Fraction,
+        split_wide: bool,
     ) -> tuple[tuple[CaptionCue, ...], int, int]:
         nonlocal calls
         calls += 1
@@ -586,3 +591,17 @@ def test_resume_preserves_old_producer_bytes_but_requires_current_joint_dependen
     assert manifest.read_bytes() == original_manifest
     assert archive.read_bytes() == b"old producer"
     assert not result.exists()
+
+
+def test_sustained_token_display_is_capped_and_recorded(exact: NativeCaptionLayout) -> None:
+    tokens = (SpokenToken("ある", 0.5, 4.3, "u"), SpokenToken("よ", 4.3, 4.5, "u"))
+    limited, rows = paging.limit_durations(tokens)
+    assert limited[0].start == 0.5 and limited[0].end < 0.5 + 2.8
+    assert limited[1] == tokens[1]
+    assert rows == [{"clipped": {"text": "ある", "start": 0.5, "end": 4.3, "utterance": "u"},
+                     "into": {"text": "ある", "start": 0.5, "end": limited[0].end,
+                              "utterance": "u"}}]  # fmt: skip
+    with pytest.raises(ValueError, match="too coarse"):
+        paging.paged_cues(tokens, layout=exact, rate=30, duration=Fraction(5))
+    cues, _, _ = paging.paged_cues(limited, layout=exact, rate=30, duration=Fraction(5))
+    assert "".join(cue.text for cue in cues).replace("\n", "") == "あるよ"

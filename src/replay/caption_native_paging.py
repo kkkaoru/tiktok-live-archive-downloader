@@ -45,6 +45,7 @@ from replay.caption_timing import (
 )
 from replay.caption_token_sources import TokenSource, load_sources
 from replay.core import ReplayError
+from replay.delivery_captions import CLOCK_EPSILON
 from replay.fcp_measured import _boundary_hold, drop_retained_hidden_prefixes, ensure_display_frames
 from replay.foreground_evidence import _bound_bytes
 from replay.motion_stages import _integer
@@ -90,6 +91,27 @@ def read_tokens(
     return tuple(result), pins
 
 
+def limit_durations(
+    tokens: tuple[SpokenToken, ...],
+) -> tuple[tuple[SpokenToken, ...], list[dict[str, object]]]:
+    """Cap a sustained or pause-spanning token's display at the focused-timing limit.
+
+    The onset and text are kept; only how long the token keeps its caption visible is shortened,
+    and every change is recorded (as ``delivery_captions.limit_token_durations`` does).
+    """
+    maximum = CaptionPolicy().maximum_context_seconds - CLOCK_EPSILON
+    limited = tuple(
+        replace(token, end=token.start + maximum) if token.end - token.start > maximum else token
+        for token in tokens
+    )
+    rows: list[dict[str, object]] = [
+        {"clipped": asdict(old), "into": asdict(new)}
+        for old, new in zip(tokens, limited, strict=True)
+        if old != new
+    ]
+    return limited, rows
+
+
 def paged_cues(
     tokens: tuple[SpokenToken, ...],
     *,
@@ -97,8 +119,14 @@ def paged_cues(
     rate: int,
     duration: Fraction,
     maximum_height: float | None = None,
+    split_wide: bool = False,
 ) -> tuple[tuple[CaptionCue, ...], int, int]:
-    """Use the same recognized onsets and phrase-aware reset/hold/frame policy."""
+    """Use the same recognized onsets and phrase-aware reset/hold/frame policy.
+
+    ``split_wide`` replaces a scaled caption (no full-size layout fits) with consecutive
+    full-size pages sharing its display time in proportion to their length, for renderers
+    that draw every caption at the style's size.
+    """
     if layout.expected_point_size is None:
         raise ReplayError("Paging requires an explicit Motion point size")
     if maximum_height is not None and (
@@ -132,6 +160,16 @@ def paged_cues(
         else cue
         for cue in raw
     )
+    if split_wide:
+        raw = tuple(
+            page
+            for cue in raw
+            for page in (
+                split_pages(cue, fit.pages(cue.text))
+                if isinstance(cue, ScaledCaptionCue)
+                else (cue,)
+            )
+        )
     positioned = [
         PositionedCue(replace(cue, end=min(cue.end, float(duration))), 540, 0) for cue in raw
     ]
@@ -143,6 +181,17 @@ def paged_cues(
     ):
         raise ReplayError("Paged caption has no retained display support")
     return tuple(item.cue for item in positioned), hidden, widened
+
+
+def split_pages(cue: CaptionCue, pages: tuple[str, ...]) -> tuple[CaptionCue, ...]:
+    """Consecutive pages over the cue's display time, each lasting in proportion to its length."""
+    total = sum(len(page.replace("\n", "")) for page in pages)
+    span, done, result = cue.end - cue.start, 0, []
+    for page in pages:
+        start = cue.start + span * done / total
+        done += len(page.replace("\n", ""))
+        result.append(CaptionCue(page, start, cue.start + span * done / total))
+    return tuple(result)
 
 
 def assemble(parts: tuple[dict[str, object], ...], *, rate: int) -> list[dict[str, object]]:
@@ -224,6 +273,7 @@ def run(
     cache_segments: tuple[int, ...] = (),
     collect_layout_failures: bool = False,
     long_executable: Path | None = None,
+    split_wide: bool = False,
 ) -> Path:
     if type(collect_layout_failures) is not bool:
         raise ReplayError("Layout failure collection must be boolean")
@@ -368,9 +418,10 @@ def run(
                 and (not cache_segments or number in cache_segments)
                 else native
             )
+            limited, clipped = limit_durations(tokens)
             try:
                 cues, hidden, widened = paged_cues(
-                    tokens, layout=layout, rate=rate, duration=duration
+                    limited, layout=layout, rate=rate, duration=duration, split_wide=split_wide
                 )
             except ValueError as error:
                 if not collect_layout_failures or not str(error).startswith(
@@ -429,6 +480,7 @@ def run(
                 "coverage": {"start": float(offset), "end": float(offset + duration)},
                 "hiddenRetainedPrefixes": hidden,
                 "frameVisibilityExtensions": widened,
+                "durationLimitedTokens": clipped,
                 "recognizedTokens": len(tokens),
                 "measurementCache": str(measurement_cache.resolve())
                 if tokens
@@ -585,6 +637,7 @@ def main() -> None:
     parser.add_argument("--long-executable", type=Path)
     parser.add_argument("--measurement-cache-segment", type=int, action="append", default=[])
     parser.add_argument("--collect-layout-failures", action="store_true")
+    parser.add_argument("--split-wide", action="store_true", help="page instead of scaling")
     parser.add_argument("--audit-support-only", action="store_true")
     parser.add_argument(
         "--resume-producer-evidence", type=Path, nargs=2, action="append", default=[]
@@ -615,6 +668,7 @@ def main() -> None:
         cache_segments=tuple(args.measurement_cache_segment),
         collect_layout_failures=args.collect_layout_failures,
         long_executable=args.long_executable,
+        split_wide=args.split_wide,
     )
 
 
