@@ -35,6 +35,7 @@ from replay.separation_pipeline_prepare import (
     load_config,
 )
 from replay.separation_window_budget import (
+    DEVICES,
     WindowBudget,
     _integer,
     _references,
@@ -161,7 +162,8 @@ def _environment(value: object) -> dict[str, str]:
 def _template(path: Path, config: Preparation) -> tuple[dict[str, object], Path, PipelineBudget]:
     data = read(path)
     require(
-        set(data) == TEMPLATE_FIELDS
+        set(data) in (TEMPLATE_FIELDS, TEMPLATE_FIELDS | {"device"})
+        and data.get("device", "cpu") in DEVICES
         and type(data.get("version")) is int
         and data.get("version") == 1
         and data.get("kind") == "separation-window-pipeline"

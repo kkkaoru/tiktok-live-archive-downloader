@@ -12,6 +12,7 @@ import hashlib
 import math
 import os
 import resource
+import shutil
 import subprocess
 import sys
 import time
@@ -49,6 +50,7 @@ from replay.recordings import record
 from replay.separation_forward_probe import _local_environment
 from replay.separation_window_budget import (
     ARRAY_HEADER_ALLOWANCE_BYTES,
+    DEVICES,
     METADATA_ALLOWANCE_BYTES,
     Execute,
     ProbePlan,
@@ -111,6 +113,7 @@ class PipelinePlan:
     bounds: tuple[tuple[int, int], ...]
     budget: PipelineBudget
     definition: dict[str, object]
+    device: str = "cpu"
 
 
 def pcm_info(path: Path) -> int:
@@ -147,23 +150,25 @@ def read_chunk(path: Path, *, start: int, count: int) -> NDArray[np.float32]:
 def load_plan(path: Path) -> PipelinePlan:
     path = canonical(str(path))
     data = read(path)
+    fields = {
+        "version",
+        "kind",
+        "source",
+        "outputDirectory",
+        "budget",
+        "codeInputs",
+        "providerInputs",
+        "modelInputs",
+        "chunkSamples",
+        "overlapSamples",
+        "sampleRate",
+        "qualityApproved",
+        "productionBackendAdopted",
+    }
+    device = data.get("device", "cpu")
     require(
-        set(data)
-        == {
-            "version",
-            "kind",
-            "source",
-            "outputDirectory",
-            "budget",
-            "codeInputs",
-            "providerInputs",
-            "modelInputs",
-            "chunkSamples",
-            "overlapSamples",
-            "sampleRate",
-            "qualityApproved",
-            "productionBackendAdopted",
-        }
+        set(data) in (fields, fields | {"device"})
+        and device in DEVICES
         and type(data.get("version")) is int
         and data.get("version") == 1
         and data.get("kind") == "separation-window-pipeline"
@@ -230,7 +235,7 @@ def load_plan(path: Path) -> PipelinePlan:
         <= selected.max_saved_bytes,
         "Pipeline retained-byte budget insufficient",
     )
-    return PipelinePlan(path, source, directory, samples, bounds, budget, data)
+    return PipelinePlan(path, source, directory, samples, bounds, budget, data, str(device))
 
 
 def estimated_pipeline_bytes(bounds: tuple[tuple[int, int], ...], samples: int) -> int:
@@ -306,7 +311,7 @@ def chunk_definition(
 
 
 def verify_chunk(
-    plan: PipelinePlan, *, index: int, bound: dict[str, object]
+    plan: PipelinePlan, *, index: int, bound: dict[str, object], device: str = "cpu"
 ) -> NDArray[np.float32]:
     proxy = chunk_proxy(plan, index)
     start, end = plan.bounds[index]
@@ -320,7 +325,7 @@ def verify_chunk(
     before = [pin(path) for path in outputs]
     checkpoint = read(proxy.directory / "complete.json")
     require(checkpoint == {"outputs": before, "qualityApproved": False}, "Chunk checkpoint changed")
-    reduced = _verify_pool(proxy, "parallel", audio)
+    reduced = _verify_pool(proxy, "parallel", audio, device)
     saved = load_array(proxy.directory / "vocals.npy", samples=end - start)
     require(
         np.array_equal(reduced, saved) and [pin(path) for path in outputs] == before,
@@ -330,11 +335,17 @@ def verify_chunk(
 
 
 def run_chunk(
-    plan: PipelinePlan, *, index: int, bound: dict[str, object], execute: Execute, resume: bool
+    plan: PipelinePlan,
+    *,
+    index: int,
+    bound: dict[str, object],
+    execute: Execute,
+    resume: bool,
+    device: str = "cpu",
 ) -> None:
     proxy = chunk_proxy(plan, index)
     if (proxy.directory / "complete.json").exists():
-        verify_chunk(plan, index=index, bound=bound)
+        verify_chunk(plan, index=index, bound=bound, device=device)
         return
     start, end = plan.bounds[index]
     audio = read_chunk(plan.source, start=start, count=end - start)
@@ -344,11 +355,18 @@ def run_chunk(
             resume and read(proxy.directory / "input.json") == definition,
             "Unknown partial chunk; explicit matching resume required",
         )
+        # An interruption leaves worker attempts that refuse a rerun; the chunk has no accepted
+        # output yet, so its window pool is redone (the workflow stage lock excludes live owners).
+        shutil.rmtree(proxy.directory / "parallel", ignore_errors=True)
     else:
         proxy.directory.mkdir(mode=0o700, parents=True)
         durable(proxy.directory / "input.json", definition)
     reduced = run_windows(
-        audio, proxy.directory / "parallel", budget=plan.budget.window, execute=execute
+        audio,
+        proxy.directory / "parallel",
+        budget=plan.budget.window,
+        execute=execute,
+        device=device,
     )
     destination = proxy.directory / "vocals.npy"
     if destination.exists():
@@ -365,7 +383,7 @@ def run_chunk(
     )
     # Verification reconstructs the reduction. Do not retain a second full pair.
     del audio, reduced
-    verify_chunk(plan, index=index, bound=bound)
+    verify_chunk(plan, index=index, bound=bound, device=device)
 
 
 def pcm_blocks(
@@ -483,7 +501,9 @@ def verify(plan_path: Path) -> None:
             plan.bounds,
             samples=plan.samples,
             overlap=OVERLAP,
-            prediction=lambda index: verify_chunk(plan, index=index, bound=bound),
+            prediction=lambda index: verify_chunk(
+                plan, index=index, bound=bound, device=plan.device
+            ),
         ):
             require(
                 audio.readframes(len(expected) // 4) == expected,
@@ -518,7 +538,9 @@ def run(plan_path: Path, *, resume: bool = False, execute: Execute = execute_chi
             return plan.directory / "result.json"
         for index in range(len(plan.bounds)):
             check_budget(plan, started)
-            run_chunk(plan, index=index, bound=bound, execute=execute, resume=resume)
+            run_chunk(
+                plan, index=index, bound=bound, execute=execute, resume=resume, device=plan.device
+            )
             check_budget(plan, started)
         destination = plan.directory / "vocals.wav"
         partial = plan.directory / "vocals.assembling.wav"
@@ -551,7 +573,7 @@ def run(plan_path: Path, *, resume: bool = False, execute: Execute = execute_chi
                 "source": str(plan.source),
                 "gainDB": 0.0,
                 "preparedInput": True,
-                "device": "cpu",
+                "device": plan.device,
                 "modelInput": str(plan.source),
                 "vocals": str(destination),
                 "separation": repr(result),

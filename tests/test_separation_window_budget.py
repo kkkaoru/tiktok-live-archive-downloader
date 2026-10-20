@@ -1,6 +1,7 @@
 """Synthetic independent windows, complete-only reuse, and owned child guards."""
 
 import importlib.metadata
+import json
 import subprocess
 import time
 from contextlib import AbstractContextManager, nullcontext
@@ -908,3 +909,24 @@ def test_successful_silent_child_has_bindable_log(
     log = directory / "worker.log"
     assert log.read_bytes() == b"WINDOW_WORKER reserved\n"
     assert pin(log)["bytes"] == 23
+
+
+def test_a_cpu_worker_runs_directly(tmp_path: Path) -> None:
+    (tmp_path / "request.json").write_text(json.dumps({"device": "cpu"}), encoding="utf-8")
+    command = window.worker_command(tmp_path)
+    assert command[1:] == ["-B", "-m", "replay.separation_window_budget", "--worker", str(tmp_path)]
+    assert not (tmp_path / "write-sandbox.sb").exists()
+
+
+def test_an_accelerator_worker_runs_in_a_checkout_only_write_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "request.json").write_text(json.dumps({"device": "mps"}), encoding="utf-8")
+    command = window.worker_command(tmp_path)
+    profile = tmp_path / "write-sandbox.sb"
+    assert command[:3] == ["/usr/bin/sandbox-exec", "-f", str(profile)]
+    assert command[-2:] == ["--worker", str(tmp_path)]
+    assert f'(allow file-write* (subpath "{tmp_path.resolve()}")' in profile.read_text(
+        encoding="utf-8"
+    )

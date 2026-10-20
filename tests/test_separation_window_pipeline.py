@@ -254,6 +254,29 @@ def test_resume_after_complete_first_chunk_never_repeats(
     assert (work / "pipeline/chunks/chunk-000000/complete.json").read_bytes() == first
 
 
+def test_resume_redoes_a_chunk_whose_workers_were_interrupted(
+    plan: Path, setup: tuple[Path, window.Execute]
+) -> None:
+    work, execute = setup
+    calls = 0
+
+    def stop_second(
+        directories: tuple[Path, ...], budget: window.WindowBudget
+    ) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            for directory in directories:
+                (directory / "attempt.json").write_text("{}", encoding="utf-8")
+            raise ReplayError("synthetic interruption after reserving workers")
+        return execute(directories, budget)
+
+    with pytest.raises(ReplayError, match="interruption"):
+        pipeline.run(plan, execute=stop_second)
+    receipt = pipeline.run(plan, resume=True, execute=execute)
+    assert read(receipt)["outputSampleCount"] == 31 * MODEL_SAMPLE_RATE
+
+
 @pytest.mark.parametrize(
     "leaf",
     [
@@ -477,3 +500,34 @@ def test_comparison_cli_routes(plan: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert pipeline.main([*arguments, "--verify"]) == 0
     assert pipeline.main([*arguments, "--resume"]) == 1
     assert calls == [False, True]
+
+
+def test_a_gpu_plan_runs_verifies_and_resumes_on_its_declared_device(
+    plan: Path, setup: tuple[Path, window.Execute]
+) -> None:
+    work, execute = setup
+    data = read(plan)
+    data["device"] = "mps"
+    replace_json(plan, data)
+    receipt = pipeline.run(plan, execute=execute)
+    assert read(receipt)["device"] == "mps"
+    requests = sorted((work / "pipeline").rglob("request.json"))
+    assert requests
+    assert {read(path)["device"] for path in requests} == {"mps"}
+    pipeline.verify(plan)
+    assert (
+        pipeline.run(plan, resume=True, execute=lambda *args: pytest.fail("repeated inference"))
+        == receipt
+    )
+
+
+def test_a_plan_without_a_device_stays_on_the_cpu(plan: Path) -> None:
+    assert pipeline.load_plan(plan).device == "cpu"
+
+
+def test_an_unknown_device_is_refused(plan: Path) -> None:
+    data = read(plan)
+    data["device"] = "cuda"
+    replace_json(plan, data)
+    with pytest.raises(ReplayError, match="Unsupported pipeline plan"):
+        pipeline.load_plan(plan)

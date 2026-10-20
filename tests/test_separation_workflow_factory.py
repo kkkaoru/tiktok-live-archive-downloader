@@ -458,3 +458,23 @@ def test_generation_input_change_is_rejected(
     with pytest.raises(ReplayError, match="inputs changed during generation"):
         factory.prepare(files.request, files.directory / "workflow.json")
     assert not (files.directory / "workflow.json").exists()
+
+
+def _set_template(files: Fixture, field: str, value: object) -> None:
+    data = read(files.template)
+    data[field] = value
+    files.template.write_text(json.dumps(data), encoding="utf-8")
+    request = read(files.request)
+    record(request["template"])["sha256"] = file_digest(files.template)
+    files.request.write_text(json.dumps(request), encoding="utf-8")
+
+
+def test_a_gpu_template_is_accepted(files: Fixture) -> None:
+    _set_template(files, "device", "mps")
+    assert factory.prepare(files.request, files.directory / "workflow.json").is_file()
+
+
+def test_an_unknown_template_device_is_refused(files: Fixture) -> None:
+    _set_template(files, "device", "cuda")
+    with pytest.raises(ReplayError, match="Unsupported original pipeline template"):
+        factory.prepare(files.request, files.directory / "workflow.json")
