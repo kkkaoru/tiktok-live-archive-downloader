@@ -22,4 +22,12 @@ struct AppSceneTests {
         #expect(try second.inspect().find(button: "新しい順にすべて要約").isDisabled())
         #expect(try second.inspect().find(text: "ライブラリ: 未選択").string() == "ライブラリ: 未選択")
     }
+
+    @Test func bgmIsASeparateWindowOpenedFromTheToolbar() throws {
+        let app = TranscriptViewerApp()
+        #expect(app.makeBGMView().model.tracks.isEmpty)
+        #expect(String(reflecting: type(of: app.body)).contains("Window<"))
+        let root = app.makeRootView()
+        try root.inspect().find(button: "BGM").tap()
+    }
 }

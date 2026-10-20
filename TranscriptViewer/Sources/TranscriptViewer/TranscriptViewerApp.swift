@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct TranscriptViewerApp: App {
     @State private var session: PlaybackSession
+    @State private var bgm = BGMLibraryModel()
 
     init() {
         self.init(arguments: Array(CommandLine.arguments.dropFirst()))
@@ -16,6 +17,13 @@ struct TranscriptViewerApp: App {
         WindowGroup(makeContent: makeWindowContent)
             .windowResizability(.contentMinSize)
             .defaultSize(width: 1200, height: 800)
+        // BGM is a separate library and window, not part of the replay catalog.
+        Window("BGM", id: BGMLibraryView.windowID, content: makeBGMView)
+            .defaultSize(width: 1000, height: 700)
+    }
+
+    func makeBGMView() -> BGMLibraryView {
+        BGMLibraryView(model: bgm)
     }
 
     func makeRootView() -> TranscriptRootView {

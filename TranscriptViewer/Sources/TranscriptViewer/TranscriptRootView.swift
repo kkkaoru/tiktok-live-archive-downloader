@@ -61,6 +61,7 @@ struct PlayerSurface: NSViewRepresentable {
 
 struct TranscriptRootView: View {
     @Bindable var session: PlaybackSession
+    @Environment(\.openWindow) private var openWindow
     var directoryPanel: () -> NSOpenPanel = { NSOpenPanel() }
     var revealInFinder: (URL) -> Void = { NSWorkspace.shared.activateFileViewerSelecting([$0]) }
 
@@ -158,6 +159,13 @@ struct TranscriptRootView: View {
                 .keyboardShortcut("f", modifiers: [.command])
                 .accessibilityLabel("検索画面を開く")
                 .accessibilityHint("字幕を検索して発話の先頭から再生します")
+                Button("BGM") {
+                    openWindow(id: BGMLibraryView.windowID)
+                }
+                .frame(minHeight: Chrome.hit)
+                .keyboardShortcut("b", modifiers: [.command])
+                .accessibilityLabel("BGMライブラリを開く")
+                .accessibilityHint("保存したBGMを検索して再生します")
             }
             .navigationSplitViewColumnWidth(min: 420, ideal: 580, max: 750)
         } detail: {
