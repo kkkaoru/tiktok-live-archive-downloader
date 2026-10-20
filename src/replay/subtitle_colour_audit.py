@@ -11,13 +11,15 @@ from pathlib import Path
 
 import numpy as np
 
-from replay.subtitle_colour_residual import unchanged_pink
-from replay.subtitle_colour_support import Box, box_mask, pink
+from replay.subtitle_colour_residual import SCENE_KERNEL, unchanged_pink
+from replay.subtitle_colour_support import BOX_MARGIN, Box, box_mask, pink
 from replay.subtitle_inpaint import Image
 
 CHANNELS = 3
 MINIMUM_CAPTION_PINK = 40
 PROCESS_SECONDS = 1800
+# Rows around a box that a count reads: the box margin plus the scene-object opening's reach.
+REACH = BOX_MARGIN + SCENE_KERNEL + 1
 
 
 def _selector(indices: Sequence[int]) -> str:
@@ -38,16 +40,32 @@ def _selector(indices: Sequence[int]) -> str:
     return "+".join(terms)
 
 
+def crop_origin(top: int) -> int:
+    """First row an ffmpeg crop of 4:2:0 video really starts at (odd rows round down)."""
+    return top - top % 2
+
+
 def _frames(
-    ffmpeg: str, video: Path, start: float, indices: Sequence[int], size: tuple[int, int]
+    ffmpeg: str,
+    video: Path,
+    start: float,
+    indices: Sequence[int],
+    size: tuple[int, int],
+    band: tuple[int, int] | None = None,
 ) -> Iterator[Image]:
-    """Yield the requested decode-order frames (ascending, unique) as BGR arrays."""
+    """Yield the requested decode-order frames (ascending, unique) as BGR arrays.
+
+    With ``band`` (top, height) only those rows are converted and piped, cropped like the band
+    audit's decode (identical to cropping the full frame at ``crop_origin(top)``).
+    """
     wanted = _selector(indices)
+    width, height = size
+    crop = "" if band is None else f",crop={width}:{band[1]}:0:{band[0]}"
     command = [ffmpeg, "-nostdin", "-v", "error"]
     command += ["-ss", f"{start:.6f}"] if start else []
-    command += ["-i", str(video), "-vf", f"select='{wanted}'", "-fps_mode", "passthrough"]
+    command += ["-i", str(video), "-vf", f"select='{wanted}'{crop}", "-fps_mode", "passthrough"]
     command += ["-frames:v", str(len(indices)), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-    width, height = size
+    height = height if band is None else band[1]
     length = width * height * CHANNELS
     with subprocess.Popen(command, stdout=subprocess.PIPE) as process:
         stream = process.stdout
@@ -72,17 +90,40 @@ def colour_counts(
     indices: Sequence[int],
     boxes: Sequence[Sequence[Box]],
     size: tuple[int, int],
+    band: tuple[int, int] | None = None,
+    cleaned_bands: Sequence[Image] | None = None,
 ) -> list[int]:
-    """Unchanged caption-colour pixels per audited frame (``indices`` ascending, unique)."""
+    """Unchanged caption-colour pixels per audited frame (``indices`` ascending, unique).
+
+    ``band`` (the band audit's rows) reads only those rows of both videos, and
+    ``cleaned_bands`` reuses the band audit's decoded candidate instead of decoding it again.
+    Both apply only when every audited box lies ``REACH`` rows inside the band, so the counts
+    equal the full-frame ones; otherwise the full frames are decoded.
+    """
     if list(indices) != sorted(set(indices)) or not indices:
         raise ValueError("Audited frame indices must be ascending and unique")
-    originals = _frames(ffmpeg, source, source_start, indices, size)
-    repaired = _frames(ffmpeg, cleaned, 0.0, indices, size)
+    if band is not None and not inside(band, [boxes[index] for index in indices]):
+        band, cleaned_bands = None, None
+    origin = 0 if band is None else crop_origin(band[0])
+    shape = (size[1] if band is None else band[1], size[0])
+    originals = _frames(ffmpeg, source, source_start, indices, size, band)
+    repaired = (
+        iter(cleaned_bands)
+        if cleaned_bands is not None
+        else _frames(ffmpeg, cleaned, 0.0, indices, size, band)
+    )
     counts: list[int] = []
     for index, original, clean in zip(indices, originals, repaired, strict=True):
-        allowed = box_mask((size[1], size[0]), (0, 0), boxes[index])
+        allowed = box_mask(shape, (0, origin), boxes[index])
         counts.append(unchanged_pink(clean, original, allowed))
     return counts
+
+
+def inside(band: tuple[int, int], boxes: Sequence[Sequence[Box]]) -> bool:
+    """Every box lies ``REACH`` rows inside the rows a crop of ``band`` really holds."""
+    first = crop_origin(band[0])
+    last = first + band[1]
+    return all(first + REACH <= box[1] and box[3] + REACH <= last for row in boxes for box in row)
 
 
 def source_pink_counts(

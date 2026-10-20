@@ -119,3 +119,35 @@ def test_source_pink_counts_need_at_least_one_line(tmp_path: Path) -> None:
         audit.source_pink_counts(
             ffmpeg="ffmpeg", source=original, source_start=0.0, lines=[], size=SIZE
         )
+
+
+def test_band_rows_and_reused_bands_give_the_full_frame_counts(tmp_path: Path) -> None:
+    original = _video(tmp_path / "original.mp4", pink=True)
+    # An odd top: the crop really starts one row higher, as the band audit's decode does.
+    band = (7, 76)
+    bands = list(audit._frames("ffmpeg", original, 0.0, [0, 9], SIZE, band))
+    counts = audit.colour_counts(
+        ffmpeg="ffmpeg", source=original, source_start=0.0, cleaned=original,
+        indices=[0, 9], boxes=_boxes(), size=SIZE, band=band, cleaned_bands=bands,
+    )  # fmt: skip
+    assert [frame.shape for frame in bands] == [(76, 160, 3), (76, 160, 3)]
+    assert counts == [300, 300]
+
+
+def test_boxes_near_the_band_edge_are_counted_on_full_frames(tmp_path: Path) -> None:
+    original = _video(tmp_path / "original.mp4", pink=True)
+    counts = audit.colour_counts(
+        ffmpeg="ffmpeg", source=original, source_start=0.0, cleaned=original,
+        indices=[0], boxes=_boxes(), size=SIZE, band=(30, 40), cleaned_bands=[],
+    )  # fmt: skip
+    assert counts == [300]
+
+
+def test_a_crop_starts_on_an_even_row() -> None:
+    assert (audit.crop_origin(7), audit.crop_origin(8)) == (6, 8)
+
+
+def test_boxes_inside_the_band_leave_the_reach_on_both_sides() -> None:
+    assert audit.inside((6, 76), [[(20, 38, 50, 50)]]) is True
+    assert audit.inside((6, 76), [[(20, 37, 50, 50)]]) is False
+    assert audit.inside((6, 76), [[(20, 40, 50, 51)]]) is False
