@@ -170,16 +170,43 @@ checked on the startup volume and on any offload volume.
   downloads, `r2-worker/` and the `work-offload/` log directory are never candidates. Open
   files are uploaded but held; a failing unit keeps every file and the sweep continues.
   Smaller non-empty files go through `python -m replay.work_pack sweep [--apply]`, which packs
-  each unit's quiet small files into one tar under `edits/work/work-offload/packs/<unit>/`,
-  offloads the tar the same way, retires the listed members and then the local tar. The
-  unit's `evidence/small-files-offload.json` lists each pack's members with SHA-256, size,
-  mode and mtime; `python -m replay.work_pack restore edits/work/<unit>` links back every
-  missing member and never overwrites a file.
+  each unit's quiet small files into zstd (level 10) `.tar.zst` packs under
+  `edits/work/work-offload/packs/<unit>/`: one group per first-level subdirectory, split at
+  256 MiB uncompressed, so later edits and restores touch only their group. Packs are
+  offloaded the same way, then the listed members and the local pack are retired; a rerun
+  finishes an interrupted pack. The unit's `evidence/small-files-offload.json` lists each
+  pack's members with SHA-256, size, mode and mtime;
+  `python -m replay.work_pack restore edits/work/<unit> [--relative PATH]` links back every
+  missing member (or only PATH, downloading only its pack) and never overwrites a file.
 - **Prefer a verified replacement to a hold.** Large ProRes parts and whole masters are
   retired once a verified compact HEVC part set (`compressed_part_*`) and the dated delivery
   exist; keep clean sources, settings, clocks, receipts and failure evidence.
 - **Report both numbers.** Logical bytes removed and the measured `df` increase can differ
   (hardlinks, APFS clones, concurrent jobs); state which is which.
+
+## One-command recording pipeline
+
+`python -m replay.recording_pipeline start <replay-id> --defaults edits/work/recording-pipeline/DEFAULTS-v1.json`
+runs every stage of one recording detached (`scripts/tmux-job.sh`) and in parallel where the
+graph allows: clocks, GPU separation, source-caption cleanup (STTN refill), ASR, YOLO tracking,
+cut plan, paging, placement, Motion caption parts, Compressor alpha render, composition, finish
+and `publish`. Each step writes a receipt bound to its inputs; a rerun skips finished steps and
+resumes interrupted ones. A source whose first video frame is presented after zero is set up
+on a `source_lead_in` copy (`<deliveryRoot>/source-lead-in/<recording>/`, same file name, with
+`lead-in.json`): the video is encoded once at 10 Mbit/s with first-picture lead-in frames, every
+source frame keeps its PTS and the audio is copied; the edit config is rebound to the copy and its
+previous bytes kept as `edit-config.<sha>.json`. A single caption word too wide for one line is
+split near its middle (a morpheme end first, then any grapheme) before it is scaled. A source whose cleanup profile finds no caption band (the bootstrap
+refuses a blanket mask) gets a 240-frame profile survey under `caption-absence-v1/` instead; only
+the verifier's own no-band refusal passes it, the source is composed unchanged, and the gate
+re-runs that verification. `--force STEP` redoes a step and everything after it; `--force-all`
+redoes the recording. `publish` hardlinks the movie into the recording's bound storage
+(`revisions/pipeline-<sha12>/delivery/`) with its SRT and `metadata/pipeline-evidence.json`, which
+`python -m replay.edit_completion check edits/replay-<id>` assesses in minutes
+(`replay.pipeline_completion`). The last step, `upload`, runs the web viewer's `sync`
+(`web-viewer/src/bin/sync.ts`, one at a time under `web-viewer/sync.lock`), so a published
+recording reaches Cloudflare without a separate command. Keep Compressor open while it renders; it reports "job controller
+is down" when the app quits after a submission.
 
 ## Resumable processing and measured phases
 
