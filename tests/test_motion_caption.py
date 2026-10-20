@@ -11,7 +11,7 @@ from xml.etree import ElementTree as ET
 
 import pytest
 
-from replay import motion_stages
+from replay import motion_reveal_stages, motion_stages
 from replay.core import ReplayError
 from replay.motion_caption import (
     CaptionAppearance,
@@ -1495,3 +1495,111 @@ def test_motion_animation_limits_expanded_document_size() -> None:
     samples = tuple((Fraction(i, 1000), Fraction(i, 10_000)) for i in range(10_000))
     with pytest.raises(ReplayError, match="XML size limit"):
         animate_caption_template(ANIMATION_TEMPLATE, samples=samples)
+
+
+def test_a_growing_caption_becomes_one_revealing_title(
+    sequence_template: str, stage_plan: dict[str, object]
+) -> None:
+    root = ET.fromstring(motion_reveal_stages.prepare(sequence_template, stage_plan))
+    assert [text.text for text in root.findall("scene/layer/scenenode//text")] == ["字幕", "字幕"]
+    assert [timing.get("out") for timing in root.findall("scene/layer/scenenode/timing")] == [
+        "29 30 1 0",
+        "29 30 1 0",
+    ]
+
+
+def test_the_entrance_is_added_only_when_the_style_enables_it(
+    sequence_template: str, stage_plan: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    without = motion_reveal_stages.prepare(sequence_template, stage_plan)
+    monkeypatch.setattr(motion_reveal_stages, "MOTION_ENTRANCE", True)
+    with_entrance = motion_reveal_stages.prepare(sequence_template, stage_plan)
+    assert with_entrance != without
+    assert len(with_entrance) > len(without)
+
+
+def reveal_stage(text: str, start: int, end: int, y: float = 100.0) -> motion_reveal_stages.Stage:
+    return motion_reveal_stages.Stage(text, start, end, 0.0, y)
+
+
+def test_chains_break_on_resets_gaps_moves_and_rebalanced_lines() -> None:
+    stages = [
+        reveal_stage("あ", 0, 2),
+        reveal_stage("あい", 2, 4),
+        reveal_stage("う", 4, 6),
+        reveal_stage("うえ", 7, 9),
+        reveal_stage("うえお", 9, 10, y=50.0),
+        reveal_stage("か\nき", 10, 12),
+        reveal_stage("かき\nく", 12, 14),
+    ]
+    assert [[s.text for s in c] for c in motion_reveal_stages.chains(stages)] == [
+        ["あ", "あい"],
+        ["う"],
+        ["うえ"],
+        ["うえお"],
+        ["か\nき"],
+        ["かき\nく"],
+    ]
+
+
+def test_reveal_keys_show_each_stage_on_its_own_frames() -> None:
+    chain = [reveal_stage("あ", 0, 3), reveal_stage("あい", 3, 5), reveal_stage("あいう", 5, 9)]
+    assert motion_reveal_stages.reveal(chain, 30) == (
+        (Fraction(0), Fraction(1, 6)),
+        (Fraction(2, 30), Fraction(1, 6)),
+        (Fraction(3, 30), Fraction(3, 6)),
+        (Fraction(4, 30), Fraction(3, 6)),
+        (Fraction(5, 30), Fraction(5, 6)),
+    )
+    assert motion_reveal_stages.reveal([reveal_stage("あ", 0, 3)], 30) == (
+        (Fraction(0), Fraction(1, 2)),
+        (Fraction(3, 30), Fraction(1, 2)),
+    )
+
+
+def test_a_stage_splitting_a_composed_character_is_refused() -> None:
+    with pytest.raises(ReplayError, match="composed character"):
+        motion_reveal_stages.visible("か", [2])
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"rate": 0},
+        {"coordinateSpace": "screen"},
+        {"placements": []},
+        {"extra": 1},
+        {"placements": [{"text": "a", "startFrame": 0, "endFrame": 1, "x": True, "y": 0}]},
+        {"placements": [{"text": "a", "startFrame": 0, "endFrame": 1, "x": 0, "y": "0"}]},
+        {"placements": [{"text": "a", "startFrame": 0, "endFrame": 1}]},
+    ],
+)
+def test_invalid_reveal_plans_are_refused(
+    sequence_template: str, stage_plan: dict[str, object], change: dict[str, object]
+) -> None:
+    with pytest.raises(ReplayError):
+        motion_reveal_stages.prepare(sequence_template, {**stage_plan, **change})
+
+
+def test_too_many_titles_are_refused(
+    sequence_template: str, stage_plan: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(motion_reveal_stages, "MAX_SEQUENCE_SENTENCES", 1)
+    plan = {**stage_plan, "placements": [
+        {"text": "字", "startFrame": 0, "endFrame": 1, "x": 0, "y": 100},
+        {"text": "幕", "startFrame": 1, "endFrame": 30, "x": 0, "y": 100},
+    ]}  # fmt: skip
+    with pytest.raises(ReplayError, match="Too many"):
+        motion_reveal_stages.prepare(sequence_template, plan)
+
+
+def test_the_reveal_cli_writes_once(
+    sequence_template: str, stage_plan: dict[str, object], tmp_path: Path
+) -> None:
+    (tmp_path / "t.moti").write_text(sequence_template, encoding="utf-8")
+    (tmp_path / "p.json").write_text(json.dumps(stage_plan), encoding="utf-8")
+    arguments = [str(tmp_path / "t.moti"), str(tmp_path / "p.json"), str(tmp_path / "o.moti")]
+    assert motion_reveal_stages.main(arguments) == 0
+    assert "字幕" in (tmp_path / "o.moti").read_text(encoding="utf-8")
+    with pytest.raises(ReplayError, match="overwrite"):
+        motion_reveal_stages.main(arguments)
