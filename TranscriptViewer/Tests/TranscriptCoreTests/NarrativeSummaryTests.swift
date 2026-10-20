@@ -176,26 +176,14 @@ struct NarrativeSummaryTests {
         #expect(result.sections[0].text == "話題をつなげて説明する文章です。")
     }
 
-    @Test func rewritesADraftThatRepeatsASentence() async throws {
+    @Test func dropsAnExactlyRepeatedSentenceWithoutARewrite() async throws {
         let repeated = "同じ文を繰り返す長めの説明文です。同じ文を繰り返す長めの説明文です。"
         let generator = NarrativeSummaryGenerator { request in
-            if request.kind == .overview { return "全体の内容を説明する文章です。" }
-            if request.correctsFormat {
-                #expect(request.source == repeated)
-                return "繰り返しを除いて内容を一度だけ説明する文章です。"
-            }
-            return repeated
+            #expect(!request.correctsFormat)
+            return request.kind == .overview ? "全体の内容を説明する文章です。" : repeated
         }
         let result = try await generator.generate(transcript(["元の文字起こし。"]))
-        #expect(result.sections[0].text == "繰り返しを除いて内容を一度だけ説明する文章です。")
-    }
-
-    @Test func reportsTheRepetitionWhenTheRewriteStillRepeats() async {
-        let repeated = "同じ文を繰り返す長めの説明文です。同じ文を繰り返す長めの説明文です。"
-        let generator = NarrativeSummaryGenerator { _ in repeated }
-        await #expect(throws: SummaryGenerationError.repeatedResponse) {
-            try await generator.generate(transcript(["元の文字起こし。"]))
-        }
+        #expect(result.sections[0].text == "同じ文を繰り返す長めの説明文です。")
     }
 
     @Test(arguments: [

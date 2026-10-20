@@ -224,8 +224,8 @@ public struct NarrativeSummaryGenerator: Sendable {
         return NarrativeSummary(overview: overview, sections: sections)
     }
 
-    /// One generation plus one proofreading pass over its own draft. A list-shaped or
-    /// sentence-repeating draft is rewritten by the model; the validation never relaxes,
+    /// One generation plus one proofreading pass over its own draft. Exact repeats of a
+    /// sentence are dropped by validation; a list-shaped draft is rewritten by the model,
     /// and a draft that still fails reports its own error instead of being edited here.
     private func response(_ request: SummaryRequest) async throws -> String {
         var source = request.source
@@ -262,9 +262,9 @@ public struct NarrativeSummaryGenerator: Sendable {
         let body = emphasized.replacingOccurrences(
             of: headingPattern, with: "", options: .regularExpression)
         // Retain heading words; remove only Markdown syntax, never source content.
-        let result = emphasized.replacingOccurrences(
-            of: #"(?m)^([ \t]*)#{1,6}[ \t]+"#, with: "$1", options: .regularExpression
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = SummaryProseQuality.removingRepeatedSentences(
+            emphasized.replacingOccurrences(
+                of: #"(?m)^([ \t]*)#{1,6}[ \t]+"#, with: "$1", options: .regularExpression))
         guard !result.isEmpty else { throw SummaryGenerationError.emptyResponse }
         try SummaryProseQuality.validate(result)
         let refusals = [

@@ -11,8 +11,15 @@ struct SummaryQualityRepairTests {
     ])
     func rejectsRepeatedSentences(_ text: String) {
         #expect(throws: SummaryGenerationError.repeatedResponse) {
-            try NarrativeSummaryGenerator.validateResponse(text)
+            try SummaryProseQuality.validate(text)
         }
+    }
+
+    @Test func dropsOnlyTheExactRepeatOfASentence() throws {
+        #expect(
+            try NarrativeSummaryGenerator.validateResponse(
+                "地域の催しでは参加者が料理の工夫を紹介している。料理の話をした。\n\n地域の催しでは参加者が料理の工夫を紹介している。料理の話をした。")
+                == "地域の催しでは参加者が料理の工夫を紹介している。料理の話をした。\n\n料理の話をした。")
     }
 
     @Test(arguments: [
@@ -98,10 +105,10 @@ struct SummaryQualityRepairTests {
             version: old.version, fingerprint: old.fingerprint, overview: "",
             sections: [
                 .init(
-                    startSeconds: 0, endSeconds: 600, text: "同じ作業について何度も説明している。同じ作業について何度も説明している。")
+                    startSeconds: 0, endSeconds: 600, text: "申し訳ありませんが対応できません。")
             ])
         try JSONEncoder().encode(invalid).write(to: fixture.current)
-        await #expect(throws: SummaryGenerationError.repeatedResponse) {
+        await #expect(throws: SummaryGenerationError.refusedResponse) {
             try await SummaryStore().load(video: fixture.video)
         }
         await #expect(throws: SummaryGenerationError.invalidRepairSelection) {

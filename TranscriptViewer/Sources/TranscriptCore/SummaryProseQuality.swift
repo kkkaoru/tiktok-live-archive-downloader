@@ -2,6 +2,26 @@ import Foundation
 
 /// Conservative surface checks, not a semantic entailment or factuality proof.
 public enum SummaryProseQuality {
+    /// Drops a sentence (with its terminator) whose exact text already appeared. Nothing is
+    /// reworded or added; the repetition check below still applies to what remains.
+    public static func removingRepeatedSentences(_ text: String) -> String {
+        var seen: Set<String> = []
+        var result = ""
+        var sentence = ""
+        func flush() {
+            let core = sentence.trimmingCharacters(
+                in: CharacterSet(charactersIn: "。！？\n").union(.whitespacesAndNewlines))
+            if core.count < 12 || seen.insert(core).inserted { result += sentence }
+            sentence = ""
+        }
+        for character in text {
+            sentence.append(character)
+            if "。！？\n".contains(character) { flush() }
+        }
+        flush()
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public static func validate(_ text: String) throws {
         let sentences = text.components(separatedBy: CharacterSet(charactersIn: "。！？\n"))
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
