@@ -38,6 +38,10 @@ DETECTOR_BATCH = 8
 TIMEOUT_SECONDS = 600
 
 
+class OutputLimitError(ValueError):
+    """A single frame alone exceeded the native session's bounded capture limit."""
+
+
 def _decode(command: list[str]) -> tuple[subprocess.Popen[bytes], IO[bytes]]:
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     if process.stdout is None:
@@ -268,7 +272,7 @@ def session_ocr(
         number += 1
         if frames is None and len(chunk) == 1:
             if band is None:
-                raise ValueError("Native OCR session failed; evidence retained")
+                raise OutputLimitError("Native OCR session failed; evidence retained")
             found[chunk[0]] = _band_frame(
                 native,
                 source,
