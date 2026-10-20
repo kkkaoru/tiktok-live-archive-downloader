@@ -77,10 +77,10 @@ def test_ass_style_gradient_and_bottom_stack_without_animation() -> None:
     assert "\\pos(1326.000,936.000)" in ass
     assert "\\pos(1326.000,988.000)" in ass
     assert "\\pos(1326.000,1040.000)" in ass
-    assert "\\bord8.509" in ass
-    assert "\\bord10.282" in ass
+    assert "\\bord5.956" in ass
+    assert "\\bord7.729" in ass
     assert "\\1c&HEEB02F&" in ass
-    assert "\\1c&HFFF6E3&" in ass
+    assert "\\1c&HF7D897&" in ass
     assert "\\t(" not in ass
     assert "\\fad" not in ass
     assert ass.count("Dialogue:") == 108
@@ -193,10 +193,10 @@ def test_actual_glyph_bounds_drive_gradient_and_shadow_clearance(tmp_path: Path)
     )
     out = tmp_path / "new"
     restyle(plan, out, Appearance(104, 1326, 1032, 745, 1906), bounds_path=bounds)
-    assert json.loads((out / "plan.json").read_text())["bottomAnchorPx"] == 1026
+    assert json.loads((out / "plan.json").read_text())["bottomAnchorPx"] == 1007
     ass = (out / "captions.ass").read_text()
-    assert "\\pos(1326.000,1026.000)" in ass
-    assert "\\blur4.727" in ass
+    assert "\\pos(1326.000,1007.000)" in ass
+    assert "\\blur9.455" in ass
     assert "\\bord2.364" in ass
 
 

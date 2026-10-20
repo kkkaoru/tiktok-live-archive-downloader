@@ -208,10 +208,13 @@ def render_ass(
                 f"\\shad0\\3c&HFFFFFF&\\1a&HFF&}}{text}"
             )
             for band in range(GRADIENT_BANDS):
-                amount = max(
-                    0.0,
-                    (band / (GRADIENT_BANDS - 1) - style.GRADIENT_DARK_HOLD)
-                    / (1 - style.GRADIENT_DARK_HOLD),
+                amount = min(
+                    1.0,
+                    max(
+                        0.0,
+                        (band / (GRADIENT_BANDS - 1) - style.GRADIENT_TOP_HOLD)
+                        / (style.GRADIENT_BOTTOM_START - style.GRADIENT_TOP_HOLD),
+                    ),
                 )
                 color = bgr(
                     (

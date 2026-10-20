@@ -22,9 +22,10 @@ from replay.caption_style_defaults import (
     FONT_FACE,
     FONT_FAMILY,
     GRADIENT_BOTTOM_HEX,
-    GRADIENT_DARK_HOLD,
+    GRADIENT_BOTTOM_START,
     GRADIENT_DIRECTION,
     GRADIENT_TOP_HEX,
+    GRADIENT_TOP_HOLD,
     HEAD_CAPTION_REFERENCE_HEIGHT,
     INNER_BLACK_STROKE_WIDTH,
     MAX_CAPTION_LINES,
@@ -53,7 +54,8 @@ class FixedBottomAppearance:
     font_size: float = FIXED_BOTTOM_FONT_SIZE
     gradient_top: str = GRADIENT_TOP_HEX
     gradient_bottom: str = GRADIENT_BOTTOM_HEX
-    gradient_dark_hold: float = GRADIENT_DARK_HOLD
+    gradient_top_hold: float = GRADIENT_TOP_HOLD
+    gradient_bottom_start: float = GRADIENT_BOTTOM_START
     gradient_direction: str = GRADIENT_DIRECTION
     white_stroke: float = WHITE_STROKE_WIDTH * FONT_SCALE
     outer_black_stroke: float = OUTER_BLACK_STROKE_WIDTH * FONT_SCALE

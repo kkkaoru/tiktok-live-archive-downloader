@@ -24,16 +24,16 @@ def node(name: str, identity: int, width: float, shadow: str = "") -> str:
 
 @pytest.fixture
 def source() -> str:
-    shadow = """<parameter id="21"><parameter id="27" value="7"/>
-    <parameter id="75"><parameter id="1" value="4"/>
-    <parameter id="2" value="4"/></parameter></parameter>"""
+    shadow = """<parameter id="21"><parameter id="27" value="16"/>
+    <parameter id="75"><parameter id="1" value="8"/>
+    <parameter id="2" value="8"/></parameter></parameter>"""
     return animate_entrance(
         '<ozml version="5.15"><template><flags>1</flags></template><scene><publishSettings/>'
         "<sceneSettings><duration>240</duration><frameRate>30</frameRate><NTSC>0</NTSC></sceneSettings>"
         '<layer id="100">'
         + node("Caption Keyline Face", 200, 2)
-        + node("Caption Face", 300, 14.4)
-        + node("Caption Outer Rim", 400, 17.4, shadow)
+        + node("Caption Face", 300, 10.08)
+        + node("Caption Outer Rim", 400, 13.08, shadow)
         + "</layer></scene></ozml>"
     )
 
@@ -149,7 +149,7 @@ def test_published_dimensions_are_pre_layout_and_synchronized(
     assert len(values) == 9
     assert values[0] == ("Caption Keyline Face Font Size", "9999/100/200/5/201/3", 88 * factor)
     assert values[2][2] == values[4][2] == 88 * factor
-    assert values[-1][2] == values[-2][2] == 4 * factor
+    assert values[-1][2] == values[-2][2] == 8 * factor
     assert new.findtext(".//text") == "あ" * characters
     with pytest.raises(ReplayError, match="already"):
         layout.publish_geometry(result)
@@ -168,9 +168,9 @@ def test_invalid_scale(source: str, factor: float) -> None:
         ('factoryID="16"', 'factoryID="15"'),
         ('id="314" value="1"', 'id="314" value="0"'),
         ("NotoSansJP-Thin_Bold", "Other"),
-        ('value="14.4"', 'value="15"'),
-        ('value="14.4"', 'value="nan"'),
-        ('value="14.4"', 'value="bad"'),
+        ('value="10.08"', 'value="15"'),
+        ('value="10.08"', 'value="nan"'),
+        ('value="10.08"', 'value="bad"'),
     ],
 )
 def test_rejects_changed_contract(source: str, old: str, new: str) -> None:

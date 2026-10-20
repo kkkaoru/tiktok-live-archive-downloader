@@ -41,7 +41,8 @@ class FinishStyle:
     """Geometry is in the already prepared document's units; RGB is Motion RGB."""
 
     bottom: tuple[float, float, float]
-    bright_start: float = 0.8
+    bright_start: float = 0.8  # where the top colour starts blending into the bottom one
+    blend_end: float = 1.0  # where the bottom colour is reached
     keyline: float = 2.0
     white_border: float = 10.92
     black_rim: float = 5.46
@@ -67,7 +68,7 @@ class FinishStyle:
             top_srgb=self.top_srgb,
             bottom_srgb=self.bottom_srgb,
             top_location=self.bright_start,
-            bottom_location=1.0,
+            bottom_location=self.blend_end,
             midpoint=self.midpoint,
             intent_policy=self.intent_policy,
             white_border=self.white_border,
@@ -123,7 +124,8 @@ def selected_finish_style(
         bottom=bottom,
         top_srgb=_hex_color(defaults.GRADIENT_TOP_HEX),
         bottom_srgb=_hex_color(defaults.GRADIENT_BOTTOM_HEX),
-        bright_start=defaults.GRADIENT_DARK_HOLD,
+        bright_start=defaults.MOTION_GRADIENT_TOP_LOCATION,
+        blend_end=defaults.MOTION_GRADIENT_BOTTOM_LOCATION,
         midpoint=0.5,
         keyline=defaults.INNER_BLACK_STROKE_WIDTH * stroke_scale,
         white_border=defaults.WHITE_STROKE_WIDTH * stroke_scale,

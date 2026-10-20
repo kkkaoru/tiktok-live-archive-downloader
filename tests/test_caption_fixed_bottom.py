@@ -29,14 +29,15 @@ def test_appearance_is_style20_at_twice_youtube_size() -> None:
     assert appearance.font_size == 104.0
     assert appearance.font_family == "Noto Sans JP"
     assert appearance.font_face == "Bold"
-    assert appearance.gradient_top == "#2FB0EE"
-    assert appearance.gradient_bottom == "#E3F6FF"
-    assert appearance.gradient_dark_hold == 0.75
-    assert appearance.white_stroke == pytest.approx(28.8 * 104 / 88)
-    assert appearance.outer_black_stroke == pytest.approx(34.8 * 104 / 88)
+    assert appearance.gradient_top == "#97D8F7"
+    assert appearance.gradient_bottom == "#2FB0EE"
+    assert appearance.gradient_top_hold == 0.10
+    assert appearance.gradient_bottom_start == 0.30
+    assert appearance.white_stroke == pytest.approx(20.16 * 104 / 88)
+    assert appearance.outer_black_stroke == pytest.approx(26.16 * 104 / 88)
     assert appearance.inner_black_stroke == pytest.approx(4.0 * 104 / 88)
-    assert appearance.shadow_offset_y == pytest.approx(7.0 * 104 / 88)
-    assert appearance.shadow_blur == pytest.approx(4.0 * 104 / 88)
+    assert appearance.shadow_offset_y == pytest.approx(16.0 * 104 / 88)
+    assert appearance.shadow_blur == pytest.approx(8.0 * 104 / 88)
     assert appearance.entrance_duration == Fraction(1, 15)
     assert appearance.entrance_start_y_scale == 0.96
 

@@ -27,16 +27,17 @@ def test_reference_geometry_and_explicit_raw_controls() -> None:
     )
     assert style.top == (0.1, 0.2, 0.3)
     assert style.bottom == (0.4, 0.5, 0.6)
-    assert style.top_srgb == (47 / 255, 176 / 255, 238 / 255)
-    assert style.bottom_srgb == (227 / 255, 246 / 255, 1.0)
-    assert style.bright_start == 0.75
+    assert style.top_srgb == (151 / 255, 216 / 255, 247 / 255)
+    assert style.bottom_srgb == (47 / 255, 176 / 255, 238 / 255)
+    assert style.bright_start == pytest.approx(0.2688)
+    assert style.blend_end == pytest.approx(0.3944)
     assert style.midpoint == 0.5
     assert style.keyline == 2.0
-    assert style.white_border == 14.4
+    assert style.white_border == 10.08
     assert style.black_rim == pytest.approx(3.0)
-    assert style.shadow_opacity == 0.6
-    assert style.shadow_distance == 7.0
-    assert style.shadow_blur == 4.0
+    assert style.shadow_opacity == 0.8
+    assert style.shadow_distance == 16.0
+    assert style.shadow_blur == 8.0
     assert style.intent_policy == "selected-default"
 
 
@@ -58,7 +59,7 @@ def test_invalid_reference_scale(scale: float) -> None:
     [
         ("top_srgb", (0.1, 0.2, 0.3)),
         ("bottom_srgb", (0.4, 0.5, 0.6)),
-        ("top_location", 0.6),
+        ("top_location", 0.3),
         ("bottom_location", 0.9),
         ("midpoint", 0.8),
         ("intent_policy", "unknown"),
@@ -109,12 +110,12 @@ def test_finished_annotation_does_not_claim_aaa(sequence_template: str) -> None:
     assert payload["selectedStyle"] == 20
     assert payload["intentPolicy"] == "selected-default"
     assert payload["requiredWhiteContrast"] is None
-    assert payload["selectedWhiteContrast"]["top"] == pytest.approx(2.4516641403549544)
-    assert payload["selectedWhiteContrast"]["bottom"] == pytest.approx(1.1115530534139368)
+    assert payload["selectedWhiteContrast"]["top"] == pytest.approx(1.5577145885463748)
+    assert payload["selectedWhiteContrast"]["bottom"] == pytest.approx(2.4516641403549544)
     assert payload["renderedContrastVerified"] is False
     assert payload["renderedColourVerified"] is False
     assert payload["motionControls"]["top"] == [0.1, 0.2, 0.3]
-    assert payload["motionControls"]["topLocation"] == 0.75
+    assert payload["motionControls"]["topLocation"] == pytest.approx(0.2688)
     assert payload["motionControls"]["midpoint"] == 0.5
     assert len(root.findall("scene/layer/scenenode")) == 3
 

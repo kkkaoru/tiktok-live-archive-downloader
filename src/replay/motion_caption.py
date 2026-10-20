@@ -103,8 +103,8 @@ class CaptionAppearance:
             if (
                 self.top_srgb != _hex_color(caption_style_defaults.GRADIENT_TOP_HEX)
                 or self.bottom_srgb != _hex_color(caption_style_defaults.GRADIENT_BOTTOM_HEX)
-                or self.top_location != caption_style_defaults.GRADIENT_DARK_HOLD
-                or self.bottom_location != 1.0
+                or self.top_location != caption_style_defaults.MOTION_GRADIENT_TOP_LOCATION
+                or self.bottom_location != caption_style_defaults.MOTION_GRADIENT_BOTTOM_LOCATION
                 or self.midpoint != 0.5
             ):
                 raise ReplayError(
