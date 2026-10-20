@@ -32,7 +32,17 @@ HEAVY_SUFFIXES = frozenset(
     {".mov", ".mp4", ".m4v", ".mkv", ".wav", ".m4a", ".aac", ".flac", ".pt", ".ckpt", ".npy"}
 )
 KEEP_NAMES = frozenset(
-    {"private", "downloads", ".git", "models", ".tools", ".venv", "node_modules", "sounds"}
+    {
+        "private",
+        "downloads",
+        ".git",
+        "models",
+        ".tools",
+        ".venv",
+        "node_modules",
+        "sounds",
+        "bgm-library",
+    }
 )
 PROXY_NAME = "source-proxy-native-clock.mp4"
 DELIVERY_DIRECTORY = "delivery"
@@ -126,6 +136,20 @@ def references(roots: Sequence[Path]) -> set[str]:
     return named
 
 
+def delivery_targets(roots: Sequence[Path]) -> frozenset[str]:
+    """Real paths of media that delivery-directory symlinks publish to the Viewer."""
+    targets: set[str] = set()
+    for root in roots:
+        for directory, _subdirectories, names in os.walk(root):
+            if Path(directory).name != DELIVERY_DIRECTORY:
+                continue
+            for name in names:
+                link = Path(directory, name)
+                if link.is_symlink():
+                    targets.add(os.path.realpath(link))
+    return frozenset(targets)
+
+
 def completes(edits: Path, assumed: frozenset[str] = frozenset()) -> Completion:
     """Memoised completion gate of one recording under `edits`.
 
@@ -145,7 +169,9 @@ def completes(edits: Path, assumed: frozenset[str] = frozenset()) -> Completion:
     return gate
 
 
-def decide(entry: Entry, named: set[str], complete: Completion) -> tuple[str, str]:
+def decide(
+    entry: Entry, named: set[str], complete: Completion, delivered: frozenset[str] = frozenset()
+) -> tuple[str, str]:
     """Classification and reason, from a fixed rule order."""
     path = entry.path
     if path.suffix.lower() not in HEAVY_SUFFIXES or entry.size < MIN_BYTES:
@@ -154,6 +180,8 @@ def decide(entry: Entry, named: set[str], complete: Completion) -> tuple[str, st
         return "keep", "protected, model or tool data"
     if path.parent.name == DELIVERY_DIRECTORY:
         return "keep", "dated delivery"
+    if str(path) in delivered:
+        return "keep", "linked dated delivery"
     if path.name == PROXY_NAME:
         return "keep", "reused caption proxy"
     owner = owner_of(path)
@@ -186,6 +214,7 @@ def plan(
 ) -> Plan:
     """Classify every large file under `roots`; `scan` bounds the reference index."""
     named = references(scan)
+    delivered = delivery_targets(scan)
     complete = completes(edits, assumed)
     result = Plan()
     seen: set[tuple[int, int]] = set()
@@ -195,7 +224,7 @@ def plan(
             if identity in seen:
                 continue
             seen.add(identity)
-            classification, reason = decide(entry, named, complete)
+            classification, reason = decide(entry, named, complete, delivered)
             if classification == "keep" and reason == "small or non-media evidence":
                 continue
             key = f"{classification}: {reason}"
