@@ -1,5 +1,6 @@
 """Chunk probes run concurrently, return in assembly order, and the original probe is restored."""
 
+import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,9 +77,9 @@ def test_probes_overlap_and_return_in_assembly_order(monkeypatch: pytest.MonkeyP
 
 def test_the_original_probe_is_restored_after_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
     _call_assemble(monkeypatch, [], [])
-    original = assembly.probe
+    original, run = assembly.probe, assembly._run
     _run()
-    assert assembly.probe is original
+    assert assembly.probe is original and assembly._run is run
 
 
 def test_the_original_probe_is_restored_when_assembly_fails(
@@ -101,3 +102,45 @@ def test_invalid_worker_counts_are_rejected() -> None:
             Path("m"), sha256="0" * 64, output=Path("o"), evidence=Path("e"),
             ffmpeg=Path("f"), ffprobe=Path("p"), workers=0,
         )  # fmt: skip
+
+
+FRAMES = ["ffprobe", "-v", "error", "-show_entries", "frame=pts,duration", "-of", "json", "m"]
+
+
+def test_the_joined_output_clock_probe_decodes_on_every_core() -> None:
+    command = parallel.decoder_threads(FRAMES, Path("e/output-frames.json"), 10)
+    assert command == ["ffprobe", "-v", "error", "-threads", "0", *FRAMES[3:]]
+
+
+def test_chunk_clock_probes_share_the_cores(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "cpu_count", lambda: 16)
+    assert parallel.decoder_threads(FRAMES, Path("e/input-0003-frames.json"), 4)[3:5] == [
+        "-threads",
+        "4",
+    ]
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    assert parallel.decoder_threads(FRAMES, Path("e/input-0003-frames.json"), 4)[4] == "1"
+
+
+def test_other_commands_are_unchanged() -> None:
+    packets = ["ffprobe", "-show_entries", "packet=pts,duration,data_hash", "m"]
+    assert parallel.decoder_threads(packets, Path("e/output-packets.json"), 4) == packets
+    threaded = ["ffprobe", "-threads", "2", *FRAMES[1:]]
+    assert parallel.decoder_threads(threaded, Path("e/output-frames.json"), 4) == threaded
+
+
+def test_the_wrapped_runner_threads_only_the_clock_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ran: list[list[str]] = []
+    monkeypatch.setattr(assembly, "_run", lambda command, _stdout, **_k: ran.append(command))
+
+    def fake_assemble(manifest: Path, **_keywords: object) -> Path:
+        assembly._run(FRAMES, Path("e/output-frames.json"), deadline=None)
+        assembly._run(["ffprobe", "x"], Path("e/output-streams.json"))
+        return manifest
+
+    monkeypatch.setattr(assembly, "assemble", fake_assemble)
+    monkeypatch.setattr(assembly, "load_chunks", lambda *_a, **_k: _chunks(1))
+    _run()
+    assert ran == [["ffprobe", "-v", "error", "-threads", "0", *FRAMES[3:]], ["ffprobe", "x"]]
