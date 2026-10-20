@@ -198,3 +198,43 @@ def test_missing_bands_rejected() -> None:
         profiled_detections(
             FrameObservation(0, 0, 1080, 1920, ()), SubtitleBands(1080, 1920, (), ())
         )
+
+
+def test_a_fixed_label_misread_by_ocr_does_not_seed_a_band(
+    observations: tuple[FrameObservation, ...],
+) -> None:
+    readings = (
+        "宝箱、ポータル禁止",
+        "宝額、ポータル禁止",
+        "宝組、ポータル禁止",
+        "家稲、ポータル禁止",
+        "品額、ポータル禁に",
+        "宝箱、ポータル禁止",
+        "定箱、ポータル禁止",
+        "宝称、ポータル禁止",
+        "宝箱、ポータル禁ル",
+        "宝縮、ボータル禁止",
+    )
+    frames = tuple(
+        replace(
+            frame,
+            detections=(
+                *frame.detections,
+                TextDetection(reading, 1, TextRectangle(388, 364, 592, 80)),
+            ),
+        )
+        for frame, reading in zip(observations, readings, strict=True)
+    )
+    assert learn_subtitle_bands(frames) == SubtitleBands(1080, 1920, (41,), (44,))
+
+
+def test_a_label_alone_still_refuses_a_blanket_mask() -> None:
+    readings = ("宝箱、ポータル禁止", "宝額、ポータル禁止", "宝組、ポータル禁止") * 4
+    frames = tuple(
+        FrameObservation(
+            0, 0, 1080, 1920, (TextDetection(reading, 1, TextRectangle(388, 364, 592, 80)),)
+        )
+        for reading in readings
+    )
+    with pytest.raises(ValueError, match="blanket mask"):
+        learn_subtitle_bands(frames)

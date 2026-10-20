@@ -1,11 +1,20 @@
 """Learn source-specific subtitle bands; retain sampled evidence and semantic limits."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from math import floor
 
 from .caption_io import FrameObservation
 from .caption_masks import TextDetection
+
+# A fixed on-screen label sits in one (x, width) cell and OCR only misreads it: at least half of a
+# band's Japanese lines share a cell and most of those read as variants of one text (measured:
+# labels 0.95-1.0, caption bands 0.05-0.33 of lines at least 0.75 similar to the commonest reading).
+LABEL_CELL = 24
+LABEL_CELL_SHARE = 0.5
+LABEL_VARIANT_SHARE = 0.8
+LABEL_SIMILARITY = 0.75
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +67,7 @@ def learn_subtitle_bands(frames: tuple[FrameObservation, ...]) -> SubtitleBands:
     texts: dict[int, set[str]] = defaultdict(set)
     jp_counts: dict[int, int] = defaultdict(int)
     jp_texts: dict[int, set[str]] = defaultdict(set)
+    cells: dict[int, list[tuple[tuple[int, int], str]]] = defaultdict(list)
     for frame in frames:
         if (frame.width, frame.height) != (width, height) or len(frame.detections) > 64:
             raise ValueError("Inconsistent profile observations")
@@ -83,10 +93,18 @@ def learn_subtitle_bands(frames: tuple[FrameObservation, ...]) -> SubtitleBands:
                 texts[band].add(text)
             if japanese_letters(line.text):
                 jp_counts[band] += 1
+                cells[band].append(
+                    ((round(box.x / LABEL_CELL), round(box.width / LABEL_CELL)), text)
+                )
                 if len(jp_texts[band]) < 5:
                     jp_texts[band].add(text)
+    labels = {band for band, lines in cells.items() if _fixed_label(lines)}
     primary = tuple(
-        sorted(band for band in jp_counts if jp_counts[band] >= 10 and len(jp_texts[band]) >= 5)
+        sorted(
+            band
+            for band in jp_counts
+            if jp_counts[band] >= 10 and len(jp_texts[band]) >= 5 and band not in labels
+        )
     )
     if not primary:
         raise ValueError("No variable Japanese subtitle bands; refuse a blanket mask")
@@ -95,12 +113,26 @@ def learn_subtitle_bands(frames: tuple[FrameObservation, ...]) -> SubtitleBands:
             band
             for band in counts
             if band not in primary
+            and band not in labels
             and counts[band] >= 10
             and len(texts[band]) >= 5
             and any(0 < band - source <= 6 for source in primary)
         )
     )
     return SubtitleBands(width, height, primary, secondary)
+
+
+def _fixed_label(lines: list[tuple[tuple[int, int], str]]) -> bool:
+    """Most lines in one geometry cell, read as variants of one text: a label, not captions."""
+    cell, count = Counter(key for key, _ in lines).most_common(1)[0]
+    if count < len(lines) * LABEL_CELL_SHARE:
+        return False
+    texts = [text for key, text in lines if key == cell]
+    reading = Counter(texts).most_common(1)[0][0]
+    variants = sum(
+        SequenceMatcher(None, reading, text).ratio() >= LABEL_SIMILARITY for text in texts
+    )
+    return variants >= len(texts) * LABEL_VARIANT_SHARE
 
 
 def _linked(left: TextDetection, right: TextDetection) -> bool:
