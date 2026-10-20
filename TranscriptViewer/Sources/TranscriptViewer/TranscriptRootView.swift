@@ -331,6 +331,14 @@ struct TranscriptRootView: View {
             )
             .frame(height: 28)
             .accessibilityHidden(true)
+            if let video = session.selectedVideo {
+                ExcitementSection(
+                    transcriptURL: video.transcriptURL, currentSeconds: session.currentSeconds
+                ) { seconds in
+                    session.resumeTimelineFollow()
+                    session.seek(to: seconds)
+                }
+            }
             ScrollView(.horizontal) {
                 HStack(spacing: 12) {
                     ForEach(session.nearbyUtterances) { cue in
