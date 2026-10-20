@@ -78,3 +78,15 @@ def test_cli_reports_a_refusal(
     monkeypatch.setattr(record_mirror, "volume", lambda _path: 1)
     assert record_mirror.main(["--edits", str(tmp_path / "edits"), str(tmp_path / "m")]) == 1
     assert "different volume" in capsys.readouterr().err
+
+
+def test_private_summary_directories_stay_private_on_every_run(tmp_path: Path) -> None:
+    edits = tmp_path / "edits"
+    record = put(edits / "replay-3" / "delivery" / "a.srt.summaries" / "current.json", "{}")
+    record.parent.chmod(0o700)
+    mirrored = tmp_path / "mirror" / "replay-3" / "delivery" / "a.srt.summaries"
+    record_mirror.mirror(edits, tmp_path / "mirror")
+    assert mirrored.stat().st_mode & 0o777 == 0o700
+    mirrored.chmod(0o755)
+    assert record_mirror.mirror(edits, tmp_path / "mirror") == {"copied": 0, "unchanged": 1}
+    assert mirrored.stat().st_mode & 0o777 == 0o700

@@ -43,6 +43,13 @@ def volume(path: Path) -> int:
     return existing.stat().st_dev
 
 
+def _copy_directory_modes(source: Path, target: Path, edits: Path) -> None:
+    """Keep private directories private; TranscriptViewer rejects a group-readable summary store."""
+    while source != edits:
+        shutil.copymode(source, target)
+        source, target = source.parent, target.parent
+
+
 def mirror(edits: Path, destination: Path) -> dict[str, int]:
     """Copy new or changed records; refuse a destination on the same volume as the source."""
     if volume(destination) == volume(edits):
@@ -51,10 +58,11 @@ def mirror(edits: Path, destination: Path) -> dict[str, int]:
     for recording in recordings(edits):
         for source in _files(recording):
             target = destination / source.relative_to(edits)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _copy_directory_modes(source.parent, target.parent, edits)
             if target.is_file() and target.stat().st_size == source.stat().st_size:
                 unchanged += 1
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
             partial = target.with_name(f"{target.name}.partial")
             shutil.copy2(source, partial)
             partial.replace(target)
