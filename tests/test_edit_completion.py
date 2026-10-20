@@ -570,7 +570,7 @@ def test_supersede_never_marks_complete_delivery(tmp_path: Path) -> None:
     root = recording(tmp_path)
     music_removed(root, render(root, "render-a"))
     assert main(["supersede", str(root)]) == 0
-    assert list((root / "evidence/superseded").iterdir()) == []
+    assert (root / "evidence/superseded").exists() is False
     assert is_superseded(root, root / f"revisions/audio-final/delivery/{STEM}-review.mp4") is False
 
 
@@ -788,6 +788,47 @@ def test_bind_storage_preserves_old_config_and_discovers_external_delivery(
     assert edit_completion.delivery_label(root, movie) == (
         f"storage:revisions/native/delivery/{STEM}-review.mp4"
     )
+
+
+def test_a_stored_delivery_is_superseded_in_its_store_for_the_viewer(tmp_path: Path) -> None:
+    root = recording(tmp_path)
+    external = storage(tmp_path, root)
+    edit_completion.bind_storage(root, external)
+    movie = external / "revisions/old/delivery" / f"{STEM}-review.mp4"
+    movie.parent.mkdir(parents=True)
+    movie.write_bytes(b"incomplete")
+    assert supersede_incomplete(root) == [movie]
+    (record,) = (external / "evidence/superseded").iterdir()
+    entry = json.loads(record.read_text())
+    assert entry["delivery"] == f"revisions/old/delivery/{STEM}-review.mp4"
+    assert entry["size"] == 10
+    assert is_superseded(root, movie) is True
+    assert (root / "evidence/superseded").exists() is False
+
+
+def test_bind_source_points_at_a_same_named_copy_and_keeps_the_old_config(
+    tmp_path: Path,
+) -> None:
+    root = recording(tmp_path)
+    before = (root / "edit-config.json").read_bytes()
+    source = load_config(root).source
+    copy = tmp_path / "lead-in" / source.name
+    copy.parent.mkdir()
+    copy.write_bytes(b"longer copy")
+    edit_completion.bind_source(root, copy)
+    assert [path.read_bytes() for path in sorted(root.glob("edit-config.*.json"))] == [before]
+    assert (load_config(root).source, load_config(root).source_size) == (copy, 11)
+
+
+def test_bind_source_refuses_another_name_or_the_source_itself(tmp_path: Path) -> None:
+    root = recording(tmp_path)
+    source = load_config(root).source
+    other = tmp_path / "other.mp4"
+    other.write_bytes(b"x")
+    with pytest.raises(ReplayError, match="keeps the source's name in another directory"):
+        edit_completion.bind_source(root, other)
+    with pytest.raises(ReplayError, match="keeps the source's name in another directory"):
+        edit_completion.bind_source(root, source)
 
 
 def test_stored_delivery_link_preserves_identity_and_stage_checks(tmp_path: Path) -> None:

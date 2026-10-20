@@ -52,6 +52,35 @@ def _read_json(path: Path) -> object:
     return edit_config._read_json(path, maximum_bytes=MAX_JSON_BYTES)
 
 
+def bind_source(root: Path, source: Path) -> Path:
+    """Point an existing config at a derived copy of its source, preserving the old config bytes.
+
+    The copy keeps the source's file name (delivery names derive from it) and lives elsewhere;
+    the previous file is kept as `edit-config.<sha256-prefix>.json`, as for a storage root.
+    """
+    config = load_config(root)
+    media = native_media_path(source)
+    if media.name != config.source.name or media == config.source:
+        raise ReplayError("A derived source keeps the source's name in another directory")
+    path = root / CONFIG_NAME
+    data = record(_read_json(path))
+    data.update(source=str(media), source_size=media.stat().st_size)
+    _replace_config(root, path, data)
+    return path
+
+
+def _replace_config(root: Path, path: Path, data: dict[str, object]) -> None:
+    os.link(path, root / f"edit-config.{_digest(path)[:16]}.json")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, delete=False) as stream:
+        json.dump(data, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        os.chmod(stream.name, 0o600)
+    os.replace(stream.name, path)
+    load_config(root)
+
+
 def bind_storage(root: Path, directory: Path) -> Path:
     """Add a storage root to an existing config, preserving the old config bytes.
 
@@ -64,15 +93,7 @@ def bind_storage(root: Path, directory: Path) -> Path:
     path = root / CONFIG_NAME
     data = record(_read_json(path))
     data[STORAGE_KEY] = str(storage_root(str(directory), root=root, source=config.source))
-    os.link(path, root / f"edit-config.{_digest(path)[:16]}.json")
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, delete=False) as stream:
-        json.dump(data, stream, indent=2, ensure_ascii=False)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-        os.chmod(stream.name, 0o600)
-    os.replace(stream.name, path)
-    load_config(root)
+    _replace_config(root, path, data)
     return path
 
 
@@ -537,12 +558,29 @@ def superseded_records(root: Path) -> list[dict[str, object]]:
     return [record(_read_json(path)) for path in sorted(directory.glob("*.json"))]
 
 
+def _record_home(root: Path, delivery: Path) -> tuple[Path, str]:
+    """Where a delivery's supersession record lives, and its label there.
+
+    A storage-root delivery is recorded in that store's own ``evidence/superseded`` with a path
+    relative to the store, which is what the Viewer library of that store reads.
+    """
+    if delivery.is_relative_to(root):
+        return root / "evidence" / "superseded", str(delivery.relative_to(root))
+    storage = load_config(root).storage_root
+    if storage is None or not delivery.is_relative_to(storage):
+        raise ReplayError("Delivery lies outside the recording and its storage root")
+    return storage / "evidence" / "superseded", str(delivery.relative_to(storage))
+
+
 def is_superseded(root: Path, delivery: Path) -> bool:
     """A delivery is superseded only while its recorded identity is unchanged."""
-    relative = delivery_label(root, delivery)
-    for item in superseded_records(root):
-        if item.get("delivery") == relative and item.get("size") == delivery.stat().st_size:
-            return item.get("sha256") == _digest(delivery)
+    home, label = _record_home(root, delivery)
+    # Older records of storage deliveries were kept under the recording as "storage:<path>".
+    places = [(home.parent.parent, label), (root, delivery_label(root, delivery))]
+    for place, relative in places:
+        for item in superseded_records(place):
+            if item.get("delivery") == relative and item.get("size") == delivery.stat().st_size:
+                return item.get("sha256") == _digest(delivery)
     return False
 
 
@@ -551,16 +589,16 @@ def supersede_incomplete(root: Path) -> list[Path]:
 
     Nothing is deleted or renamed; a complete delivery is never superseded.
     """
-    directory = root / "evidence" / "superseded"
-    directory.mkdir(mode=0o700, exist_ok=True)
     recorded: list[Path] = []
     for delivery in _deliveries(root):
         failures = assess_delivery(delivery, root=root)
         if not failures or is_superseded(root, delivery):
             continue
         digest = _digest(delivery)
+        directory, label = _record_home(root, delivery)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         entry = {
-            "delivery": delivery_label(root, delivery),
+            "delivery": label,
             "sha256": digest,
             "size": delivery.stat().st_size,
             "missingStages": failures,
@@ -581,15 +619,15 @@ def supersede_for_regeneration(root: Path, reason: str) -> list[Path]:
     """
     if not reason.strip():
         raise ReplayError("A regeneration needs a stated reason")
-    directory = root / "evidence" / "superseded"
-    directory.mkdir(mode=0o700, exist_ok=True)
     recorded: list[Path] = []
     for delivery in _deliveries(root):
         if assess_delivery(delivery, root=root) or is_superseded(root, delivery):
             continue
         digest = _digest(delivery)
+        directory, label = _record_home(root, delivery)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         entry = {
-            "delivery": delivery_label(root, delivery),
+            "delivery": label,
             "sha256": digest,
             "size": delivery.stat().st_size,
             "reason": reason,
