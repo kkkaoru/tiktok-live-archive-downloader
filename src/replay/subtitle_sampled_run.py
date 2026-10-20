@@ -8,8 +8,10 @@ The receipt states that regions came from sampling and that quality is not appro
 
 import json
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 
 from replay.caption_io import FrameObservation
@@ -50,8 +52,11 @@ def _attempt(
     stride: int, directory: Path, tools: Collaborators, audit_stride: int
 ) -> dict[str, object]:
     directory.mkdir(mode=0o700)
+    marks = [time.monotonic()]
     plan = tools.plan(stride, directory)
+    marks.append(time.monotonic())
     video = tools.render(plan, directory)
+    marks.append(time.monotonic())
     regions = _regions(plan)
     indices = audit_indices(len(regions), audit_stride)
     observed = tools.audit(video, indices)
@@ -62,6 +67,7 @@ def _attempt(
         interface = [item for item, coloured in zip(residuals, flags, strict=True) if not coloured]
         residuals = tuple(item for item, coloured in zip(residuals, flags, strict=True) if coloured)
     counts: Sequence[int] = () if tools.colour is None else tools.colour(plan, video, indices)
+    marks.append(time.monotonic())
     over = flagged(counts, gate=GATE)
     return {
         "stride": stride,
@@ -69,6 +75,14 @@ def _attempt(
         "video": video.name,
         "sampling": plan.get("sampling"),
         "stageSeconds": plan.get("stageSeconds"),
+        # Wall time of plan, render and audit (with the colour gate): where a chunk's time goes.
+        "phaseSeconds": dict(
+            zip(
+                ("plan", "render", "audit"),
+                (round(b - a, 3) for a, b in pairwise(marks)),
+                strict=True,
+            )
+        ),
         "auditStride": audit_stride,
         "auditedFrames": len(observed),
         "residualLines": [_residual(item) for item in residuals],
