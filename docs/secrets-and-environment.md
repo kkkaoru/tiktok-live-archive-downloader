@@ -11,7 +11,7 @@ it is a safety net, not a substitute for keeping a secret out of the tree.
 | TikTok session (`TIKTOK_SESSIONID`) | `private/tiktok-sessionid.secret` (0600) | Loaded only by `scripts/replay-authorized.sh`; never in argv, chat, logs or `.env`. |
 | Creator anchor ID (`TIKTOK_TARGET_ANCHOR_ID`) | `private/target-anchor-id` (0600) | Treated as a credential. |
 | Recordings, transcripts, summaries | `downloads/`, `youtube-originals/`, `edits/`, `*.summaries/` | Personal data. Summaries and diagnostics must not be published. |
-| Web viewer Worker secrets | `web-viewer/secrets.json` (0600) | `X_CLIENT_ID`, `X_CLIENT_SECRET`, `SESSION_SECRET`, `X_ADMIN_USERNAMES`, optional `DEBUG_TOKEN` / `DEBUG_TOKEN_EXPIRES`. Template: `web-viewer/secrets.example.json`. |
+| Web viewer Worker secrets | `web-viewer/secrets.json` (0600) | `X_CLIENT_ID`, `X_CLIENT_SECRET`, `SESSION_SECRET`, `X_ADMIN_USERNAMES`, `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` (share-link bot check), optional `DEBUG_TOKEN` / `DEBUG_TOKEN_EXPIRES`. Template: `web-viewer/secrets.example.json`. |
 | Legacy viewer login | `web-viewer/credentials.txt` | Basic-auth fallback from before X sign-in; delete when no longer needed. |
 | Debug session cookie | `web-viewer/.debug-cookies` | One hour, read-only; recreated on demand. |
 | Cloudflare CLI state | `.cloudflare/` (includes the account ID), `web-viewer/.cloudflare/` | CLI authentication itself is stored outside the checkout. |
@@ -40,7 +40,7 @@ Worker and Cloudflare configuration that only *names* environment variables, and
 | `YOUTUBE_DOWNLOAD_DIR` | `scripts/download-youtube.sh` | Optional output directory. |
 | `REPLAY_NATIVE_WORK_NAME`, `HF_HUB_OFFLINE`, `HF_DATASETS_OFFLINE`, `TRANSFORMERS_OFFLINE` | native build and ASR tooling | Non-secret switches. |
 | `VIEWER_DOMAIN` | `web-viewer/cloudflare.config.ts` | `web-viewer/deploy.env`, read by `bun run deploy`. |
-| `X_CLIENT_ID`, `X_CLIENT_SECRET`, `SESSION_SECRET`, `X_ADMIN_USERNAMES`, `DEBUG_TOKEN`, `DEBUG_TOKEN_EXPIRES`, `BASIC_USER`, `BASIC_PASS` | viewer Worker | Uploaded as Worker secrets from `web-viewer/secrets.json`. |
+| `X_CLIENT_ID`, `X_CLIENT_SECRET`, `SESSION_SECRET`, `X_ADMIN_USERNAMES`, `DEBUG_TOKEN`, `DEBUG_TOKEN_EXPIRES`, `BASIC_USER`, `BASIC_PASS`, `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | viewer Worker | Uploaded as Worker secrets from `web-viewer/secrets.json`. |
 | `UPLOAD_TOKEN` | temporary uploader Worker | Random per sync run; never stored. |
 
 The downloader never reads a `.env` file automatically; do not add automatic loading.

@@ -2,7 +2,10 @@
 // Every route except /login and /auth/* requires a signed session cookie issued
 // after X (OAuth 2.0 + PKCE) sign-in of an admin (env X_ADMIN_USERNAMES) or an
 // account the admin added on /admin (stored in R2 config/allowed-users.json), because the
-// bucket holds personal recordings; never add a public route here.
+// bucket holds personal recordings; never add a public route here. The one exception is
+// /s/<token>/…: an admin-issued share (R2 shares/<token>.json, random 256-bit token,
+// expiry, revocable) that exposes only the page and the single video it names, and only
+// after a Cloudflare Turnstile check (no Turnstile keys configured: shares stay closed).
 // Until X_CLIENT_ID is configured, HTTP Basic (BASIC_USER / BASIC_PASS) stays
 // as the only gate so a half-configured deploy never opens the site.
 const SESSION_COOKIE = "tv_session";
@@ -12,11 +15,20 @@ const OAUTH_SECONDS = 600;
 const DEBUG_SESSION_SECONDS = 3600;
 const ALLOW_KEY = "config/allowed-users.json";
 const ALLOW_CACHE_MS = 10_000;
+const SHARE_DEFAULT_DAYS = 7;
+const SHARE_MAX_DAYS = 365;
+const SHARE_PASS_COOKIE = "tv_share";
+const SHARE_PASS_SECONDS = 60 * 60 * 12;
+const TURNSTILE_VERIFY = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 let allowCache = { at: 0, users: [] };
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/s/")) return shareRoute(request, url, env);
+    if (url.pathname === "/robots.txt") {
+      return new Response("User-agent: *\nDisallow: /\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    }
     if (xConfigured(env)) {
       if (url.pathname === "/login") return loginPage(url);
       if (url.pathname === "/auth/login") return startLogin(url, env);
@@ -33,7 +45,7 @@ export default {
       if (url.pathname === "/admin" || url.pathname.startsWith("/api/admin/")) {
         if (!isAdmin(session.u, env)) return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
         if (url.pathname === "/admin") return adminPage();
-        return adminApi(request, url, env);
+        return adminApi(request, url, env, session);
       }
     } else if (!basicAuthorized(request, env)) {
       return new Response("Authentication required", {
@@ -47,22 +59,26 @@ export default {
     }
     // /streamers, /streamers/<name> and /streamers/<name>/videos/<id> are client-routed pages.
     if (url.pathname === "/streamers" || url.pathname.startsWith("/streamers/")) {
-      return env.ASSETS.fetch(new Request(new URL("/", url), request));
+      // Revalidate every load (cheap 304) so a deploy is never hidden behind a cached old page.
+      const page = await env.ASSETS.fetch(new Request(new URL("/", url), request));
+      const headers = new Headers(page.headers);
+      headers.set("Cache-Control", "no-cache");
+      return new Response(page.body, { status: page.status, headers });
     }
     if (url.pathname === "/api/catalog") {
-      return r2Json(env, "catalog.json");
+      return r2Json(request, env, "catalog.json");
     }
     const dataMatch = url.pathname.match(/^\/api\/videos\/([A-Za-z0-9._-]+)\.json$/);
     if (dataMatch) {
-      return r2Json(env, `data/${dataMatch[1]}.json`);
+      return r2Json(request, env, `data/${dataMatch[1]}.json`);
     }
     const mediaMatch = url.pathname.match(/^\/media\/([A-Za-z0-9._-]+\.mp4)$/);
     if (mediaMatch) {
-      return serveMedia(request, env, `media/${mediaMatch[1]}`);
+      return serveMedia(request, url, env, `media/${mediaMatch[1]}`);
     }
     const originalMatch = url.pathname.match(/^\/media-original\/([A-Za-z0-9._-]+\.mp4)$/);
     if (originalMatch) {
-      return serveMedia(request, env, `media-original/${originalMatch[1]}`);
+      return serveMedia(request, url, env, `media-original/${originalMatch[1]}`);
     }
     return env.ASSETS.fetch(request);
   },
@@ -188,12 +204,16 @@ const json = (value, status = 200) =>
     headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
   });
 
-async function adminApi(request, url, env) {
-  if (url.pathname !== "/api/admin/users") return new Response("Not found", { status: 404 });
-  if (request.method === "GET") return json({ users: await allowedUsers(env) });
+async function adminApi(request, url, env, session) {
+  const shares = url.pathname === "/api/admin/shares";
+  if (!shares && url.pathname !== "/api/admin/users") return new Response("Not found", { status: 404 });
+  if (request.method === "GET") {
+    return shares ? json({ shares: await listShares(env, url.searchParams.get("video")) }) : json({ users: await allowedUsers(env) });
+  }
   const sameOrigin = request.headers.get("Origin") === url.origin;
   const isJson = (request.headers.get("Content-Type") || "").startsWith("application/json");
   if (!sameOrigin || !isJson) return new Response("Bad request", { status: 400 });
+  if (shares) return shareWrite(request, env, session);
   const name = normalizeName((await request.json().catch(() => ({}))).username);
   if (!/^[a-z0-9_]{1,15}$/.test(name)) return json({ error: "invalid username" }, 400);
   const current = await allowedUsers(env);
@@ -216,13 +236,17 @@ ul{padding:0}li button{background:#2a2f3a}input:focus-visible,button:focus-visib
 <main><p><a href="/">← 動画一覧へ</a></p><h1>閲覧許可の管理</h1>
 <p>ここに追加したXアカウントは、ログイン後に閲覧できます。管理者は環境変数 X_ADMIN_USERNAMES で指定され、常に許可されます。</p>
 <form id="f"><input id="u" placeholder="Xのユーザー名（@なし）" autocomplete="off" required><button>追加</button></form>
-<p id="msg" class="err" role="alert"></p><ul id="list"></ul><p class="note" id="empty" hidden>追加されたアカウントはありません。</p></main>
+<p id="msg" class="err" role="alert"></p><ul id="list"></ul><p class="note" id="empty" hidden>追加されたアカウントはありません。</p>
+<h1>共有リンク</h1><p>動画ページの「共有」で発行したリンクです。オフにするとすぐに無効になります。</p><ul id="shares"></ul><p class="note" id="noShares" hidden>共有リンクはありません。</p></main>
 <script>
 const list=document.getElementById("list"),msg=document.getElementById("msg"),empty=document.getElementById("empty");
 function render(users){list.replaceChildren(...users.map(n=>{const li=document.createElement("li"),b=document.createElement("button");li.append("@"+n);b.textContent="削除";b.onclick=()=>call("DELETE",n);li.append(b);return li;}));empty.hidden=users.length>0;}
 async function call(method,username){msg.textContent="";const r=await fetch("/api/admin/users",{method,headers:{"Content-Type":"application/json"},body:JSON.stringify({username})});const d=await r.json().catch(()=>({}));if(!r.ok){msg.textContent=d.error||"失敗しました";return;}render(d.users);}
 document.getElementById("f").onsubmit=e=>{e.preventDefault();const v=document.getElementById("u");call("POST",v.value);v.value="";};
 fetch("/api/admin/users").then(r=>r.json()).then(d=>render(d.users));
+function renderShares(shares){const now=Date.now()/1000;document.getElementById("noShares").hidden=shares.length>0;document.getElementById("shares").replaceChildren(...shares.map(s=>{const li=document.createElement("li"),a=document.createElement("a"),b=document.createElement("button"),kinds=[s.video.movie&&"編集済み",s.video.original&&"元動画"].filter(Boolean).join("・");a.href="/s/"+s.token;a.target="_blank";a.textContent=(s.video.broadcastStartJST||s.video.id)+" "+kinds;li.append(a," ",s.expiresAt>now?"〜"+new Date(s.expiresAt*1000).toLocaleString("ja-JP"):"期限切れ");b.textContent="オフにする";b.onclick=async()=>{const r=await fetch("/api/admin/shares",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:s.token})});if(r.ok)loadShares();else msg.textContent="失敗しました";};li.append(b);return li;}));}
+function loadShares(){fetch("/api/admin/shares").then(r=>r.json()).then(d=>renderShares(d.shares));}
+loadShares();
 </script></html>`;
   return new Response(html, { headers: PAGE_HEADERS });
 }
@@ -349,16 +373,23 @@ function logout() {
   });
 }
 
-async function r2Json(env, key) {
+// Catalog and transcripts change when a sync uploads them: browsers revalidate every time and
+// an unchanged object costs only a 304 (a long stale-while-revalidate kept renamed speakers for a day).
+async function r2Json(request, env, key) {
+  const headers = { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "private, no-cache" };
+  const head = await env.MEDIA.head(key);
+  if (!head) return new Response("Not found", { status: 404 });
+  if (request.headers.get("If-None-Match") === head.httpEtag) {
+    return new Response(null, { status: 304, headers: { ...headers, ETag: head.httpEtag } });
+  }
   const obj = await env.MEDIA.get(key);
   if (!obj) return new Response("Not found", { status: 404 });
-  return new Response(obj.body, {
-    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "private, max-age=300, stale-while-revalidate=86400" },
-  });
+  return new Response(obj.body, { headers: { ...headers, ETag: obj.httpEtag } });
 }
 
 // R2 honors HTTP range reads; without this a <video> element cannot seek.
-async function serveMedia(request, env, key) {
+// ?download=1 adds Content-Disposition; Range stays on so large downloads can resume.
+async function serveMedia(request, url, env, key) {
   const head = await env.MEDIA.head(key);
   if (!head) return new Response("Not found", { status: 404 });
   const size = head.size;
@@ -368,6 +399,9 @@ async function serveMedia(request, env, key) {
     "Cache-Control": "private, max-age=3600",
     ETag: head.httpEtag,
   };
+  if (url.searchParams.get("download") === "1") {
+    base["Content-Disposition"] = `attachment; filename="${key.split("/").pop()}"`;
+  }
   if (request.method === "HEAD") {
     return new Response(null, { headers: { ...base, "Content-Length": String(size) } });
   }
@@ -405,4 +439,191 @@ function parseRange(header, size) {
     end = m[2] === "" ? size - 1 : Math.min(Number(m[2]), size - 1);
   }
   return start > end || start >= size ? "invalid" : { start, end };
+}
+
+// Shares: R2 shares/<token>.json holds the video snapshot and the allowed kinds, so the
+// public route never reads the catalog (whose entries carry local filesystem paths).
+const SHARE_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const shareKey = (token) => `shares/${token}.json`;
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+async function readShare(env, token) {
+  if (!SHARE_TOKEN.test(token)) return null;
+  const obj = await env.MEDIA.get(shareKey(token));
+  return obj ? obj.json() : null;
+}
+
+// shortcut: one list page (1000 shares), paginate if shares ever exceed that.
+async function listShares(env, videoId) {
+  const listed = await env.MEDIA.list({ prefix: "shares/" });
+  const shares = await Promise.all(listed.objects.map(async (o) => (await env.MEDIA.get(o.key))?.json()));
+  return shares
+    .filter((s) => s && (!videoId || s.video.id === videoId))
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+async function shareWrite(request, env, session) {
+  const body = await request.json().catch(() => ({}));
+  if (request.method === "DELETE") {
+    if (!SHARE_TOKEN.test(String(body.token))) return json({ error: "invalid token" }, 400);
+    await env.MEDIA.delete(shareKey(body.token));
+    return json({ ok: true });
+  }
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  const days = body.days ?? SHARE_DEFAULT_DAYS;
+  if (!Number.isInteger(days) || days < 1 || days > SHARE_MAX_DAYS) return json({ error: `days must be 1-${SHARE_MAX_DAYS}` }, 400);
+  if (!body.edited && !body.original) return json({ error: "choose edited and/or original" }, 400);
+  const catalog = await env.MEDIA.get("catalog.json");
+  const entry = catalog ? (await catalog.json()).videos.find((v) => v.id === body.videoId) : undefined;
+  if (!entry) return json({ error: "unknown video" }, 400);
+  if ((body.edited && !entry.movie) || (body.original && !entry.original)) return json({ error: "video kind not available" }, 400);
+  const createdAt = nowSeconds();
+  const share = {
+    token: randomToken(32),
+    createdAt,
+    expiresAt: createdAt + days * 86400,
+    createdBy: session.u,
+    // Named fields only: catalog entries also hold local paths that must stay private.
+    video: {
+      id: entry.id,
+      streamer: entry.streamer,
+      title: entry.title,
+      broadcastStartJST: entry.broadcastStartJST,
+      duration: entry.duration,
+      movie: body.edited ? entry.movie : null,
+      original: body.original ? { movie: entry.original.movie } : null,
+    },
+  };
+  await env.MEDIA.put(shareKey(share.token), JSON.stringify(share), { httpMetadata: { contentType: "application/json" } });
+  return json({ share });
+}
+
+function shareGone(url) {
+  if (url.pathname.split("/").length > 3) return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
+  const html = `<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>共有リンク | TranscriptViewer Web</title><meta name="robots" content="noindex"><link rel="icon" type="image/svg+xml" href="${FAVICON}"><style>
+:root{color-scheme:dark}body{margin:0;min-height:100dvh;display:grid;place-items:center;font-family:system-ui,-apple-system,"Hiragino Sans",sans-serif;background:#0f1115;color:#e8eaed}p{color:#9aa3b2}</style>
+<main><p>この共有リンクは無効か、有効期限が切れています。</p></main></html>`;
+  return new Response(html, { status: 404, headers: { ...PAGE_HEADERS, "X-Robots-Tag": "noindex" } });
+}
+
+// Missing, malformed, expired and revoked (deleted) shares all look the same.
+async function shareRoute(request, url, env) {
+  const [, , token, ...rest] = url.pathname.split("/");
+  const share = await readShare(env, token);
+  if (!share || share.expiresAt <= nowSeconds()) return shareGone(url);
+  const path = "/" + rest.join("/");
+  // The link-preview image is the one public piece: crawlers fetching OGP cannot pass Turnstile.
+  if (path === "/og.jpg") return shareImage(env, share.video);
+  if (path === "/verify") return verifyHuman(request, url, env, share);
+  if (!(await passedChallenge(request, env, token))) {
+    return path === "/" ? challengePage(env, share, url) : new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
+  }
+  const { video } = share;
+  if (path === "/") {
+    // No conditional headers from the visitor: always the current page, never a 304.
+    const page = await env.ASSETS.fetch(new Request(new URL("/", url)));
+    // The token is in the URL: keep it out of Referer (Google Fonts) and search indexes.
+    const headers = new Headers(page.headers);
+    headers.set("Referrer-Policy", "no-referrer");
+    headers.set("X-Robots-Tag", "noindex");
+    headers.set("Cache-Control", "no-store");
+    return new Response(page.body, { status: page.status, headers });
+  }
+  if (path === "/api/catalog") return json({ videos: [video], share: { expiresAt: share.expiresAt } });
+  if (path === `/api/videos/${video.id}.json`) {
+    const obj = await env.MEDIA.get(`data/${video.id}.json`);
+    return obj ? new Response(obj.body, { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }) : shareGone(url);
+  }
+  if (video.movie && path === `/media/${video.movie}`) return serveMedia(request, url, env, `media/${video.movie}`);
+  if (video.original && path === `/media-original/${video.original.movie}`) {
+    return serveMedia(request, url, env, `media-original/${video.original.movie}`);
+  }
+  return shareGone(url);
+}
+
+// Turnstile gate for shares: a visitor proves to be human once, then a signed cookie scoped
+// to this share's path (12 h) lets the page, data and media requests through.
+const turnstileConfigured = (env) => Boolean(env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY);
+
+async function passedChallenge(request, env, token) {
+  if (!turnstileConfigured(env)) return false;
+  const pass = await verify(env, cookie(request, SHARE_PASS_COOKIE));
+  return Boolean(pass && pass.share === token);
+}
+
+async function shareImage(env, video) {
+  const obj = await env.MEDIA.get(`og/${video.id}.jpg`);
+  if (!obj) return new Response("Not found", { status: 404, headers: { "Cache-Control": "no-store" } });
+  return new Response(obj.body, { headers: { "Content-Type": "image/jpeg", "Cache-Control": "public, max-age=600" } });
+}
+
+const escapeHtml = (text) =>
+  String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+// Link-preview tags for chat apps and social crawlers: who, when, how long, until when.
+// Nothing from the transcript or summary is exposed here.
+async function previewTags(env, share, url) {
+  const v = share.video;
+  const when = (v.broadcastStartJST || "").slice(0, 16);
+  const minutes = Math.round((v.duration || 0) / 60);
+  const length = minutes >= 60 ? `${Math.floor(minutes / 60)}時間${minutes % 60}分` : `${minutes}分`;
+  const until = new Date(share.expiresAt * 1000).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const title = escapeHtml(`${v.streamer} の配信 ${when}`);
+  const description = escapeHtml(`${when} JSTの配信アーカイブ（${length}）。${until}まで視聴できます。`);
+  const page = `${url.origin}/s/${share.token}`;
+  const image = (await env.MEDIA.head(`og/${v.id}.jpg`))
+    ? `<meta property="og:image" content="${page}/og.jpg"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="${title}"><meta name="twitter:image" content="${page}/og.jpg"><meta name="twitter:card" content="summary_large_image">`
+    : '<meta name="twitter:card" content="summary">';
+  return {
+    title,
+    tags: `<meta name="description" content="${description}"><meta property="og:type" content="video.other"><meta property="og:site_name" content="TranscriptViewer Web"><meta property="og:title" content="${title}"><meta property="og:description" content="${description}"><meta property="og:url" content="${page}"><meta property="og:locale" content="ja_JP"><meta name="twitter:title" content="${title}"><meta name="twitter:description" content="${description}">${image}`,
+  };
+}
+
+async function challengePage(env, share, url, failed = false) {
+  const token = share.token;
+  const preview = await previewTags(env, share, url);
+  const ready = turnstileConfigured(env);
+  const body = ready
+    ? `<p>ボットではないことを確認しています。</p>${failed ? '<p class="err" role="alert">確認できませんでした。もう一度お試しください。</p>' : ""}
+<form id="f" method="post" action="/s/${token}/verify"><div class="cf-turnstile" data-sitekey="${env.TURNSTILE_SITE_KEY}" data-callback="passed" data-language="ja"></div><noscript><p>JavaScriptを有効にしてください。</p></noscript></form>
+<script>function passed(){document.getElementById("f").submit();}</script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>`
+    : "<p>共有リンクは現在利用できません。</p>";
+  const html = `<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${preview.title}</title><meta name="robots" content="noindex">${preview.tags}<link rel="icon" type="image/svg+xml" href="${FAVICON}"><style>
+:root{color-scheme:dark}body{margin:0;min-height:100dvh;display:grid;place-items:center;font-family:system-ui,-apple-system,"Hiragino Sans",sans-serif;background:#0f1115;color:#e8eaed}main{text-align:center;padding:16px}p{color:#9aa3b2}.err{color:#ff8a8a}</style>
+<main>${body}</main></html>`;
+  // "origin" (not no-referrer): Turnstile checks the embedding origin, and the token path stays private.
+  return new Response(html, {
+    status: ready ? (failed ? 403 : 200) : 503,
+    headers: { ...PAGE_HEADERS, "Referrer-Policy": "origin", "X-Robots-Tag": "noindex" },
+  });
+}
+
+async function verifyHuman(request, url, env, share) {
+  const token = share.token;
+  if (request.method !== "POST" || request.headers.get("Origin") !== url.origin || !turnstileConfigured(env)) {
+    return new Response("Bad request", { status: 400, headers: { "Cache-Control": "no-store" } });
+  }
+  const form = await request.formData().catch(() => null);
+  const response = form?.get("cf-turnstile-response");
+  if (typeof response !== "string" || !response) return challengePage(env, share, url, true);
+  const body = new FormData();
+  body.append("secret", env.TURNSTILE_SECRET_KEY);
+  body.append("response", response);
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (ip) body.append("remoteip", ip);
+  const result = await fetch(TURNSTILE_VERIFY, { method: "POST", body })
+    .then((r) => r.json())
+    .catch(() => ({ success: false }));
+  if (!result.success || result.hostname !== url.hostname) return challengePage(env, share, url, true);
+  const pass = await sign(env, { share: token, exp: nowSeconds() + SHARE_PASS_SECONDS });
+  return new Response(null, {
+    status: 303,
+    headers: {
+      Location: `/s/${token}`,
+      "Cache-Control": "no-store",
+      "Set-Cookie": `${SHARE_PASS_COOKIE}=${pass}; Path=/s/${token}; Max-Age=${SHARE_PASS_SECONDS}; HttpOnly; Secure; SameSite=Lax`,
+    },
+  });
 }
