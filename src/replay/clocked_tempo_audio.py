@@ -11,7 +11,8 @@ import argparse
 import os
 import subprocess
 import wave
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from time import monotonic
@@ -26,7 +27,7 @@ from replay.foreground_evidence import _bound_bytes
 from replay.stages import file_digest
 from replay.tracking_observations import _checked_output, _digest
 
-MAX_WINDOW_BYTES = 64 * 1024**2
+MAX_WINDOW_BYTES = 512 * 1024**2  # one continuous kept span of about 46 min of 48 kHz stereo
 PROCESS_TIMEOUT_SECONDS = 120
 
 
@@ -182,6 +183,25 @@ def tempo_cut(
     return raw[crop * width : (crop + target) * width], measured
 
 
+def pieces(slot: CutSlot, low: int, high: int, width: int) -> Iterator[CutSlot]:
+    """The requested part of a slot, as budget-sized slots on the slot's own source mapping."""
+    if len(slot.spans) != 1 or slot.input_samples * width * 2 <= MAX_WINDOW_BYTES:
+        yield slot
+        return
+    ((start, end),) = slot.spans
+    target = slot.output_end - slot.output_start
+    step = MAX_WINDOW_BYTES // (4 * width)  # leaves the context and a faster rate in budget
+
+    def mapped(at: int) -> int:
+        return start + (at - slot.output_start) * (end - start) // target
+
+    for first in range(low, high, step):
+        last = min(high, first + step)
+        yield replace(
+            slot, output_start=first, output_end=last, spans=((mapped(first), mapped(last)),)
+        )
+
+
 def render(
     source: Path,
     output: Path,
@@ -207,11 +227,16 @@ def render(
                 low, high = max(output_start, slot.output_start), min(end, slot.output_end)
                 if low >= high:
                     continue
-                raw, measured = tempo_cut(reader, slot, ffmpeg=ffmpeg, policy=policy)
-                writer.writeframesraw(
-                    raw[(low - slot.output_start) * width : (high - slot.output_start) * width]
-                )
-                measurements.append(measured)
+                for piece in pieces(slot, low, high, width):
+                    raw, measured = tempo_cut(reader, piece, ffmpeg=ffmpeg, policy=policy)
+                    first, last = max(low, piece.output_start), min(high, piece.output_end)
+                    writer.writeframesraw(
+                        raw[
+                            (first - piece.output_start) * width : (last - piece.output_start)
+                            * width
+                        ]
+                    )
+                    measurements.append(measured)
     if source.stat() != before:
         raise ValueError("Source changed during tempo rendering")
     return tuple(measurements)
