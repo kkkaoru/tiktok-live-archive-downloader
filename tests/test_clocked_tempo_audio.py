@@ -177,6 +177,23 @@ def test_window_is_exact_crop_across_cut_boundary(tones: Path, tmp_path: Path) -
         assert reader.readframes(20) == expected
 
 
+@pytest.mark.parametrize("target", [32000, 30000])
+def test_long_slot_is_split_within_budget(
+    tones: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: int
+) -> None:
+    slots = (CutSlot(F(0), F(4), 0, target, ((0, 32000),)),)
+    job.render(tones, tmp_path / "whole.wav", slots, ffmpeg=FFMPEG, policy=job.TempoPolicy())
+    monkeypatch.setattr(job, "MAX_WINDOW_BYTES", 40000 * 4)
+    measured = job.render(
+        tones, tmp_path / "split.wav", slots, ffmpeg=FFMPEG, policy=job.TempoPolicy()
+    )
+    assert [m.output_end_sample for m in measured] == [*range(10000, target, 10000), target]
+    with wave.open(str(tmp_path / "split.wav"), "rb") as split:
+        assert split.getnframes() == target
+        if target == 32000:
+            assert split.readframes(target) == (tmp_path / "whole.wav").read_bytes()[44:]
+
+
 def test_chirp_frequency_tracks_source_time_without_octave_shift(tmp_path: Path) -> None:
     source = tmp_path / "chirp.wav"
     time = np.arange(32000) / 8000
