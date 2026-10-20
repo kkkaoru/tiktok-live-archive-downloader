@@ -239,6 +239,32 @@ struct RootViewTests {
         #expect(!session.showsError)
     }
 
+    @Test func skipButtonsMoveTenSecondsAndTheSpeedButtonCycles() throws {
+        let fixture = try SummaryFixture()
+        defer { #expect(throws: Never.self) { try fixture.remove() } }
+        let session = PlaybackSession()
+        session.videos = [fixture.video]
+        session.selectedVideoID = fixture.video.id
+        let view = TranscriptRootView(session: session)
+        let back = try view.inspect().find(button: "10秒戻す")
+        let forward = try view.inspect().find(button: "10秒送る")
+        let speed = try view.inspect().find(button: "速度を切り替え")
+
+        try forward.tap()
+        #expect(session.currentSeconds == session.sliderUpperBound)
+        #expect(session.player.rate == 0)
+        try back.tap()
+        #expect(session.currentSeconds == 0)
+        try speed.tap()
+        #expect(session.playbackSpeed == .oneAndHalf)
+        try speed.tap()
+        try speed.tap()
+        #expect(session.playbackSpeed == .half)
+        #expect(session.player.defaultRate == 0.5)
+        try speed.tap()
+        #expect(session.playbackSpeed == .normal)
+    }
+
     @Test func selectedVideoExposesPlaybackSpeedAndSwitchesBetweenSummaryAndTranscript() throws {
         let fixture = try SummaryFixture()
         defer { #expect(throws: Never.self) { try fixture.remove() } }

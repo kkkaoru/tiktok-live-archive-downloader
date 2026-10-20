@@ -61,7 +61,8 @@ struct TranscriptSummaryTests {
     }
 
     @Test func supportedSpeeds() {
-        #expect(PlaybackSpeed.allCases.map(\.rawValue) == [1, 1.5, 2])
-        #expect(PlaybackSpeed.allCases.map(\.label) == ["1.0x", "1.5x", "2.0x"])
+        #expect(PlaybackSpeed.allCases.map(\.rawValue) == [0.5, 1, 1.5, 2])
+        #expect(PlaybackSpeed.allCases.map(\.label) == ["0.5x", "1.0x", "1.5x", "2.0x"])
+        #expect(PlaybackSpeed.allCases.map(\.next) == [.normal, .oneAndHalf, .double, .half])
     }
 }

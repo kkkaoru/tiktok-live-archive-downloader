@@ -440,6 +440,16 @@ final class PlaybackSession {
         browseAnchorID = nil
     }
 
+    /// Moves by `offset` seconds within the movie, keeping play or pause as it is.
+    func skip(by offset: Double) {
+        let now = player.currentTime().seconds
+        let target = min(max(0, (now.isFinite ? now : currentSeconds) + offset), sliderUpperBound)
+        player.seek(
+            to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero,
+            toleranceAfter: .zero)
+        updateCue(at: target)
+    }
+
     func seek(to seconds: Double) {
         let clamped = min(max(0, seconds), sliderUpperBound)
         let time = CMTime(seconds: clamped, preferredTimescale: 600)

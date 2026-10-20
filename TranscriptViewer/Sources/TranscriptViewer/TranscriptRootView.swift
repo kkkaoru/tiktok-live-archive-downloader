@@ -177,8 +177,26 @@ struct TranscriptRootView: View {
                                     }
                                 }
                                 .pickerStyle(.segmented)
-                                .frame(width: 240)
+                                .frame(width: 300)
                                 .accessibilityLabel("再生速度")
+                                Button("速度を切り替え", systemImage: "speedometer") {
+                                    session.playbackSpeed = session.playbackSpeed.next
+                                }
+                                .labelStyle(.iconOnly)
+                                .keyboardShortcut("s", modifiers: [])
+                                .help("S: 再生速度を 0.5x→1.0x→1.5x→2.0x の順に切り替え")
+                                Button("10秒戻す", systemImage: "gobackward.10") {
+                                    session.skip(by: -10)
+                                }
+                                .labelStyle(.iconOnly)
+                                .keyboardShortcut(.leftArrow, modifiers: [])
+                                .help("←: 10秒戻す")
+                                Button("10秒送る", systemImage: "goforward.10") {
+                                    session.skip(by: 10)
+                                }
+                                .labelStyle(.iconOnly)
+                                .keyboardShortcut(.rightArrow, modifiers: [])
+                                .help("→: 10秒送る")
                                 Spacer()
                             }
                             timeline

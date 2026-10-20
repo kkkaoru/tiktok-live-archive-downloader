@@ -53,15 +53,27 @@ public struct TranscriptSummary: Equatable, Sendable, Encodable {
 
 /// Supported rates are shared by the picker and AVPlayer's default/current rate.
 public enum PlaybackSpeed: Float, CaseIterable, Sendable {
+    case half = 0.5
     case normal = 1
     case oneAndHalf = 1.5
     case double = 2
 
     public var label: String {
         switch self {
+        case .half: "0.5x"
         case .normal: "1.0x"
         case .oneAndHalf: "1.5x"
         case .double: "2.0x"
+        }
+    }
+
+    /// The next faster speed, wrapping from the fastest back to the slowest.
+    public var next: Self {
+        switch self {
+        case .half: .normal
+        case .normal: .oneAndHalf
+        case .oneAndHalf: .double
+        case .double: .half
         }
     }
 }
