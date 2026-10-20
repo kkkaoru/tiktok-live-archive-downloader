@@ -319,6 +319,12 @@ def native_stage_failures(details: dict[str, object]) -> dict[str, str]:
 
 def assess_delivery(delivery: Path, *, root: Path) -> dict[str, str]:
     """Return failed stages for one dated delivery; an empty mapping means complete."""
+    pipeline_index = delivery.parent.parent / "metadata" / "pipeline-evidence.json"
+    if pipeline_index.is_file():
+        # Recording-pipeline deliveries carry their own step evidence (replay.pipeline_completion).
+        from replay import pipeline_completion
+
+        return pipeline_completion.assess(pipeline_index, delivery=delivery, root=root)
     native = native_delivery_assessment(delivery, root=root)
     if native is not None:
         return native_stage_failures(native)
