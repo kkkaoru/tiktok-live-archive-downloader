@@ -5,10 +5,11 @@ import TranscriptSummaries
 let defaultRoot = FileManager.default.homeDirectoryForCurrentUser
     .appending(path: "Movies", directoryHint: .isDirectory)
     .appending(path: "Apple-Pro-Apps-Verification", directoryHint: .isDirectory)
-let root =
+// Several libraries are merged like the app's default catalog.
+let roots =
     CommandLine.arguments.count > 1
-    ? URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
-    : defaultRoot
+    ? CommandLine.arguments.dropFirst().map { URL(fileURLWithPath: $0, isDirectory: true) }
+    : [defaultRoot]
 
 do {
     if CommandLine.arguments.dropFirst().first == "--representative" {
@@ -27,7 +28,8 @@ do {
         )
         exit(0)
     }
-    let scan = try TranscriptCatalog.scan(in: root)
+    var scan = CatalogScan()
+    for root in roots { scan.merge(try TranscriptCatalog.scan(in: root)) }
     for video in scan.videos {
         print("OK \(video.title)/\(video.movieURL.lastPathComponent) cues=\(video.cues.count)")
     }
@@ -35,7 +37,7 @@ do {
         print("NG \(issue)")
     }
     print(
-        "LOADED \(scan.videos.count) ISSUES \(scan.issues.count) ROOT \(root.path(percentEncoded: false))"
+        "LOADED \(scan.videos.count) ISSUES \(scan.issues.count) ROOT \(roots.map { $0.path(percentEncoded: false) }.joined(separator: " "))"
     )
     exit(scan.issues.isEmpty ? 0 : 1)
 } catch {
