@@ -32,6 +32,8 @@ class Adaptation:
     output: Path
     media_root: Path
     chunk_frames: int
+    # The pinned clock moved with its work root: use this copy when its hash equals the pin.
+    source_clock: Path | None = None
 
 
 def _read(path: Path) -> dict[str, object]:
@@ -65,10 +67,11 @@ def _text_map(value: object) -> dict[str, str]:
     return {key: str(item) for key, item in data.items()}
 
 
-def _settings(adaptation: Adaptation, native: Path, native_sha: str) -> dict[str, str]:
-    """Write settings equal to the base ones except for the sampled-run native identity."""
+def _settings(adaptation: Adaptation, native: Path, native_sha: str, clock: Path) -> dict[str, str]:
+    """Write the base settings with the sampled-run native and the verified clock location."""
     base = _read(adaptation.settings)
     base["native"] = {"path": str(native), "sha256": native_sha}
+    base["sourceClock"] = _pin(clock)
     base["sampledRepair"] = {"basedOn": _pin(adaptation.settings), "qualityApproved": False}
     target = adaptation.output / "settings.json"
     _write(target, base)
@@ -174,10 +177,12 @@ def adapt(adaptation: Adaptation) -> Path:
     """Write the consumer layout for every chunk of the source plan; return ``plan.json``."""
     adaptation.output.mkdir(mode=0o700, parents=True)
     source_sha, native, native_sha = _identity(adaptation)
-    settings = _settings(adaptation, native, native_sha)
-    base = _read(adaptation.settings)
-    clock_ref = record(base.get("sourceClock"))
-    source_clock = _read(Path(str(clock_ref.get("path"))))
+    clock_ref = record(_read(adaptation.settings).get("sourceClock"))
+    clock_path = adaptation.source_clock or Path(str(clock_ref.get("path")))
+    if fingerprint(clock_path) != clock_ref.get("sha256"):
+        raise ValueError("Source clock differs from the settings pin")
+    settings = _settings(adaptation, native, native_sha, clock_path)
+    source_clock = _read(clock_path)
     clocks = clock_chunks(source_clock, maximum_frames=adaptation.chunk_frames)
     for index, clock in enumerate(clocks):
         _chunk(index, clock, adaptation, settings)

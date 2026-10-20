@@ -1,5 +1,6 @@
 """The consumer adapter writes hash-bound metadata only for validated sampled chunks."""
 
+import dataclasses
 import hashlib
 import json
 from fractions import Fraction
@@ -10,6 +11,7 @@ import pytest
 from replay import subtitle_sampled_consumer as consumer
 from replay.caption_io import FrameObservation
 from replay.caption_masks import MaskPolicy, TextDetection, TextRectangle
+from replay.core import ReplayError
 from replay.recordings import record
 from replay.subtitle_cleanup_plan import CaptionSearchProfile
 from replay.subtitle_clock import VideoFrameClock
@@ -181,6 +183,29 @@ def test_media_outside_the_root_is_rejected(tmp_path: Path) -> None:
     (tmp_path / "other").mkdir()
     with pytest.raises(ValueError, match="outside the media root"):
         consumer.adapt(elsewhere)
+
+
+def test_a_moved_clock_with_the_pinned_hash_is_used(tmp_path: Path) -> None:
+    world = _world(tmp_path)
+    settings = json.loads(world.settings.read_text("utf-8"))
+    pinned = Path(settings["sourceClock"]["path"])
+    moved = tmp_path / "moved-clock.json"
+    moved.write_bytes(pinned.read_bytes())
+    pinned.unlink()
+    with pytest.raises(ReplayError, match="regular local input"):
+        consumer.adapt(world)
+    moved_world = dataclasses.replace(world, output=tmp_path / "out-2", source_clock=moved)
+    assert _plan(moved_world)["plannedFrames"] == 4
+    written = json.loads((tmp_path / "out-2/settings.json").read_text("utf-8"))
+    assert written["sourceClock"] == {"path": str(moved), "sha256": _sha(moved)}
+
+
+def test_a_clock_differing_from_the_pin_is_rejected(tmp_path: Path) -> None:
+    world = _world(tmp_path)
+    other = tmp_path / "other-clock.json"
+    other.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="differs from the settings pin"):
+        consumer.adapt(dataclasses.replace(world, source_clock=other))
 
 
 def test_chunk_clock_must_match_the_source_plan(tmp_path: Path) -> None:
