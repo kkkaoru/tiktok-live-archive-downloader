@@ -105,6 +105,8 @@ def _chunk(
     config = _read(adaptation.configs / f"chunk-{index:05d}.json")
     state = adaptation.states / f"chunk-{index:05d}"
     receipt = _read(state / "chunk-receipt.json")
+    if receipt.get("accepted") is None:
+        raise ValueError(f"Chunk {index} failed its audit after escalation; rerun the cleanup step")
     accepted = str(receipt.get("accepted"))
     admission = _read(state / accepted / "admission.json")
     pins = _text_map(receipt.get("pins"))

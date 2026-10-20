@@ -256,3 +256,13 @@ def test_failed_audit_chunk_is_not_adapted(tmp_path: Path) -> None:
     path.write_text(json.dumps(receipt), encoding="utf-8")
     with pytest.raises(ValueError, match="residual-text audit"):
         consumer.adapt(world)
+
+
+def test_unaccepted_chunk_names_its_failure(tmp_path: Path) -> None:
+    world = _world(tmp_path)
+    path = tmp_path / "state/chunk-00001/chunk-receipt.json"
+    receipt = json.loads(path.read_text("utf-8"))
+    receipt["accepted"] = None
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="Chunk 1 failed its audit"):
+        consumer.adapt(world)
