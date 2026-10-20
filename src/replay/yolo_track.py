@@ -1,7 +1,10 @@
 """Track the avatar face and the burned-in caption boxes over a video with the trained detector.
 
 Frames are decoded once by ffmpeg, scaled to the training width (so the detector sees the same
-pixels it was trained on) and passed to the pinned checkpoint in batches. The result is a JSON
+pixels it was trained on) and passed to the pinned checkpoint in batches. By default the video is
+decoded by VideoToolbox (the media engine) and the detector runs on the GPU (MPS); the hardware
+decode yields the same bytes as the software decoder, and decoding runs ahead of inference so the
+two overlap. The result is a JSON
 evidence file that names the checkpoint and the video by sha256 and holds, per sampled frame, the
 single face box chosen by one fixed rule (highest confidence; the number of faces is kept so
 ambiguity stays visible) and the caption box count. Boxes are reported in source pixels. The
@@ -12,11 +15,13 @@ import argparse
 import hashlib
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from bisect import bisect_left
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -37,6 +42,10 @@ CONFIDENCE_FLOOR = 0.25
 TRAIN_WIDTH = 640
 MAX_BATCH = 64
 FACE_RULE = "highest-confidence face box; faceCount keeps the number of faces above the floor"
+DECODERS = ("videotoolbox", "software")
+PREFETCH_FRAMES = 128
+# One decoded frame, the decoder's failure, or the end of the stream.
+Prefetched = tuple[int, NDArray[np.uint8]] | BaseException | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,21 +179,30 @@ def video_frames(
     start: int,
     end: int,
     step: int,
-    rate: int,
+    rate: int | Fraction,
     ffmpeg: str,
-) -> Iterator[tuple[int, NDArray[np.uint8]]]:
+    decoder: str = "software",
+) -> Generator[tuple[int, NDArray[np.uint8]]]:
     """Decode frames start, start+step, ... below `end`, scaled to the training width (BGR).
 
     The input is sought to `start / rate` and the output is limited to the wanted frame count, so
-    ffmpeg stops reading when the range is done instead of decoding to the end of the file.
+    ffmpeg stops reading when the range is done instead of decoding to the end of the file. With
+    ``videotoolbox`` the frames stay on the media engine until the sampled ones are downloaded;
+    the scaling is the same software filter, so the pixels match the software decoder's.
     """
     if not 0 <= start < end or step < 1 or rate < 1:
         raise ReplayError("Invalid frame range or step")
+    if decoder not in DECODERS:
+        raise ReplayError(f"Unknown decoder: {decoder}")
     scaled = scaled_height(width, height)
     count = (end - start + step - 1) // step
+    hardware = decoder == "videotoolbox"
+    accelerated = ["-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld"]
+    download = "hwdownload,format=nv12," if hardware else ""
     command = [
-        ffmpeg, "-v", "error", "-nostdin", "-ss", f"{start / rate:.6f}", "-i", str(source),
-        "-vf", f"select='not(mod(n,{step}))',scale={TRAIN_WIDTH}:{scaled}",
+        ffmpeg, "-v", "error", "-nostdin", *(accelerated if hardware else []),
+        "-ss", f"{float(start / rate):.6f}", "-i", str(source),
+        "-vf", f"select='not(mod(n,{step}))',{download}scale={TRAIN_WIDTH}:{scaled}",
         "-frames:v", str(count), "-fps_mode", "passthrough",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]  # fmt: skip
@@ -198,6 +216,52 @@ def video_frames(
             number += step
     if process.returncode != 0:
         raise ReplayError("ffmpeg failed while decoding frames")
+
+
+def prefetched(
+    frames: Generator[tuple[int, NDArray[np.uint8]]], depth: int = PREFETCH_FRAMES
+) -> Generator[tuple[int, NDArray[np.uint8]]]:
+    """Yield `frames` while a thread keeps decoding up to `depth` frames ahead.
+
+    The detector then waits for the decoder only when decoding is the slower side. A decoder
+    failure is raised where the frame it failed to produce would have been yielded; when the
+    consumer stops early the decoder is closed, which ends its ffmpeg process.
+    """
+    if depth < 1:
+        raise ReplayError("Invalid prefetch depth")
+    buffer: queue.Queue[Prefetched] = queue.Queue(depth)
+    stop = threading.Event()
+
+    def put(item: Prefetched) -> bool:
+        while not stop.is_set():
+            try:
+                buffer.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def produce() -> None:
+        try:
+            for item in frames:
+                if not put(item):
+                    return
+            put(None)
+        except BaseException as error:  # handed to the consumer, which raises it
+            put(error)
+        finally:
+            frames.close()
+
+    worker = threading.Thread(target=produce, name="yolo-decode", daemon=True)
+    worker.start()
+    try:
+        while (item := buffer.get()) is not None:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop.set()
+        worker.join()
 
 
 def scaled_height(width: int, height: int) -> int:
@@ -245,18 +309,22 @@ def document(
     weights: tuple[Path, str],
     source: tuple[Path, str],
     size: tuple[int, int],
-    rate: int,
+    rate: int | Fraction,
     step: int,
     timing: dict[str, float],
+    device: str = "mps",
+    decoder: str = "software",
 ) -> dict[str, object]:
     return {
         "protocol": PROTOCOL,
         "provenance": "yolo",
+        "device": device,
+        "decoder": decoder,
         "weights": {"path": str(weights[0]), "sha256": weights[1]},
         "source": {"path": str(source[0]), "sha256": source[1]},
         "width": size[0],
         "height": size[1],
-        "rate": rate,
+        "rate": rate.numerator if rate.denominator == 1 else str(rate),
         "step": step,
         "timeBase": str(clock.time_base),
         "faceRule": FACE_RULE,
@@ -275,8 +343,8 @@ def document(
     }
 
 
-def probe_video(source: Path, ffprobe: str) -> tuple[int, int, int]:
-    """(width, height, integer frame rate) of the first video stream."""
+def probe_video(source: Path, ffprobe: str) -> tuple[int, int, Fraction]:
+    """(width, height, nominal frame rate) of the first video stream; it may be fractional."""
     out = subprocess.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
          "stream=width,height,r_frame_rate", "-of", "json", str(source)],
@@ -284,9 +352,9 @@ def probe_video(source: Path, ffprobe: str) -> tuple[int, int, int]:
     ).stdout  # fmt: skip
     stream = json.loads(out)["streams"][0]
     numerator, denominator = (int(part) for part in str(stream["r_frame_rate"]).split("/"))
-    if denominator < 1 or numerator % denominator != 0:
-        raise ReplayError("Only integer frame rates are supported")
-    return int(stream["width"]), int(stream["height"]), numerator // denominator
+    if numerator < 1 or denominator < 1:
+        raise ReplayError("The video has no frame rate")
+    return int(stream["width"]), int(stream["height"]), Fraction(numerator, denominator)
 
 
 def parse(argv: list[str] | None) -> argparse.Namespace:
@@ -302,6 +370,7 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--device", choices=("mps", "cpu"), default="mps")
+    parser.add_argument("--decoder", choices=DECODERS, default="videotoolbox")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
@@ -313,10 +382,10 @@ def run(args: argparse.Namespace, model: ModelLike) -> dict[str, object]:
     clock = presentation_clock(args.source, args.ffprobe)
     started = time.monotonic()
     rows, inference = track(
-        video_frames(
+        prefetched(video_frames(
             args.source, width=width, height=height, start=args.start, end=args.end,
-            step=args.step, rate=rate, ffmpeg=args.ffmpeg,
-        ),
+            step=args.step, rate=rate, ffmpeg=args.ffmpeg, decoder=args.decoder,
+        )),
         model, scale=width / TRAIN_WIDTH, batch=args.batch, device=args.device, imgsz=args.imgsz,
     )  # fmt: skip
     wall = time.monotonic() - started
@@ -327,7 +396,7 @@ def run(args: argparse.Namespace, model: ModelLike) -> dict[str, object]:
         "framesPerSecond": len(rows) / wall if wall > 0 else 0.0,
     }
     return document(
-        timed_rows(rows, clock, start=Fraction(args.start, rate), step=args.step),
+        timed_rows(rows, clock, start=args.start / rate, step=args.step),
         clock=clock,
         weights=(args.weights, args.weights_sha256),
         source=(args.source, sha256(args.source)),
@@ -335,7 +404,17 @@ def run(args: argparse.Namespace, model: ModelLike) -> dict[str, object]:
         rate=rate,
         step=args.step,
         timing=timing,
+        device=args.device,
+        decoder=args.decoder,
     )
+
+
+def require_mps() -> None:
+    """Refuse to start on the GPU path when Metal is unavailable instead of running elsewhere."""
+    import torch
+
+    if not torch.backends.mps.is_available():
+        raise ReplayError("The MPS (GPU) device is not available")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -346,6 +425,8 @@ def main(argv: list[str] | None = None) -> int:
     check_settings(args.config_directory, args.work)
     os.environ["YOLO_CONFIG_DIR"] = str(args.config_directory)
     os.environ["ULTRALYTICS_OFFLINE"] = "1"
+    if args.device == "mps":
+        require_mps()
     from ultralytics.engine.results import Results
     from ultralytics.models.yolo.model import YOLO
 

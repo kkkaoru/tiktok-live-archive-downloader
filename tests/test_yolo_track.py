@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 import types
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from fractions import Fraction
 from pathlib import Path
 
@@ -230,7 +230,7 @@ def test_the_decoded_stream_samples_the_requested_frames_at_the_training_width(
     )
     assert [number for number, _ in got] == [4, 9, 14, 19, 24]
     assert got[0][1].shape == (960, 640, 3)
-    assert tracking.probe_video(video, "ffprobe") == (320, 480, 10)
+    assert tracking.probe_video(video, "ffprobe") == (320, 480, Fraction(10))
 
 
 def test_an_invalid_range_or_step_is_refused() -> None:
@@ -264,14 +264,24 @@ def test_a_failing_decoder_is_reported(tmp_path: Path) -> None:
         )
 
 
-def test_a_non_integer_frame_rate_is_refused(
+def test_a_fractional_frame_rate_is_kept_exactly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class Done:
-        stdout = json.dumps({"streams": [{"width": 4, "height": 4, "r_frame_rate": "30000/1001"}]})
+        stdout = json.dumps({"streams": [{"width": 4, "height": 4, "r_frame_rate": "301/12"}]})
 
     monkeypatch.setattr(subprocess, "run", lambda *args, **options: Done())
-    with pytest.raises(ReplayError, match="integer frame rates"):
+    assert tracking.probe_video(tmp_path / "x.mp4", "ffprobe") == (4, 4, Fraction(301, 12))
+
+
+def test_a_video_without_a_frame_rate_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Done:
+        stdout = json.dumps({"streams": [{"width": 4, "height": 4, "r_frame_rate": "0/0"}]})
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **options: Done())
+    with pytest.raises(ReplayError, match="no frame rate"):
         tracking.probe_video(tmp_path / "x.mp4", "ffprobe")
 
 
@@ -338,6 +348,7 @@ def test_run_and_main_write_evidence_for_a_synthetic_video(
     assert written["frames"][0]["face"] == [0.5, 1.0, 1.5, 2.0, 0.8]
     assert written["rate"] == 10
     assert written["step"] == 10
+    assert (written["device"], written["decoder"]) == ("cpu", "videotoolbox")
     assert set(written["timing"]) == {
         "wallSeconds", "inferenceSeconds", "decodeAndOtherSeconds", "framesPerSecond",
     }  # fmt: skip
@@ -351,6 +362,7 @@ def test_parse_defaults(tmp_path: Path) -> None:
     )  # fmt: skip
     assert isinstance(args, argparse.Namespace)
     assert (args.start, args.batch, args.device, args.imgsz) == (0, 16, "mps", 640)
+    assert args.decoder == "videotoolbox"
 
 
 def test_main_refuses_to_overwrite_before_loading_anything(tmp_path: Path) -> None:
@@ -362,3 +374,95 @@ def test_main_refuses_to_overwrite_before_loading_anything(tmp_path: Path) -> No
              "--config-directory", str(tmp_path), "--work", str(tmp_path), "--end", "10",
              "--step", "5"]
         )  # fmt: skip
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required for the stream test")
+def test_the_hardware_decoder_gives_the_software_decoders_pixels(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x480:rate=10:duration=2",
+         "-pix_fmt", "yuv420p", str(video)],
+        check=True,
+    )  # fmt: skip
+    decoded = {
+        decoder: list(
+            tracking.video_frames(
+                video,
+                width=320,
+                height=480,
+                start=2,
+                end=20,
+                step=3,
+                rate=10,
+                ffmpeg="ffmpeg",
+                decoder=decoder,
+            )
+        )  # fmt: skip
+        for decoder in tracking.DECODERS
+    }
+    hardware, software = decoded["videotoolbox"], decoded["software"]
+    assert [n for n, _ in hardware] == [n for n, _ in software] == [2, 5, 8, 11, 14, 17]
+    assert all(np.array_equal(a, b) for (_, a), (_, b) in zip(hardware, software, strict=True))
+
+
+def test_an_unknown_decoder_is_refused() -> None:
+    with pytest.raises(ReplayError, match="Unknown decoder: gpu"):
+        next(
+            tracking.video_frames(
+                Path("x.mp4"), width=10, height=10, start=0, end=5, step=1, rate=10,
+                ffmpeg="ffmpeg", decoder="gpu",
+            )
+        )  # fmt: skip
+
+
+def numbered(count: int, closed: list[bool]) -> Generator[tuple[int, NDArray[np.uint8]]]:
+    try:
+        for number in range(count):
+            yield number, np.zeros((1, 1, 3), dtype=np.uint8)
+    finally:
+        closed.append(True)
+
+
+def test_prefetching_keeps_the_order_and_closes_the_decoder() -> None:
+    closed: list[bool] = []
+    frames = numbered(10, closed)
+    assert [n for n, _ in tracking.prefetched(frames, depth=2)] == list(range(10))
+    assert closed == [True]
+
+
+def test_stopping_early_closes_the_decoder() -> None:
+    closed: list[bool] = []
+    stream = tracking.prefetched(numbered(1000, closed), depth=1)
+    assert next(stream)[0] == 0
+    stream.close()
+    assert closed == [True]
+
+
+def test_a_decoder_failure_reaches_the_consumer() -> None:
+    def failing() -> Generator[tuple[int, NDArray[np.uint8]]]:
+        yield 0, np.zeros((1, 1, 3), dtype=np.uint8)
+        raise ReplayError("ffmpeg failed while decoding frames")
+
+    stream = tracking.prefetched(failing(), depth=4)
+    assert next(stream)[0] == 0
+    with pytest.raises(ReplayError, match="ffmpeg failed"):
+        next(stream)
+
+
+def test_an_invalid_prefetch_depth_is_refused() -> None:
+    with pytest.raises(ReplayError, match="prefetch depth"):
+        next(tracking.prefetched(numbered(1, []), depth=0))
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_the_gpu_path_requires_mps(monkeypatch: pytest.MonkeyPatch, available: bool) -> None:
+    torch = types.ModuleType("torch")
+    torch.__dict__["backends"] = types.SimpleNamespace(
+        mps=types.SimpleNamespace(is_available=lambda: available)
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    if available:
+        tracking.require_mps()
+    else:
+        with pytest.raises(ReplayError, match="MPS"):
+            tracking.require_mps()
