@@ -366,3 +366,53 @@ the move need re-pinning, while content sha256 still verifies.
   unresolved. Reports:
   `edits/work/cold-consolidation/repin-report.json` and `repin-report-2.json`. Plans that will run again are re-bound with
   `replay.separation_plan_refresh` or `replay.metal_asr_config`.
+
+
+## BGM library
+
+BGM is kept apart from TikTok/YouTube replays in `<library>/<video id>/`, where `<library>` is the
+`root` of ignored `edits/bgm-library.json` (`{"version": 1, "root": "/Volumes/m.2-ssd/movie/bgm-library"}`;
+the Viewer and `replay.bgm_library` both read it, an unmounted volume is reported and never
+recreated) or, without it, `edits/bgm-library`:
+`<title> [<id>].m4a` (title, channel and artwork embedded, ready to drag into Final Cut Pro or
+Logic Pro), `<title> [<id>].jpg` and an allowlisted `track.json` (title, channel, channel URL,
+watch URL, duration, upload time; never signed media URLs). Save tracks with
+`python -m replay.bgm_library add URL [URL ...]`; only canonical watch URLs are accepted, audio
+only is downloaded (no video, no cookies), and a track appears only after its audio decodes.
+The audio is YouTube's best stream (`-f ba`, usually Opus ~160k at 48 kHz) decoded once into
+24-bit Apple Lossless, so no second lossy generation is added (about 375 MB per 30 min). Do not
+let yt-dlp convert it (`-x --audio-format alac` produced AAC). An existing track is reported as
+`present`; `--replace` re-downloads it and swaps it in only once the new one decodes. TranscriptViewer opens
+the library in its own **BGM** window (toolbar or ⌘B): search title/channel, play audio with the
+thumbnail shown, open the YouTube page, Reveal Finder, copy the path, or save a new URL.
+`storage_disposition` always keeps `bgm-library`.
+
+### Looping BGM from a talk stream
+
+When a stream's BGM is a loop under continuous talk, rebuild it from the separation residual
+instead of downloading anything. `python -m replay.bgm_loop residual OUT.wav --part MIX VOCALS
+... --keep-seconds S` joins mix minus the separated vocals with exactly the decoded parts and
+grid the separation used (verify each part's decode hash against its `sourceSHA256`).
+`python -m replay.bgm_loop extract RESIDUAL VOCALS OUT.wav RECEIPT.json --repeats N` measures
+the period by autocorrelation, aligns every repetition per 10 s segment (decoding joins and
+clock drift included), rebuilds each 1 s block by a spectral median taken per frame over only
+the copies in which nobody speaks at that moment (under speech the separation also strips parts
+of the music, identically in every talked-over copy) and tiles N seamless periods. Frames with
+fewer than three speech-free copies (`fewSpeechFreeBlockSeconds`) take, per frequency bin, the
+third of the copies (3-8) with the least vocal-stem magnitude in that bin, because the separation
+strips music only where it hears voice; on a held-out speech-free phase rebuilt from talked-over
+copies only this cut the 2-16 kHz error by about 1 dB versus the quietest three copies broadband.
+The receipt lists `uncleanBlockSeconds` (no two copies agree) and `singleCopyBlockSeconds` (no
+median possible); check the result by
+separating one period again and comparing its vocal energy with a raw repetition. When the
+period holds a silence (a song that ends and is played again), the output starts at the attack
+after it (`songStartFrame`); `python -m replay.bgm_loop retile MASTER.wav OUT.wav --repeats N`
+re-tiles an exact one-period master the same way. A BGM mixed under talk is quiet: both commands
+scale the period once in floating point so its 4x-oversampled true peak meets `--peak-db`
+(default -1 dBFS, receipt `gainDB`). Decode the mix parts with `-c:a pcm_s32le`; the residual and
+output are 32-bit float WAV (RF64 once past 4 GiB, as a multi-hour residual is), so the gain
+amplifies no rounding noise (scaling a saved 16-bit master would). Publish it with
+`python -m replay.bgm_library add-loop URL OUT.wav [--replace]`, which fetches only metadata and
+the thumbnail and encodes 24-bit Apple Lossless (sample-exact length, so the file wraps gaplessly;
+the Viewer's restart at the end of the item is not guaranteed gapless); `--replace` swaps an existing track only after the new one is staged and decodes.
+The track is marked `loop` and the Viewer restarts it at its end.
