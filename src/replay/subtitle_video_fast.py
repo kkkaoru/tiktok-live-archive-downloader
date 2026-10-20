@@ -169,12 +169,13 @@ def fast_repair_stream(
     def drain() -> None:
         item = pending.popleft()
         for offset, frame in enumerate(item.frames):
-            output = frame.copy()
             span, glyph, future = item.spans[offset], item.glyphs[offset], item.futures[offset]
             index = item.first + offset
             result: RepairedFrame | None = None
+            output = frame  # a frame without a repair is written as decoded, not copied
             if span is not None and future is not None:
                 result = future.result()
+                output = frame.copy()
                 output[span.y : span.y + span.height, span.x : span.x + span.width] = result.image
                 receipt(index, span, result)
             write(output)
