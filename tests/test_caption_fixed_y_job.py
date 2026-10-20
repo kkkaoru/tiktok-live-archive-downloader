@@ -130,12 +130,12 @@ def test_runs_that_fit_are_placed_and_runs_that_do_not_are_recorded_as_failures(
 
     def person_top(start: Fraction, end: Fraction) -> float:
         if start >= 3:
-            raise ReplayError(
+            raise fixed.UnknownPerson(
                 "Observed person top differs too much across an unobserved caption run"
             )
         return 1000.0
 
-    placed, failures = job.plan_runs(
+    placed, failures, topped = job.plan_runs(
         cues, rate=30, region=Box(0.0, 100.0, 1080.0, 1800.0), center_x=540.0, clearance=20.0,
         envelope=envelope, person_top=person_top,
     )  # fmt: skip
@@ -151,6 +151,101 @@ def test_runs_that_fit_are_placed_and_runs_that_do_not_are_recorded_as_failures(
             "error": "Observed person top differs too much across an unobserved caption run",
         }
     ]
+    assert topped == []
+
+
+def unknown_after_three(start: Fraction, end: Fraction) -> float:
+    if start >= 3:
+        raise fixed.UnknownPerson("No observed person on one side of an unobserved caption run")
+    return 1000.0
+
+
+def test_a_run_with_an_unknown_person_is_placed_at_the_region_top_when_asked() -> None:
+    cues = [
+        fixed.RunCue("あ", Fraction(0), Fraction(1, 2)),
+        fixed.RunCue("う", Fraction(3), Fraction(7, 2)),
+        fixed.RunCue("えお", Fraction(7, 2), Fraction(4)),
+    ]
+    placed, failures, topped = job.plan_runs(
+        cues, rate=30, region=Box(0.0, 100.0, 1080.0, 1800.0), center_x=540.0, clearance=20.0,
+        envelope=envelope, person_top=unknown_after_three, unknown_person="region-top",
+    )  # fmt: skip
+    assert [(item.cue.text, item.run, item.y) for item in placed] == [
+        ("あ", 0, 930.0),
+        ("う", 1, 150.0),
+        ("えお", 2, 150.0),
+    ]
+    assert failures == []
+    assert [(item["run"], item["cues"], item["start"]) for item in topped] == [
+        (1, 1, 3.0),
+        (2, 1, 3.5),
+    ]
+
+
+def test_a_run_rising_into_the_captions_is_placed_cue_by_cue_and_topped_when_needed() -> None:
+    def rising(start: Fraction, end: Fraction) -> float:
+        return 1000.0 if end <= Fraction(1, 2) else 120.0
+
+    cues = [
+        fixed.RunCue("あい", Fraction(0), Fraction(1, 2)),
+        fixed.RunCue("あいう", Fraction(1, 2), Fraction(1)),
+    ]
+    placed, failures, topped = job.plan_runs(
+        cues, rate=30, region=Box(0.0, 100.0, 1080.0, 1800.0), center_x=540.0, clearance=20.0,
+        envelope=envelope, person_top=rising, unknown_person="region-top",
+    )  # fmt: skip
+    assert [(item.cue.text, item.y) for item in placed] == [("あい", 930.0), ("あいう", 150.0)]
+    assert failures == []
+    assert [(item["cues"], item["start"]) for item in topped] == [(1, 0.5)]
+
+
+def test_a_cue_that_fits_neither_above_nor_at_the_top_is_a_failure() -> None:
+    def high(start: Fraction, end: Fraction) -> float:
+        return 120.0
+
+    placed, failures, topped = job.plan_runs(
+        [fixed.RunCue("あ", Fraction(0), Fraction(1))], rate=30,
+        region=Box(0.0, 100.0, 1080.0, 120.0), center_x=540.0, clearance=20.0,
+        envelope=envelope, person_top=high, unknown_person="region-top",
+    )  # fmt: skip
+    assert (placed, topped) == ([], [])
+    assert [item["error"] for item in failures] == [
+        "A caption run does not fit at one origin inside the region"
+    ]
+
+
+def test_placement_failures_stay_failures_when_the_rule_is_fail() -> None:
+    def no_fit(start: Fraction, end: Fraction) -> float:
+        raise ReplayError("Measured caption envelope cannot fit above foreground support")
+
+    placed, failures, topped = job.plan_runs(
+        [fixed.RunCue("あ", Fraction(0), Fraction(1))], rate=30,
+        region=Box(0.0, 100.0, 1080.0, 1800.0), center_x=540.0, clearance=20.0,
+        envelope=envelope, person_top=no_fit,
+    )  # fmt: skip
+    assert (placed, len(failures), topped) == ([], 1, [])
+
+
+def test_a_top_run_that_does_not_fit_the_region_is_refused() -> None:
+    with pytest.raises(ReplayError, match="inside the region"):
+        job.top_origins(
+            [fixed.RunCue("あ", Fraction(0), Fraction(1))], 0,
+            region=Box(0.0, 100.0, 1080.0, 120.0), center_x=540.0, envelope=envelope,
+        )  # fmt: skip
+    with pytest.raises(ReplayError, match="horizontal origin"):
+        job.top_origins(
+            [fixed.RunCue("あ", Fraction(0), Fraction(1))], 0,
+            region=Box(0.0, 100.0, 1080.0, 1800.0), center_x=5.0, envelope=envelope,
+        )  # fmt: skip
+
+
+def test_an_unknown_rule_is_refused() -> None:
+    with pytest.raises(ReplayError, match="unobserved-person rule"):
+        job.plan_runs(
+            [fixed.RunCue("あ", Fraction(0), Fraction(1))], rate=30,
+            region=Box(0.0, 100.0, 1080.0, 1800.0), center_x=540.0, clearance=20.0,
+            envelope=envelope, person_top=unknown_after_three, unknown_person="guess",
+        )  # fmt: skip
 
 
 def test_rebasing_moves_every_time_by_the_same_offset_and_keeps_the_origins() -> None:
@@ -281,7 +376,7 @@ def test_a_whole_range_is_planned_written_and_bound_to_its_inputs(tmp_path: Path
         str(tmp_path / "index.json"),
         str(tmp_path / "cuts.json"),
     }
-    assert document["plannedRuns"] == {"placedCues": 3, "failedRuns": []}
+    assert document["plannedRuns"] == {"placedCues": 3, "failedRuns": [], "regionTopRuns": []}
 
 
 def test_a_second_plan_into_the_same_output_is_refused(tmp_path: Path) -> None:

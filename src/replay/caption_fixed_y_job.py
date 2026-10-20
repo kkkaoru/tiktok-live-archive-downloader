@@ -29,6 +29,8 @@ from replay.vertical_captions import Box
 
 COORDINATE_SYSTEM = "top-left canvas; calibrated text origin"
 MAX_LINES_TOP_READER = 2
+UNKNOWN_PERSON_RULES = ("fail", "region-top")
+ABOVE_PERSON = "cannot fit above foreground support"  # foreground_geometry's refusal
 NO_INDEX = Path("-")
 
 
@@ -129,10 +131,21 @@ def plan_runs(
     clearance: float,
     envelope: fixed.Envelope,
     person_top: fixed.PersonTop,
-) -> tuple[list[fixed.FixedCue], list[dict[str, object]]]:
-    """Fixed origins for every run that fits; the others are returned as recorded failures."""
+    unknown_person: str = "fail",
+) -> tuple[list[fixed.FixedCue], list[dict[str, object]], list[dict[str, object]]]:
+    """Fixed origins for every run that fits; the others are returned as recorded failures.
+
+    With ``unknown_person="region-top"`` a run whose person position no observation bounds is
+    placed at the top of the region, the origin farthest from any person below it, instead of
+    being dropped; such runs are returned separately so the choice stays visible. The same rule
+    covers a run that cannot clear the person at one origin (the head rises during it): each of
+    its cues gets its own origin, and a cue that still cannot clear the person goes to the top.
+    """
+    if unknown_person not in UNKNOWN_PERSON_RULES:
+        raise ReplayError(f"Unknown unobserved-person rule: {unknown_person}")
     placed: list[fixed.FixedCue] = []
     failures: list[dict[str, object]] = []
+    topped: list[dict[str, object]] = []
     for number, run in enumerate(fixed.split_runs(cues, rate=rate)):
         members = [cues[i] for i in run]
         try:
@@ -142,16 +155,63 @@ def plan_runs(
                     envelope=envelope, person_top=person_top,
                 )
             )  # fmt: skip
+        except fixed.UnknownPerson as error:
+            if unknown_person == "fail":
+                failures.append(failure(number, members, error))
+                continue
+            placed.extend(top_origins(members, number, region=region, center_x=center_x,
+                                      envelope=envelope))  # fmt: skip
+            topped.append(failure(number, members, error))
         except ReplayError as error:
-            failures.append(
-                {
-                    "run": number,
-                    "cues": len(members),
-                    "start": float(members[0].start),
-                    "error": str(error),
-                }
-            )
-    return placed, failures
+            if unknown_person == "fail" or ABOVE_PERSON not in str(error):
+                failures.append(failure(number, members, error))
+                continue
+            for cue in members:
+                try:
+                    placed.extend(
+                        fixed.fixed_origins(
+                            [cue], rate=rate, region=region, center_x=center_x,
+                            clearance=clearance, envelope=envelope, person_top=person_top,
+                        )
+                    )  # fmt: skip
+                except (fixed.UnknownPerson, ReplayError) as single:
+                    reason: Exception = single
+                    if isinstance(single, fixed.UnknownPerson) or ABOVE_PERSON in str(single):
+                        try:
+                            top = top_origins(
+                                [cue], number, region=region, center_x=center_x, envelope=envelope
+                            )
+                            placed.extend(top)
+                            topped.append(failure(number, [cue], single))
+                            continue
+                        except ReplayError as unplaced:
+                            reason = unplaced
+                    failures.append(failure(number, [cue], reason))
+    return placed, failures, topped
+
+
+def failure(number: int, members: Sequence[fixed.RunCue], error: Exception) -> dict[str, object]:
+    return {"run": number, "cues": len(members), "start": float(members[0].start),
+            "error": str(error)}  # fmt: skip
+
+
+def top_origins(
+    members: Sequence[fixed.RunCue],
+    number: int,
+    *,
+    region: Box,
+    center_x: float,
+    envelope: fixed.Envelope,
+) -> list[fixed.FixedCue]:
+    """One origin for the run at the top of the region: every cue's whole envelope inside it."""
+    boxes = [envelope(cue.text) for cue in members]
+    for box in boxes:
+        if center_x + box.left < region.left or center_x + box.right > region.right:
+            raise ReplayError("Measured caption cannot fit at the fixed horizontal origin")
+    origin = max(region.top - box.top for box in boxes)
+    if any(origin + box.bottom > region.bottom for box in boxes):
+        raise ReplayError("A caption run does not fit at one origin inside the region")
+    return [fixed.FixedCue(cue, number, center_x, origin) for cue in members]
 
 
 def rebased(cues: Sequence[fixed.FixedCue], *, offset: Fraction) -> list[fixed.FixedCue]:
@@ -273,6 +333,7 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--clearance", type=float, required=True)
     parser.add_argument("--maximum-drift", type=float, required=True)
     parser.add_argument("--rebase", action="store_true")
+    parser.add_argument("--unknown-person", choices=UNKNOWN_PERSON_RULES, default="fail")
     parser.add_argument("--yolo-track", type=Path, help="yolo_track evidence for unobserved frames")
     parser.add_argument("--yolo-minimum-confidence", type=float, default=0.5)
     parser.add_argument("--yolo-gap-seconds", type=Fraction, default=Fraction(1, 2))
@@ -293,7 +354,7 @@ def run_plan(args: argparse.Namespace, observed: Sequence[TrackingPosition]) -> 
         max_lines=args.max_lines,
     )
     mapping = cut_map(json.loads(args.cuts.read_text(encoding="utf-8"))["cuts"])
-    placed, failures = plan_runs(
+    placed, failures, topped = plan_runs(
         cues,
         rate=args.rate,
         region=Box(0.0, args.region_top, float(width), args.region_bottom),
@@ -308,6 +369,7 @@ def run_plan(args: argparse.Namespace, observed: Sequence[TrackingPosition]) -> 
         person_top=person_top_from(
             observed, mapping, rate=args.rate, maximum_drift=args.maximum_drift
         ),
+        unknown_person=args.unknown_person,
     )
     chosen = rebased(placed, offset=args.start_seconds) if args.rebase else placed
     document = candidate_for(
@@ -322,7 +384,11 @@ def run_plan(args: argparse.Namespace, observed: Sequence[TrackingPosition]) -> 
             *([args.yolo_track] if args.yolo_track is not None else []),
         ],
     )
-    document["plannedRuns"] = {"placedCues": len(placed), "failedRuns": failures}
+    document["plannedRuns"] = {
+        "placedCues": len(placed),
+        "failedRuns": failures,
+        "regionTopRuns": topped,
+    }
     args.output.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
     return {"placedCues": len(placed), "failedRuns": len(failures)}
 

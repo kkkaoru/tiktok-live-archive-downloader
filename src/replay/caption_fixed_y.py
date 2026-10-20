@@ -24,6 +24,10 @@ Envelope = Callable[[str], Box]
 PersonTop = Callable[[Fraction, Fraction], float]
 
 
+class UnknownPerson(ReplayError):
+    """No observation bounds where the person is during an unobserved caption run."""
+
+
 @dataclass(frozen=True, slots=True)
 class RunCue:
     """A page of text and its half-open display interval in seconds."""
@@ -123,10 +127,10 @@ def person_top_with_hold(
     before = [point for point in series if point.time < start]
     after = [point for point in series if point.time > end]
     if not before or not after:
-        raise ReplayError("No observed person on one side of an unobserved caption run")
+        raise UnknownPerson("No observed person on one side of an unobserved caption run")
     near_before, near_after = before[-1], after[0]
     if abs(near_before.y - near_after.y) > maximum_drift:
-        raise ReplayError("Observed person top differs too much across an unobserved caption run")
+        raise UnknownPerson("Observed person top differs too much across an unobserved caption run")
     return PersonTopEstimate(min(near_before.y, near_after.y), True)
 
 
