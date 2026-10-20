@@ -284,6 +284,43 @@ def wrap_measured_lines(
     raise CaptionLayoutError("No phrase layout fits measured caption region")
 
 
+def wrap_split_word(
+    text: str,
+    *,
+    measure: Callable[[str], tuple[float, float]],
+    width: float,
+    height: float,
+    prepare_lines: Callable[[tuple[str, ...]], None] | None = None,
+) -> str:
+    """Two lines for a single line too wide to wrap at any phrase: the last resort before scaling.
+
+    A long unknown katakana name or word has no phrase boundary, and its morphology is unreliable.
+    The break nearest the middle is taken, preferring a morpheme end, then any grapheme end; no
+    line starts with a dependent kana or closing mark, and none ends with an opening mark.
+    """
+    if "\n" in text or "\r" in text:
+        raise ValueError("Invalid measured caption region")
+    middle = len(text) / 2
+    graphemes = {match.end() for match in regex.finditer(r"\X", text)}
+    legal = [
+        point
+        for point in sorted(graphemes - {len(text)}, key=lambda point: (abs(point - middle), point))
+        if text[point] not in PROHIBITED_LINE_START and text[point - 1] not in PROHIBITED_LINE_END
+    ]
+    morphemes = {item.end() for item in _tokenizer().tokenize(text)}
+    ordered = [point for point in legal if point in morphemes]
+    ordered += [point for point in legal if point not in morphemes]
+    layouts = [(text[:point], text[point:]) for point in ordered]
+    if prepare_lines is not None:
+        prepare_lines(tuple(dict.fromkeys(line for layout in layouts for line in layout)))
+    for first, second in layouts:
+        candidate = f"{first}\n{second}"
+        measured_width, measured_height = measure(candidate)
+        if measured_width <= width and measured_height <= height:
+            return candidate
+    raise CaptionLayoutError("No split of the word fits measured caption region")
+
+
 def attached_tokens(words: list[SpokenToken], *, maximum_gap: float) -> list[bool]:
     """Mark native-token starts inside a phrase, without merging or retiming tokens.
 

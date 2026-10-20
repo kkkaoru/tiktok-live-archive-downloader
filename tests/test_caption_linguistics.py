@@ -947,3 +947,39 @@ def test_measured_batch_failure_does_not_fall_back_to_individual_calls() -> None
             height=2,
             prepare_lines=fail_preparation,
         )
+
+
+def width_of(text: str) -> tuple[float, float]:
+    return max(map(len, text.split("\n"))) * 10.0, float(len(text.split("\n")))
+
+
+def test_a_word_too_wide_is_split_at_the_morpheme_end_nearest_the_middle() -> None:
+    assert (
+        caption_linguistics.wrap_split_word("マルコフォード", measure=width_of, width=40, height=2)
+        == "マルコ\nフォード"
+    )
+
+
+def test_without_a_fitting_morpheme_end_the_middle_grapheme_is_used() -> None:
+    lines: list[tuple[str, ...]] = []
+    assert (
+        caption_linguistics.wrap_split_word(
+            "ミルク", measure=width_of, width=20, height=2, prepare_lines=lines.append
+        )
+        == "ミ\nルク"
+    )
+    assert lines == [("ミ", "ルク", "ミル", "ク")]
+
+
+def test_no_line_starts_with_a_long_vowel_mark() -> None:
+    assert (
+        caption_linguistics.wrap_split_word("ターター", measure=width_of, width=30, height=2)
+        == "ター\nター"
+    )
+
+
+def test_a_word_that_fits_no_split_is_refused() -> None:
+    with pytest.raises(caption_linguistics.CaptionLayoutError, match="No split of the word"):
+        caption_linguistics.wrap_split_word("マルコフォード", measure=width_of, width=20, height=2)
+    with pytest.raises(ValueError, match="Invalid measured caption region"):
+        caption_linguistics.wrap_split_word("マル\nコ", measure=width_of, width=20, height=2)
