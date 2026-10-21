@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -69,8 +70,10 @@ MAX_STREAMS = 8
 POLL_SECONDS = 15.0
 # Polls to wait after a chunk starts before the next admission: a job reaches its STTN buffers
 # (its peak) about 25 s in (YOLO ~6 s, repair pass ~19 s, measured 2026-10-20); longer waits
-# outlast a whole ~80 s job and serialise the queue.
-SETTLE_POLLS = 3
+# outlast a whole job and serialise the queue (45 s did on 720x1280 chunks of ~48 s, 2026-10-21).
+# The waiter wakes exactly when the settle ends instead of at the next poll (a fixed 15 s poll
+# stretched 30 s settles to ~36 s between starts).
+SETTLE_SECONDS = 20.0
 # A chunk job's peak footprint (measured 9.5-10 GB on 2026-10-20); a further job is admitted only
 # while the free memory still covers it above the floor.
 JOB_PEAK_BYTES = 10 * 1024**3
@@ -218,6 +221,7 @@ def run(
     free: FreeBytes = free_bytes,
     measure: Measure = read_load,
     poll_seconds: float = POLL_SECONDS,
+    settle_seconds: float = SETTLE_SECONDS,
     leases: Path | None = None,
 ) -> dict[str, object]:
     """Run chunk jobs ``first..last``; skip finished, stop below the floor.
@@ -231,7 +235,9 @@ def run(
     """
     floor = recording.number("freeFloorGiB") * GIB
     leases = gpu_lease.root() if leases is None else leases
-    replay_id = recording.text("recording").removeprefix("replay-").split("-")[0]
+    # "replay-<id>-p1" or "youtube-<id>-p1" (a YouTube ID may itself hold hyphens): the
+    # pipeline leases under "<id>" or "youtube-<id>".
+    replay_id = re.sub(r"-p[0-9]+$", "", recording.text("recording")).removeprefix("replay-")
     base = recording.number("streams")
     admission = threading.Condition()
     active = [0]
@@ -263,11 +269,23 @@ def run(
             # Memory admits a job first; then it also needs one of the machine-wide GPU leases.
             try:
                 while held is None:
-                    settled = time.monotonic() - last_start[0] >= SETTLE_POLLS * poll_seconds
-                    if active[0] < 1 or (settled and admitted(measure())):
+                    remaining = settle_seconds - (time.monotonic() - last_start[0])
+                    load = measure() if active[0] >= 1 and remaining <= 0 else None
+                    if active[0] < 1 or (load is not None and admitted(load)):
                         held = waiter.try_acquire()
+                    decisions.write(
+                        json.dumps(
+                            {"t": round(time.time(), 1), "chunk": index, "active": active[0],
+                             "settleLeft": round(max(remaining, 0.0), 1),
+                             "memoryFree": None if load is None else load.memory_free_percent,
+                             "lease": held}
+                        ) + "\n"
+                    )  # fmt: skip
+                    decisions.flush()
                     if held is None:
-                        admission.wait(poll_seconds)
+                        admission.wait(
+                            poll_seconds if remaining <= 0 else min(poll_seconds, remaining)
+                        )
             finally:
                 waiter.close()
             active[0] += 1
@@ -289,9 +307,17 @@ def run(
             with admission:
                 active[0] -= 1
                 admission.notify_all()
-        results[index] = {"exit": code, "wallSeconds": round(time.time() - began, 1)}
+        results[index] = {
+            "exit": code,
+            "startedAt": round(began, 1),
+            "wallSeconds": round(time.time() - began, 1),
+        }
 
-    with ThreadPoolExecutor(max_workers=recording.max_streams) as pool:
+    # One line per admission decision: the evidence for why streams did or did not overlap.
+    with (
+        (recording.work / "logs" / "admission.jsonl").open("a", encoding="utf-8") as decisions,
+        ThreadPoolExecutor(max_workers=recording.max_streams) as pool,
+    ):
         list(pool.map(one, range(first, last + 1)))
     summary: dict[str, object] = {
         "chunks": [first, last],

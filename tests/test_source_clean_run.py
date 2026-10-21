@@ -3,6 +3,7 @@
 import hashlib
 import json
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from replay import source_clean_run as runner
 from replay import subtitle_cleanup_assembly as preparation
 from replay import subtitle_sampled_consumer as consumer
 from replay.core import ReplayError
-from replay.workflow_parallel import Load
+from replay.workflow_parallel import MEMORY_FREE_MIN, Load
 
 
 @pytest.fixture(autouse=True)
@@ -166,7 +167,7 @@ def concurrency(recording: runner.Recording, measured: Load) -> int:
     runner.configs(recording)
     runner.run(
         recording, first=0, last=2, runner=fake, free=lambda: 100 * runner.GIB,
-        measure=lambda: measured, poll_seconds=0.01,
+        measure=lambda: measured, poll_seconds=0.01, settle_seconds=0.03,
     )  # fmt: skip
     return max(peak)
 
@@ -188,7 +189,7 @@ def test_an_interrupted_chunk_is_retired_and_run_again(tmp_path: Path) -> None:
     media.mkdir(parents=True)
     runner.run(
         recording, first=0, last=0, runner=lambda _c, _l: 0, free=lambda: 100 * runner.GIB,
-        measure=lambda: IDLE, poll_seconds=0.01,
+        measure=lambda: IDLE, poll_seconds=0.01, settle_seconds=0.03,
     )  # fmt: skip
     assert not stale.parent.exists() and not media.exists()
     (retired,) = (recording.work / "interrupted").iterdir()
@@ -196,7 +197,7 @@ def test_an_interrupted_chunk_is_retired_and_run_again(tmp_path: Path) -> None:
 
 
 def test_free_memory_must_cover_one_more_job_above_the_floor(tmp_path: Path) -> None:
-    floor_only = Load(cpus=10, load=1.0, memory_free_percent=runner.MEMORY_FREE_MIN, gpu_percent=10)
+    floor_only = Load(cpus=10, load=1.0, memory_free_percent=MEMORY_FREE_MIN, gpu_percent=10)
     assert concurrency(make(tmp_path, streams=3, maxStreams=3), floor_only) == 1
 
 
@@ -405,3 +406,43 @@ def test_main_describe_writes_a_new_revision_beside_an_existing_one(
     assert capsys.readouterr().out.splitlines()[-1].endswith("clean-replay-9-v2.description.json")
     with pytest.raises(ValueError, match="alphanumeric"):
         runner.main([str(boot), "describe", "--defaults", str(defaults), "--revision", "../x"])
+
+
+def test_chunks_lease_under_the_pipeline_recording_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recording = make(tmp_path, recording="youtube-Eg9-gl3Z954-p1")
+    runner.configs(recording)
+    keys: list[str] = []
+    real = gpu_lease.Waiter
+
+    def waiter(directory: Path, replay_id: str) -> gpu_lease.Waiter:
+        keys.append(replay_id)
+        return real(directory, replay_id)
+
+    monkeypatch.setattr(gpu_lease, "Waiter", waiter)
+    runner.run(recording, first=0, last=0, runner=lambda *_a: 0, free=lambda: 100 * runner.GIB)
+    assert keys == ["youtube-Eg9-gl3Z954"]
+
+
+def test_a_settle_longer_than_the_poll_wakes_when_it_ends_and_is_logged(tmp_path: Path) -> None:
+    recording = make(tmp_path, streams=2, maxStreams=2)
+    runner.configs(recording)
+    starts: list[float] = []
+
+    def slow(_command: Sequence[str], _log: Path) -> int:
+        starts.append(time.monotonic())
+        time.sleep(0.6)
+        return 0
+
+    runner.run(
+        recording, first=0, last=1, runner=slow, free=lambda: 100 * runner.GIB,
+        measure=lambda: IDLE, poll_seconds=5.0, settle_seconds=0.2,
+    )  # fmt: skip
+    assert 0.15 < starts[1] - starts[0] < 0.5
+    decisions = [
+        json.loads(line)
+        for line in (recording.work / "logs" / "admission.jsonl").read_text().splitlines()
+    ]
+    assert {row["chunk"] for row in decisions} == {0, 1}
+    assert any(row["lease"] is None and row["settleLeft"] > 0 for row in decisions)
