@@ -130,6 +130,15 @@ def test_gap_is_not_claimed_quiet() -> None:
     )
 
 
+def test_timestamp_jitter_gaps_do_not_split_a_quiet_run() -> None:
+    starts = tuple(index * 2064 for index in range(100))
+    clock = AudioFrameClock(starts, (2048,) * 100, 48000, Fraction(1, 48000))
+    result = source_quiet((MeasuredQuietSpan(0, 204800 / 48000),), clock)
+    assert result == (MeasuredQuietSpan(0, (99 * 2064 + 2048) / 48000),)
+    loud_after = source_quiet((MeasuredQuietSpan(0, 2048 / 48000),), clock)
+    assert loud_after == (MeasuredQuietSpan(0, 2064 / 48000),)
+
+
 def test_overlap_is_quiet_only_when_every_owner_is_quiet() -> None:
     clock = AudioFrameClock((0, 500), (1000, 1000), 10000, Fraction(1, 10000))
     assert source_quiet((MeasuredQuietSpan(0, 0.2),), clock) == (MeasuredQuietSpan(0, 0.15),)

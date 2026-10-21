@@ -23,6 +23,8 @@ from replay.recordings import record
 from replay.stages import file_digest
 from replay.waveform_quiet import measured_quiet_runs
 
+JITTER_GAP = Fraction(1, 1000)
+
 
 def source_quiet(
     quiet: tuple[MeasuredQuietSpan, ...],
@@ -35,7 +37,9 @@ def source_quiet(
     Split at decoded-frame boundaries before mapping. Count decoded owners and
     individually quiet owners on exact rational intervals. An overlapping loud
     or unknown owner protects the interval; quiet owners never cancel it by an
-    averaged waveform. Zero owners is missing support, never measured silence.
+    averaged waveform. Zero owners is missing support, never measured silence;
+    only a timestamp-jitter gap of at most ``JITTER_GAP`` seconds, which holds no
+    decoded sample at all, joins the quiet spans on both of its sides.
     """
     rate = clock.sample_rate if measurement_rate is None else measurement_rate
     if type(rate) is not int or not 8000 <= rate <= 192000:
@@ -76,6 +80,15 @@ def source_quiet(
     previous = Fraction(0)
     events.sort(key=lambda event: event[0])
     for point, group in groupby(events, key=lambda event: event[0]):
+        if (
+            0 < point - previous <= JITTER_GAP
+            and owners == 0
+            and result
+            and result[-1][1] == previous
+        ):
+            # Encoder timestamps step a few samples past a frame's end (2064 for 2048 samples):
+            # nothing plays there, so it must not split one quiet run into frame-sized pieces.
+            result[-1] = (result[-1][0], point)
         if previous < point and owners > 0 and owners == quiet_owners:
             beginning = previous
             if result and result[-1][1] == previous:
