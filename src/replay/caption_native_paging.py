@@ -8,9 +8,12 @@ fine-ASR words may carry explicit measured uniform-scale evidence.
 import argparse
 import json
 import math
+import os
+import shutil
 from dataclasses import asdict, replace
 from fractions import Fraction
 from functools import partial
+from multiprocessing import get_context
 from pathlib import Path
 
 from replay import (
@@ -55,6 +58,8 @@ from replay.stages import file_digest
 MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_SEGMENTS = 512
 MAX_SEGMENT_TOKENS = 4096
+# Segments are independent (own measurer and part file); measurements do not depend on batching.
+PREFILL_WORKERS = 6
 save = NativeCaptionLayout._save
 
 
@@ -165,7 +170,7 @@ def paged_cues(
             page
             for cue in raw
             for page in (
-                split_pages(cue, fit.pages(cue.text))
+                split_pages(cue, fit.pages(cue.text), rate=rate)
                 if isinstance(cue, ScaledCaptionCue)
                 else (cue,)
             )
@@ -183,15 +188,29 @@ def paged_cues(
     return tuple(item.cue for item in positioned), hidden, widened
 
 
-def split_pages(cue: CaptionCue, pages: tuple[str, ...]) -> tuple[CaptionCue, ...]:
-    """Consecutive pages over the cue's display time, each lasting in proportion to its length."""
-    total = sum(len(page.replace("\n", "")) for page in pages)
-    span, done, result = cue.end - cue.start, 0, []
-    for page in pages:
-        start = cue.start + span * done / total
-        done += len(page.replace("\n", ""))
-        result.append(CaptionCue(page, start, cue.start + span * done / total))
-    return tuple(result)
+def split_pages(cue: CaptionCue, pages: tuple[str, ...], *, rate: int) -> tuple[CaptionCue, ...]:
+    """Consecutive pages over the cue's display time, each lasting in proportion to its length.
+
+    Page boundaries fall on the frame grid so every page owns at least one display frame (a
+    proportional split of a short cue could otherwise hide pages and delay the next caption).
+    A cue with fewer frames than pages runs on by one frame per missing page.
+    """
+    start, end = display_time(cue.start), display_time(cue.end)
+    first = math.ceil(start * rate)
+    natural = math.ceil(end * rate) - first
+    frames = max(natural, len(pages))
+    sizes = [len(page.replace("\n", "")) for page in pages]
+    total, done, edges = sum(sizes), 0, [first]
+    for index, size in enumerate(sizes[:-1]):
+        done += size
+        edge = first + round(frames * done / total)
+        edges.append(min(max(edge, edges[-1] + 1), first + frames - (len(sizes) - 1 - index)))
+    last = end if natural >= len(pages) else Fraction(first + frames, rate)
+    times = [start, *(Fraction(edge, rate) for edge in edges[1:]), last]
+    return tuple(
+        CaptionCue(page, float(a), float(b))
+        for page, a, b in zip(pages, times[:-1], times[1:], strict=True)
+    )
 
 
 def assemble(parts: tuple[dict[str, object], ...], *, rate: int) -> list[dict[str, object]]:
@@ -274,7 +293,13 @@ def run(
     collect_layout_failures: bool = False,
     long_executable: Path | None = None,
     split_wide: bool = False,
+    prefill: bool = False,
 ) -> Path:
+    """Page the selected segments and publish ``reflow.json``.
+
+    ``prefill`` only writes the part files of segments without one and publishes nothing; a
+    segment it cannot page is left to the publishing run, which reproduces the failure.
+    """
     if type(collect_layout_failures) is not bool:
         raise ReplayError("Layout failure collection must be boolean")
     index_path = directory / "segments.json"
@@ -345,8 +370,10 @@ def run(
         duration = Fraction(_integer(row.get("frames")), rate)
         if not 0 < duration <= 120 or offset < 0:
             raise ReplayError("Segment extent exceeds shared planner limits")
-        if coverage_start is not None and (
-            offset > coverage_end or offset < coverage_end - Fraction(1, 10)
+        if (
+            not prefill
+            and coverage_start is not None
+            and (offset > coverage_end or offset < coverage_end - Fraction(1, 10))
         ):
             raise ReplayError("Selected segment coverage is discontinuous")
         combined = segment_binding(directory, row, sources)
@@ -359,6 +386,8 @@ def run(
         token_pins.update(recognition_pins(old, source=media, source_digest=source_digest))
         part_path = output / f"part-{number:04d}.json"
         code_pins: dict[str, str] = {}
+        if prefill and part_path.exists():
+            continue
         if part_path.exists():
             part = record(json.loads(part_path.read_text(encoding="utf-8")))
             if part.get("settings") != settings or part.get("coverage") != {
@@ -424,6 +453,8 @@ def run(
                     limited, layout=layout, rate=rate, duration=duration, split_wide=split_wide
                 )
             except ValueError as error:
+                if prefill:
+                    continue
                 if not collect_layout_failures or not str(error).startswith(
                     (
                         "Native token exceeds display budget;",
@@ -506,6 +537,8 @@ def run(
         coverage_start = offset if coverage_start is None else min(coverage_start, offset)
         coverage_end = max(coverage_end, offset + duration)
         print(f"PAGED_SEGMENT {number}", flush=True)
+    if prefill:
+        return output
     if failures:
         save(
             output / "layout-failures.json",
@@ -561,6 +594,59 @@ def run(
         },
     )
     return result
+
+
+def prefill_parallel(
+    directory: Path,
+    output: Path,
+    *,
+    page: "partial[Path]",
+    workers: int,
+    selected: tuple[int, ...],
+) -> None:
+    """Page segments without a part in contiguous shards across worker processes.
+
+    The publishing ``run`` afterwards reuses those parts exactly as resumed ones. Metrics
+    directories this prefill left without a part are removed so that run measures afresh; a
+    segment that already had one stays for that run to judge.
+    """
+    entries = record(json.loads((directory / "segments.json").read_text(encoding="utf-8"))).get(
+        "segments"
+    )
+    numbers = (
+        [_integer(record(row).get("segment")) for row in entries]
+        if isinstance(entries, list)
+        else []
+    )
+    missing = [
+        number
+        for number in numbers
+        if (not selected or number in selected)
+        and not (output / f"part-{number:04d}.json").exists()
+        and not (output / f"metrics-{number:04d}").exists()
+    ]
+    if workers < 2 or len(missing) < 2:
+        return
+    output.mkdir(mode=0o700, exist_ok=True)
+    size = math.ceil(len(missing) / workers)
+    shards = [tuple(missing[start : start + size]) for start in range(0, len(missing), size)]
+    # Forked targets are not pickled (``run`` lives in ``__main__`` under runpy) and inherit
+    # in-process settings: ``caption_native_paging_lines`` lowers the line limit.
+    processes = [
+        get_context("fork").Process(
+            target=page, args=(directory, output), kwargs={"prefill": True, "selected": shard}
+        )
+        for shard in shards
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join()
+        if process.exitcode != 0:
+            print(f"PREFILL_SHARD_FAILED exit {process.exitcode}", flush=True)
+    for number in missing:
+        if not (output / f"part-{number:04d}.json").exists():
+            shutil.rmtree(output / f"metrics-{number:04d}", ignore_errors=True)
 
 
 def audit_support(directory: Path, output: Path) -> Path:
@@ -640,15 +726,17 @@ def main() -> None:
     parser.add_argument("--split-wide", action="store_true", help="page instead of scaling")
     parser.add_argument("--audit-support-only", action="store_true")
     parser.add_argument(
+        "--workers", type=int, default=min(PREFILL_WORKERS, max(1, (os.cpu_count() or 2) // 2))
+    )
+    parser.add_argument(
         "--resume-producer-evidence", type=Path, nargs=2, action="append", default=[]
     )
     args = parser.parse_args()
     if args.audit_support_only:
         audit_support(args.directory, args.output)
         return
-    run(
-        args.directory,
-        args.output,
+    page = partial(
+        run,
         executable=args.executable,
         style=NativeCaptionStyle(
             caption_style_defaults.FONT_POSTSCRIPT_NAME,
@@ -661,14 +749,22 @@ def main() -> None:
         width=args.width,
         evidence=tuple(args.evidence),
         source_media=args.source_media,
-        selected=tuple(args.segment),
         token_sources=args.token_sources,
-        resume_evidence=tuple((part, manifest) for part, manifest in args.resume_producer_evidence),
         measurement_cache=args.measurement_cache,
         cache_segments=tuple(args.measurement_cache_segment),
         collect_layout_failures=args.collect_layout_failures,
         long_executable=args.long_executable,
         split_wide=args.split_wide,
+    )
+    selected = tuple(args.segment)
+    prefill_parallel(
+        args.directory, args.output, page=page, workers=args.workers, selected=selected
+    )
+    page(
+        args.directory,
+        args.output,
+        selected=selected,
+        resume_evidence=tuple((part, manifest) for part, manifest in args.resume_producer_evidence),
     )
 
 

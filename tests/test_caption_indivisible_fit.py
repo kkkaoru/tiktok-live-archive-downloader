@@ -167,7 +167,7 @@ def test_cross_window_particle_has_real_phrase_frames_before_a_greeting() -> Non
     assert tokens[-2] == SpokenToken("か", 0.312, 0.332, "000000480000:1:cut-7")
 
 
-def test_true_cut_keeps_density_guard_for_a_subframe_particle() -> None:
+def test_a_subframe_particle_at_a_true_cut_delays_the_next_caption_one_frame() -> None:
     tokens = (
         SpokenToken("飲み", 0, 0.12, "000000000000:10:cut-7"),
         SpokenToken("まし", 0.12, 0.2, "000000000000:11:cut-7"),
@@ -177,8 +177,13 @@ def test_true_cut_keeps_density_guard_for_a_subframe_particle() -> None:
     )
     layout = Measurements()
     layout.width = 240
-    with pytest.raises(ValueError, match="density exceeds one-frame display-delay budget"):
-        paged_cues(tokens, layout=layout, rate=30, duration=Fraction(1))
+    cues, hidden, widened = paged_cues(tokens, layout=layout, rate=30, duration=Fraction(1))
+    assert (hidden, widened) == (0, 1)
+    assert [(cue.text, cue.start, cue.end) for cue in cues] == [
+        ("飲みました", 0, 0.312),
+        ("か", 0.312, 11 / 30),
+        ("ありがとう", 11 / 30, 0.68),
+    ]
 
 
 def test_normal_fitting_unit_remains_unscaled_and_height_uses_same_factor() -> None:
@@ -275,9 +280,9 @@ def test_a_word_no_layout_fits_is_paged_at_full_size_when_scaling_is_off() -> No
     )
     assert hidden == widened == 0
     assert [(cue.text, round(cue.start, 4), round(cue.end, 4)) for cue in cues] == [
-        ("こぉぉぉぉ", 0.0, 2.0364),
-        ("ぉぉぉぉぉ", 2.0364, 4.0727),
-        ("ぉ", 4.0727, 4.48),
+        ("こぉぉぉぉ", 0.0, 2.0333),
+        ("ぉぉぉぉぉ", 2.0333, 4.1),
+        ("ぉ", 4.1, 4.48),
     ]
     assert not any(isinstance(cue, ScaledCaptionCue) for cue in cues)
 

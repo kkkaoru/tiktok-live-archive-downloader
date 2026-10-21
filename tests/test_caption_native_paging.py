@@ -1,6 +1,7 @@
 import json
 import sys
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -605,3 +606,99 @@ def test_sustained_token_display_is_capped_and_recorded(exact: NativeCaptionLayo
         paging.paged_cues(tokens, layout=exact, rate=30, duration=Fraction(5))
     cues, _, _ = paging.paged_cues(limited, layout=exact, rate=30, duration=Fraction(5))
     assert "".join(cue.text for cue in cues).replace("\n", "") == "あるよ"
+
+
+def test_split_pages_keep_frame_grid_boundaries_in_proportion() -> None:
+    pages = paging.split_pages(CaptionCue("x", 1.0, 2.0), ("ああ", "あああああああ\nあ"), rate=30)
+    assert [(p.text, p.start, p.end) for p in pages] == [
+        ("ああ", 1.0, 36 / 30),
+        ("あああああああ\nあ", 36 / 30, 2.0),
+    ]
+
+
+def test_split_pages_give_each_page_a_frame_even_in_a_short_cue() -> None:
+    pages = paging.split_pages(CaptionCue("x", 1.0, 1.05), ("あ", "い", "う"), rate=30)
+    assert [p.start for p in pages] == [1.0, 31 / 30, 32 / 30]
+    assert pages[-1].end == 33 / 30
+    assert all(int(p.start * 30 + 1e-9) < round(p.end * 30) for p in pages)
+
+
+def three_segments(root: Path) -> Path:
+    media = root / "original.mp4"
+    media.write_bytes(b"synthetic")
+    for number, text in enumerate(("ab", "cd", "ef")):
+        token = root / f"tokens-{number:04d}.json"
+        token.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "clock": "output",
+                    "tokens": [{"text": text, "start": 0.1, "end": 0.5, "utterance": "u"}],
+                }
+            )
+        )
+        (root / f"combined-{number:04d}.json").write_text(
+            json.dumps({"inputs": {str(media): file_digest(media), str(token): file_digest(token)}})
+        )
+    (root / "segments.json").write_text(
+        json.dumps(
+            {
+                "rate": 30,
+                "segments": [
+                    {"segment": 0, "offsetFrame": 30, "frames": 30, "jobs": [0]},
+                    {"segment": 1, "offsetFrame": 60, "frames": 30, "jobs": [1]},
+                    {"segment": 2, "offsetFrame": 90, "frames": 30, "jobs": [2]},
+                ],
+            }
+        )
+    )
+    return media
+
+
+def test_parallel_prefill_publishes_the_serial_reflow(
+    tmp_path: Path, exact: NativeCaptionLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media = three_segments(tmp_path)
+    monkeypatch.setattr(paging, "NativeCaptionLayout", lambda **kwargs: exact)
+    page = partial(
+        paging.run,
+        executable=exact.executable,
+        style=exact.style,
+        point_size=10,
+        width=24,
+        evidence=(),
+        source_media=media,
+    )
+    serial = page(tmp_path, tmp_path / "serial")
+    paging.prefill_parallel(tmp_path, tmp_path / "parallel", page=page, workers=2, selected=())
+    assert sorted(path.name for path in (tmp_path / "parallel").iterdir()) == [
+        "part-0000.json",
+        "part-0001.json",
+        "part-0002.json",
+    ]
+    parallel = page(tmp_path, tmp_path / "parallel")
+    assert json.loads((tmp_path / "parallel/part-0001.json").read_text())["captions"] == [
+        {"start": 2.1, "end": 2.58, "text": "cd"}
+    ]
+    assert (
+        json.loads(parallel.read_text())["captions"] == json.loads(serial.read_text())["captions"]
+    )
+
+
+def test_prefill_skips_existing_work_and_clears_what_a_failed_shard_left(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    three_segments(tmp_path)
+    output = tmp_path / "paged"
+    output.mkdir()
+    (output / "part-0000.json").write_text("{}")
+
+    def failing(directory: Path, out: Path, *, prefill: bool, selected: tuple[int, ...]) -> Path:
+        (out / f"metrics-{selected[0]:04d}").mkdir()
+        raise ValueError("synthetic failure")
+
+    paging.prefill_parallel(tmp_path, output, page=partial(failing), workers=1, selected=())
+    paging.prefill_parallel(tmp_path, output, page=partial(failing), workers=4, selected=(2,))
+    paging.prefill_parallel(tmp_path, output, page=partial(failing), workers=4, selected=())
+    assert sorted(path.name for path in output.iterdir()) == ["part-0000.json"]
+    assert capsys.readouterr().out.count("PREFILL_SHARD_FAILED exit 1") == 2
