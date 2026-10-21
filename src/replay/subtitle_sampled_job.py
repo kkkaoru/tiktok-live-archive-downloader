@@ -85,8 +85,61 @@ def key_frames(
             continue
         if "lineBoxes" not in entry:
             raise ValueError("Admission lacks recognised line boxes for colour keying")
-        frames.append(colour.FrameBoxes(_span_origin(spans, index), tuple(_entry_boxes(entry))))
+        boxes = _entry_boxes(entry)
+        region = entry.get("region")
+        if not boxes and isinstance(region, dict):
+            # The detector found a caption that OCR could not read (a lone digit): key its region.
+            x, y = int(region["x"]), int(region["y"])
+            boxes = [(x, y, x + int(region["width"]), y + int(region["height"]))]
+        frames.append(colour.FrameBoxes(_span_origin(spans, index), tuple(boxes)))
     return frames
+
+
+def with_residual(
+    admitted: dict[str, object],
+    boxes: Sequence[Sequence[yolo.Corners]],
+    extra: Mapping[int, Sequence[colour.Box]],
+) -> list[list[yolo.Corners]]:
+    """Add residual boxes to the planned YOLO boxes and line boxes of their caption frames.
+
+    A residual line beyond a frame's caption region (a tall block whose upper lines lie above the
+    profiled band) widens that region and its mask too, or the repair would stay clipped to it.
+    """
+    entries, masks = admitted["frames"], admitted.get("masks")
+    if not isinstance(entries, list) or not isinstance(masks, list):
+        raise ValueError("Admission lacks per-frame entries")
+    overlays = [
+        index
+        for index, entry in enumerate(entries)
+        if record(entry).get("classification") == "overlay-subtitle"
+    ]
+    merged = [list(frame) for frame in boxes]
+    for index, added in extra.items():
+        if index not in overlays:
+            continue
+        entry = record(entries[index])
+        entry["lineBoxes"] = [*_entry_boxes(entry), *(list(box) for box in added)]
+        regions = [record(entry["region"]), record(record(masks[overlays.index(index)])["region"])]
+        for region in regions:
+            _widen(region, added)
+        if index < len(merged):
+            merged[index] += [(float(a), float(b), float(c), float(d)) for a, b, c, d in added]
+    return merged
+
+
+def _widen(region: dict[str, object], boxes: Sequence[colour.Box]) -> None:
+    """Grow an {x, y, width, height} region in place to cover every box and one line beyond.
+
+    The extra line height above and below lets the colour key's stacked-line rule reach a
+    further caption line of the same block that OCR did not report.
+    """
+    x, y = int(str(region["x"])), int(str(region["y"]))
+    right, bottom = x + int(str(region["width"])), y + int(str(region["height"]))
+    left = min([x, *(box[0] for box in boxes)])
+    top = min([y, *(box[1] - (box[3] - box[1]) for box in boxes)])
+    right = max([right, *(box[2] for box in boxes)])
+    bottom = max([bottom, *(box[3] + (box[3] - box[1]) for box in boxes)])
+    region.update(x=left, y=top, width=right - left, height=bottom - top)
 
 
 def box_frames(
@@ -154,6 +207,17 @@ def real_collaborators(
     if (caption_masks or yolo_admission) and caption_detector is None:
         raise ValueError("YOLO repair masks and admission need the YOLO caption detector")
     planned_boxes: list[list[yolo.Corners]] = []
+    extra: dict[int, list[colour.Box]] = {}
+
+    def residual(lines: Sequence[Residual], audit_stride: int) -> None:
+        # A residual glyph persists between audited frames: cover the frames around each one.
+        for line in lines:
+            if line.box is None:
+                continue
+            x, y, w, h = line.box
+            box = (int(x), int(y), int(np.ceil(x + w)), int(np.ceil(y + h)))
+            for index in range(line.frame - audit_stride, line.frame + audit_stride + 1):
+                extra.setdefault(index, []).append(box)
 
     def regions() -> list[Region | None]:
         if caption_detector is None:
@@ -202,6 +266,7 @@ def real_collaborators(
         )
 
     def render_attempt(admitted: dict[str, object], directory: Path) -> Path:
+        boxes = with_residual(admitted, planned_boxes, extra) if extra else planned_boxes
         (directory / "admission.json").write_text(json.dumps(admitted), encoding="utf-8")
         masks = admitted["masks"]
         spans = repair_spans(
@@ -219,7 +284,7 @@ def real_collaborators(
         boxed: yolo.BoxMaskDetector | None = None
         detector: Detects
         if caption_masks:
-            boxed = yolo.BoxMaskDetector(box_frames(admitted, spans, planned_boxes))
+            boxed = yolo.BoxMaskDetector(box_frames(admitted, spans, boxes))
             detector = boxed
         else:
             detector = mps.MpsTextDetector(network, max_batch=RENDER_BATCH)
@@ -267,7 +332,7 @@ def real_collaborators(
             )  # fmt: skip
         if keyed is not None and keyed.consumed != len(planned):
             raise ValueError("Colour-key frames were not all consumed by the renderer")
-        if boxed is not None and boxed.consumed != len(box_frames(admitted, spans, planned_boxes)):
+        if boxed is not None and boxed.consumed != len(box_frames(admitted, spans, boxes)):
             raise ValueError("YOLO mask frames were not all consumed by the renderer")
         return video
 
@@ -365,9 +430,9 @@ def real_collaborators(
         pins["auditBand"] = f"tile{audit_tile}"
     if config.get("colourKey") is True:
         pins["colourKey"] = COLOUR_KEY_PIN
-    gate = colour_residual if config.get("colourGate") is True else None
-    coloured = caption_coloured if config.get("colourGate") is True else None
-    return runner.Collaborators(plan, render_attempt, audit, gate, coloured), pins
+    gate = colour_residual if gated else None
+    coloured = caption_coloured if gated else None
+    return runner.Collaborators(plan, render_attempt, audit, gate, coloured, residual), pins
 
 
 def main(argv: Sequence[str] | None = None) -> int:

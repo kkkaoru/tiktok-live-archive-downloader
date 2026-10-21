@@ -189,8 +189,27 @@ def test_attempt_count_is_bounded() -> None:
     plan = _admission([None] * 10)
     receipt = _receipt(plan)
     receipt["attempts"] = []
-    with pytest.raises(ValueError, match="one or two"):
+    with pytest.raises(ValueError, match="one to three"):
         _check(receipt, plan)
+    receipt["attempts"] = [{}] * 4
+    with pytest.raises(ValueError, match="one to three"):
+        _check(receipt, plan)
+
+
+def test_a_residual_attempt_after_two_failures_is_accepted() -> None:
+    plan = _admission([None] * 10)
+    receipt = _receipt(plan)
+    attempts = _rows(receipt, "attempts")
+    accepted = attempts[0]
+    failed = copy.deepcopy(accepted) | {"passed": False, "residualLines": [{"frame": 1}]}
+    attempts[:] = [
+        failed | {"directory": "attempt-sampled"},
+        failed | {"directory": "attempt-full"},
+        accepted | {"directory": "attempt-residual"},
+    ]
+    receipt["accepted"] = "attempt-residual"
+    receipt["escalated"] = True
+    _check(receipt, plan)
 
 
 def test_sampling_must_match_the_accepted_attempt() -> None:

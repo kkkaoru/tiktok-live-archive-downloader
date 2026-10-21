@@ -9,6 +9,7 @@ import pytest
 from replay import subtitle_sampled_run as runner
 from replay.caption_io import FrameObservation
 from replay.caption_masks import TextDetection, TextRectangle
+from replay.subtitle_repair_audit import Residual
 
 BOX = {"x": 0, "y": 100, "width": 1000, "height": 200}
 PLAN: dict[str, object] = {
@@ -143,3 +144,48 @@ def test_a_residual_without_caption_colour_is_recorded_as_interface_text(tmp_pat
 def test_a_caption_coloured_residual_still_fails_the_audit(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Audit failed"):
         runner.run(tmp_path / "chunk", _coloured_tools([True], []))
+
+
+def test_residual_boxes_get_one_more_attempt_when_a_collaborator_takes_them(
+    tmp_path: Path,
+) -> None:
+    strides: list[int] = []
+    taken: list[tuple[int, int]] = []
+    base = _tools(0, strides)
+
+    def audit(video: Path, indices: Sequence[int]) -> Mapping[int, FrameObservation]:
+        line = SMEAR if taken else CAPTION
+        return {index: FrameObservation(0.0, 0.0, 1080, 1920, (line,)) for index in indices}
+
+    def residual(lines: Sequence[Residual], audit_stride: int) -> None:
+        taken.extend((line.frame, audit_stride) for line in lines)
+
+    tools = runner.Collaborators(base.plan, base.render, audit, residual=residual)
+    receipt = runner.run(tmp_path / "chunk", tools)
+    assert strides == [6, 1, 1]
+    assert receipt["accepted"] == "attempt-residual"
+    assert taken and all(stride == runner.AUDIT_STRIDE for _, stride in taken)
+
+
+def test_no_residual_attempt_without_boxes_or_collaborator(tmp_path: Path) -> None:
+    strides: list[int] = []
+    with pytest.raises(ValueError, match="nothing accepted"):
+        runner.run(tmp_path / "chunk", _tools(0, strides))
+    assert strides == [6, 1]
+
+
+def test_a_caption_line_stacked_above_the_region_still_fails_the_audit(tmp_path: Path) -> None:
+    strides: list[int] = []
+    above = TextDetection("ならちょ待って", 1.0, TextRectangle(100, 20, 60, 30))
+    far = TextDetection("遠い", 1.0, TextRectangle(100, 900, 60, 30))
+    base = _tools(0, strides)
+
+    def audit(video: Path, indices: Sequence[int]) -> Mapping[int, FrameObservation]:
+        line = far if strides[-1] == 1 else above
+        return {index: FrameObservation(0.0, 0.0, 1080, 1920, (line,)) for index in indices}
+
+    receipt = runner.run(tmp_path / "chunk", runner.Collaborators(base.plan, base.render, audit))
+    assert receipt["accepted"] == "attempt-full"
+    attempts = receipt["attempts"]
+    assert isinstance(attempts, list)
+    assert attempts[0]["residualLines"][0]["text"] == "ならちょ待って"

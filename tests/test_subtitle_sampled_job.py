@@ -252,6 +252,15 @@ def test_key_frames_skip_unknown_frames_and_read_span_origins() -> None:
     assert [(f.origin, f.boxes) for f in frames] == [((7, 9), ((1, 2, 30, 40),))]
 
 
+def test_key_frames_key_an_unread_detected_region() -> None:
+    region = {"x": 3, "y": 4, "width": 10, "height": 20}
+    admitted: dict[str, object] = {
+        "frames": [{"classification": "overlay-subtitle", "lineBoxes": [], "region": region}]
+    }
+    frames = job.key_frames(admitted, (SubtitleSpan(0, 1, 0, 0, 64, 32),))
+    assert [f.boxes for f in frames] == [((3, 4, 13, 24),)]
+
+
 def test_key_frames_reject_missing_boxes_spans_and_entries() -> None:
     span = (SubtitleSpan(0, 1, 0, 0, 64, 32),)
     with pytest.raises(ValueError, match="line boxes"):
@@ -418,3 +427,40 @@ def test_an_invalid_audit_tile_is_refused(tmp_path: Path) -> None:
     config["auditTile"] = 9
     with pytest.raises(ValueError, match="auditTile"):
         job.real_collaborators(config, network=_bar)
+
+
+def test_residual_boxes_join_caption_frames_only() -> None:
+    region = {"x": 0, "y": 0, "width": 10, "height": 10}
+    admitted: dict[str, object] = {
+        "frames": [
+            {"classification": "overlay-subtitle", "lineBoxes": [[1, 2, 3, 4]], "region": region},
+            {"classification": "unknown"},
+        ],
+        "masks": [{"startSeconds": 0, "endSeconds": 1, "region": dict(region)}],
+    }
+    merged = job.with_residual(
+        admitted,
+        [[(0.0, 0.0, 9.0, 9.0)], []],
+        {0: [(5, 6, 7, 8)], 1: [(5, 6, 7, 8)], 4: [(1, 1, 2, 2)]},
+    )
+    assert merged == [[(0.0, 0.0, 9.0, 9.0), (5.0, 6.0, 7.0, 8.0)], []]
+    frames = admitted["frames"]
+    assert isinstance(frames, list)
+    assert frames[0]["lineBoxes"] == [(1, 2, 3, 4), [5, 6, 7, 8]]
+    assert "lineBoxes" not in frames[1]
+    assert frames[0]["region"] == {"x": 0, "y": 0, "width": 10, "height": 10}
+    masks = admitted["masks"]
+    assert isinstance(masks, list)
+    assert masks[0]["region"] == {"x": 0, "y": 0, "width": 10, "height": 10}
+    above: dict[str, object] = {
+        "frames": [{"classification": "overlay-subtitle", "lineBoxes": [], "region": dict(region)}],
+        "masks": [{"region": dict(region)}],
+    }
+    job.with_residual(above, [[]], {0: [(-5, -8, 4, 2), (6, 20, 30, 24)]})
+    above_frames, above_masks = above["frames"], above["masks"]
+    assert isinstance(above_frames, list)
+    assert isinstance(above_masks, list)
+    assert above_frames[0]["region"] == {"x": -5, "y": -18, "width": 35, "height": 46}
+    assert above_masks[0]["region"] == {"x": -5, "y": -18, "width": 35, "height": 46}
+    with pytest.raises(ValueError, match="per-frame entries"):
+        job.with_residual({"frames": 3}, [], {0: [(1, 1, 2, 2)]})

@@ -104,8 +104,9 @@ def _accepted_attempt(
     ):
         raise ValueError("Chunk receipt identity, pins or approval flags are invalid")
     attempts = receipt.get("attempts")
-    if not isinstance(attempts, list) or not 1 <= len(attempts) <= 2:
-        raise ValueError("Chunk receipt must list one or two attempts")
+    # sampled, then full OCR, then once more with the residual boxes the full audit found
+    if not isinstance(attempts, list) or not 1 <= len(attempts) <= 3:
+        raise ValueError("Chunk receipt must list one to three attempts")
     records = [_record(item, "attempt") for item in attempts]
     accepted = [item for item in records if item.get("directory") == receipt.get("accepted")]
     if len(accepted) != 1:
@@ -118,7 +119,7 @@ def _accepted_attempt(
         or type(audited) is not int
         or audited < 1
         or attempt is not records[-1]
-        or receipt.get("escalated") is not (len(attempts) == 2)
+        or receipt.get("escalated") is not (len(attempts) > 1)
     ):
         raise ValueError("Accepted attempt did not pass a non-empty residual-text audit")
     return attempt

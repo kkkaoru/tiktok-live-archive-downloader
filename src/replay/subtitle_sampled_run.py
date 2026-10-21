@@ -32,6 +32,8 @@ class Collaborators:
     audit: Callable[[Path, Sequence[int]], Mapping[int, FrameObservation]]
     colour: Callable[[dict[str, object], Path, Sequence[int]], Sequence[int]] | None = None
     caption_coloured: Callable[[Sequence[Residual]], Sequence[bool]] | None = None
+    # Registers the residual lines a failed full attempt left, as repair boxes for one more try.
+    residual: Callable[[Sequence[Residual], int], None] | None = None
 
 
 def _regions(plan: Mapping[str, object]) -> list[Region | None]:
@@ -48,6 +50,16 @@ def _regions(plan: Mapping[str, object]) -> list[Region | None]:
     return regions
 
 
+def _stacked(region: Region) -> Region:
+    """The region with its own height added above and below it.
+
+    A caption block taller than the profiled band stacks its extra lines there; only
+    caption-coloured lines among them fail the audit, so scene text beside it stays interface.
+    """
+    left, top, right, bottom = region
+    return left, top - (bottom - top), right, bottom + (bottom - top)
+
+
 def _attempt(
     stride: int, directory: Path, tools: Collaborators, audit_stride: int
 ) -> dict[str, object]:
@@ -60,7 +72,9 @@ def _attempt(
     regions = _regions(plan)
     indices = audit_indices(len(regions), audit_stride)
     observed = tools.audit(video, indices)
-    residuals = residual_lines(observed, regions)
+    residuals = residual_lines(
+        observed, [None if box is None else _stacked(box) for box in regions]
+    )
     interface: list[Residual] = []
     if tools.caption_coloured is not None and residuals:
         flags = tools.caption_coloured(residuals)
@@ -107,6 +121,18 @@ def _residual(item: Residual) -> dict[str, object]:
     }
 
 
+def _residuals(attempt: Mapping[str, object]) -> list[Residual]:
+    lines = attempt["residualLines"]
+    if not isinstance(lines, list):
+        raise ValueError("Attempt lacks residual lines")
+    return [
+        Residual(int(line["frame"]), str(line["text"]), float(line["confidence"]),
+                 (float(box[0]), float(box[1]), float(box[2]), float(box[3])))
+        for line in lines
+        if isinstance(line, dict) and isinstance(box := line.get("box"), list)
+    ]  # fmt: skip
+
+
 def run(
     output: Path,
     tools: Collaborators,
@@ -115,13 +141,20 @@ def run(
     audit_stride: int = AUDIT_STRIDE,
     pins: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
-    """Attempt the sampled repair, escalate once to full OCR on a failed audit, write receipt."""
+    """Attempt the sampled repair, escalate once to full OCR on a failed audit, then once more
+    with the residual boxes when a collaborator takes them; write the receipt."""
     if stride <= FULL_STRIDE or audit_stride < 1:
         raise ValueError("Sampled stride must exceed 1 and the audit stride must be positive")
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     attempts = [_attempt(stride, output / "attempt-sampled", tools, audit_stride)]
     if not attempts[0]["passed"]:
         attempts.append(_attempt(FULL_STRIDE, output / "attempt-full", tools, audit_stride))
+    left = _residuals(attempts[-1])
+    if not attempts[-1]["passed"] and tools.residual is not None and left:
+        # OCR found what the plan missed (a glyph neither detector nor colour key covered):
+        # repair those boxes too, once, and audit the result like any attempt.
+        tools.residual(left, audit_stride)
+        attempts.append(_attempt(FULL_STRIDE, output / "attempt-residual", tools, audit_stride))
     accepted = next((item for item in reversed(attempts) if item["passed"]), None)
     receipt: dict[str, object] = {
         "version": 1,
