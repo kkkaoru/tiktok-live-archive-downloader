@@ -14,6 +14,7 @@ from replay.caption_native_layout import NativeCaptionLayout, NativeCaptionStyle
 from replay.caption_timing import CaptionPolicy, SpokenToken, make_captions
 from replay.core import ReplayError
 from replay.recordings import record
+from replay.stages import StageError
 
 
 def fake_native(argv: tuple[str, ...], output: Path, timeout: int) -> None:
@@ -328,3 +329,28 @@ def test_ass_size_is_not_motion_point_size(
         layout.measure("ab")
     layout.expected_point_size = 7
     assert layout.measure("ab") == (24, 12)
+
+
+def test_a_crashed_measurement_is_kept_aside_and_measured_once_more(
+    layout: NativeCaptionLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[Path] = []
+
+    def crash_once(argv: tuple[str, ...], output: Path, timeout: int) -> None:
+        fake_native(argv, output, timeout)
+        calls.append(output)
+        if len(calls) == 1:
+            raise StageError("Stage command failed")
+
+    monkeypatch.setattr(layout, "_execute", crash_once)
+    assert layout.measure("ab")
+    assert len(calls) == 2
+    assert (calls[0].parent / "batch-000000.crashed.json").exists()
+
+    def always(argv: tuple[str, ...], output: Path, timeout: int) -> None:
+        fake_native(argv, output, timeout)
+        raise StageError("Stage command failed")
+
+    monkeypatch.setattr(layout, "_execute", always)
+    with pytest.raises(StageError):
+        layout.measure("cd")

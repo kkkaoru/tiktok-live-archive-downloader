@@ -17,7 +17,7 @@ from pathlib import Path
 from replay import caption_linguistics, caption_style_defaults
 from replay.core import ReplayError
 from replay.recordings import record
-from replay.stages import execute_command, file_digest
+from replay.stages import StageError, execute_command, file_digest
 
 MAX_CACHE = 65_536
 MAX_BATCH_UNITS = 128
@@ -138,11 +138,15 @@ class NativeCaptionLayout:
             },
         )
         request_hash = file_digest(request)
-        self._execute(
-            (str(self.executable), "measure-media", "caption_text_measure", str(request)),
-            response,
-            60,
-        )
+        command = (str(self.executable), "measure-media", "caption_text_measure", str(request))
+        try:
+            self._execute(command, response, 60)
+        except StageError:
+            # The tool can abort in exit()'s stdio flush after writing its answer (an
+            # os_unfair_lock race seen twice in thousands of batches). A crashed run is never
+            # used: keep its output as evidence and measure the batch once more.
+            response.rename(stem.with_suffix(".crashed.json"))
+            self._execute(command, response, 60)
         if file_digest(request) != request_hash:
             raise ReplayError("Native caption measurement request changed during execution")
         if response.is_symlink() or not 0 < response.stat().st_size <= MAX_RESPONSE_BYTES:
