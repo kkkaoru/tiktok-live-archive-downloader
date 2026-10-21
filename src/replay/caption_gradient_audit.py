@@ -37,15 +37,40 @@ def fill_mask(frame: NDArray[np.uint8]) -> NDArray[np.bool_]:
     return np.asarray((frame[..., 3] > 250) & (spread > SATURATION))
 
 
+def _lines(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Join a fragment under half the tallest row run to the next run (or the last one).
+
+    A glyph's detached stroke (the dash above え) leaves fill-free rows above its body; it is
+    part of that text line, not a line of its own.
+    """
+    tallest = max(bottom - top + 1 for top, bottom in spans)
+    lines: list[tuple[int, int]] = []
+    pending: int | None = None
+    for top, bottom in spans:
+        top = top if pending is None else pending
+        if bottom - top + 1 < tallest / 2:
+            pending = top
+            continue
+        pending = None
+        lines.append((top, bottom))
+    if pending is not None:  # the tallest run came earlier, so a line exists to join
+        lines[-1] = (lines[-1][0], spans[-1][1])
+    return lines
+
+
 def line_lifts(frame: NDArray[np.uint8]) -> list[float]:
     """Per text line: luma of the upper fifth's fill minus the middle fifth's fill."""
     fill = fill_mask(frame)
     rows = np.nonzero(fill.sum(axis=1) > 3)[0]
     if not len(rows):
         return []
+    spans = [
+        (int(run[0]), int(run[-1]))
+        for run in np.split(rows, np.nonzero(np.diff(rows) > LINE_GAP)[0] + 1)
+    ]
     lifts = []
-    for run in np.split(rows, np.nonzero(np.diff(rows) > LINE_GAP)[0] + 1):
-        top, height = int(run[0]), int(run[-1]) - int(run[0]) + 1
+    for top, bottom in _lines(spans):
+        height = bottom - top + 1
         upper = frame[top : top + height // 5, :, :3][fill[top : top + height // 5]]
         middle_rows = slice(top + 2 * height // 5, top + 3 * height // 5)
         middle = frame[middle_rows, :, :3][fill[middle_rows]]

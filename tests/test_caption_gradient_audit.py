@@ -91,3 +91,13 @@ def test_the_cli_prints_the_audit(
         "weakestLift": 51.4,
         "minimumLift": 12.0,
     }
+
+
+def test_a_detached_stroke_above_a_glyph_belongs_to_its_line() -> None:
+    frame = np.zeros((60, 40, 4), dtype=np.uint8)
+    frame[5:9, 5:35] = (240, 200, 120, 255)  # the dash above え, then fill-free rows
+    frame[15:40, 5:35] = (150, 80, 40, 255)
+    frame[15:20, 5:35] = (240, 200, 120, 255)
+    frame[50:54, 5:35] = (150, 80, 40, 255)  # a trailing fragment joins the last line
+    lifts = line_lifts(frame)
+    assert len(lifts) == 1 and lifts[0] > 12
