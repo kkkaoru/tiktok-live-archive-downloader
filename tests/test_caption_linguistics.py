@@ -983,3 +983,34 @@ def test_a_word_that_fits_no_split_is_refused() -> None:
         caption_linguistics.wrap_split_word("マルコフォード", measure=width_of, width=20, height=2)
     with pytest.raises(ValueError, match="Invalid measured caption region"):
         caption_linguistics.wrap_split_word("マル\nコ", measure=width_of, width=20, height=2)
+
+
+def test_an_unfittable_unit_splits_at_observed_edges_keeping_dependent_kana() -> None:
+    texts = ("こと", "ー", "デ", "ィ", "ス", "コ", "ア", "イ", "デ", "ィ", "ー", "さ", "す")
+    words = [
+        SpokenToken(text, index * 0.2, index * 0.2 + 0.2, "a") for index, text in enumerate(texts)
+    ]
+    runs = caption_linguistics.edge_runs(words, lambda unit: len(unit.text) <= 6)
+    assert [(run.text, run.start) for run in runs] == [
+        ("ことーディス", 0.0),
+        ("コアイディー", 1.0),
+        ("さす", 2.2),
+    ]
+    stuck = caption_linguistics.edge_runs(words[:2], lambda unit: False)
+    assert [run.text for run in stuck] == ["ことー"]
+
+
+def test_a_too_wide_unknown_run_is_shown_in_fitting_runs_at_its_word_onsets() -> None:
+    texts = ("こと", "ー", "デ", "ィ", "ス", "コ", "ア", "イ", "デ", "ィ", "ー", "さ", "す")
+    words = tuple(
+        SpokenToken(text, index * 0.2, index * 0.2 + 0.2, "a") for index, text in enumerate(texts)
+    )
+    policy = CaptionPolicy(linguistic_boundaries=True, complete_phrases=True, maximum_characters=6)
+    cues = make_captions(words, policy=policy)
+    assert [(cue.text, round(cue.start, 2)) for cue in cues] == [
+        ("ことー", 0.0),
+        ("ディス", 0.4),
+        ("コアイ", 1.0),
+        ("ディー", 1.6),
+        ("ディーさす", 2.2),
+    ]

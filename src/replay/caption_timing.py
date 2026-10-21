@@ -350,12 +350,40 @@ def _display_tokens(tokens: tuple[SpokenToken, ...], policy: CaptionPolicy) -> l
             or unit.end - unit.start <= policy.maximum_context_seconds
         )
 
-    return atomic_tokens(
+    units = atomic_tokens(
         words,
         maximum_gap=policy.maximum_gap,
         complete_phrases=policy.complete_phrases,
         accept_phrase=fits,
     )
+    return _width_refit(units, words, policy)
+
+
+def _width_refit(
+    units: list[SpokenToken], words: list[SpokenToken], policy: CaptionPolicy
+) -> list[SpokenToken]:
+    """Re-split a unit too wide for the caption at its own observed ASR word edges.
+
+    No lexical edge fits an unknown run such as "ことーディスコアイディーさす", yet the recognizer
+    timed its parts; showing them in fitting runs beats refusing the whole recording.
+    """
+    from replay.caption_linguistics import edge_runs
+
+    def wide(unit: SpokenToken) -> bool:
+        return _over_budget(punctuation_lines(unit.text), policy, context=(unit,))
+
+    result: list[SpokenToken] = []
+    position = 0
+    for unit in units:
+        members: list[SpokenToken] = []
+        while position < len(words) and len("".join(w.text for w in members)) < len(unit.text):
+            members.append(words[position])
+            position += 1
+        if wide(unit) and len(members) > 1 and "".join(w.text for w in members) == unit.text:
+            result.extend(edge_runs(members, lambda run: not wide(run)))
+        else:
+            result.append(unit)
+    return result
 
 
 def phrase_units(

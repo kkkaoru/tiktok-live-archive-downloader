@@ -7,7 +7,7 @@ word guesses. These are conservative phrase candidates, not a dependency parse.
 import argparse
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from itertools import accumulate, combinations, islice, pairwise
 from math import isfinite
@@ -586,6 +586,38 @@ def _recognition_overflow(
         return None
     chosen = min(candidates, key=lambda item: (item[0], item[1]))
     return [chosen[2], chosen[3]]
+
+
+def _unit(words: Sequence[SpokenToken]) -> SpokenToken:
+    return SpokenToken(
+        "".join(word.text for word in words),
+        words[0].start,
+        max(word.end for word in words),
+        recognition_continuity(words[-1].utterance),
+    )
+
+
+def edge_runs(
+    words: Sequence[SpokenToken], accept: Callable[[SpokenToken], bool]
+) -> list[SpokenToken]:
+    """Split words that no lexical edge could fit at observed ASR word edges, longest run first.
+
+    Only recognized edges are used (no invented times), never before a dependent kana, so
+    "ディ" stays whole. A run that cannot shrink further is kept for the budget check to refuse.
+    """
+    runs: list[SpokenToken] = []
+    start = 0
+    while start < len(words):
+        allowed = [
+            end
+            for end in range(start + 1, len(words) + 1)
+            if end == len(words) or words[end].text.lstrip()[:1] not in DEPENDENT_KANA
+        ]
+        fitting = [end for end in allowed if accept(_unit(words[start:end]))]
+        end = max(fitting) if fitting else allowed[0]
+        runs.append(_unit(words[start:end]))
+        start = end
+    return runs
 
 
 def _atomic_group(
