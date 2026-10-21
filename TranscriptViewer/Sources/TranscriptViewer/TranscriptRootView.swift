@@ -217,11 +217,14 @@ struct TranscriptRootView: View {
                             timeline
                         }
                     }
+                    // Outside the scroll area, so the BGM stays visible however short it gets.
+                    VideoBGMControls(model: session.videoBGM)
                     Picker("表示内容", selection: $session.showsSummary) {
                         Text("要約").tag(true)
                         Text("認識結果").tag(false)
                     }
                     .pickerStyle(.segmented)
+                    .controlSize(.large)
                     if session.showsSummary {
                         NarrativeSummaryView(video: video, model: session.narrativeSummary) {
                             seconds in
@@ -353,6 +356,9 @@ struct TranscriptRootView: View {
                     session.resumeTimelineFollow()
                     session.seek(to: seconds)
                 }
+            }
+            ClipsPanel(model: session.clips) { clip, index, loop in
+                session.play(clip, range: index, loop: loop)
             }
             ScrollView(.horizontal) {
                 HStack(spacing: 12) {

@@ -40,6 +40,8 @@ final class PlaybackSession {
     var scanIssues: [String] = []
     let player = AVPlayer()
     let narrativeSummary: NarrativeSummaryModel
+    let videoBGM: VideoBGMModel
+    let clips: ClipsModel
     var playbackSpeed = PlaybackSpeed.normal {
         didSet {
             player.defaultRate = playbackSpeed.rawValue
@@ -87,6 +89,8 @@ final class PlaybackSession {
         presentWindow: @escaping (NSWindow) -> Void = { $0.makeKeyAndOrderFront(nil) },
         scanCatalog: @escaping CatalogLoader = TranscriptCatalog.scan(in:completion:),
         narrativeSummary: NarrativeSummaryModel = NarrativeSummaryModel(),
+        videoBGM: VideoBGMModel? = nil,
+        clips: ClipsModel = ClipsModel(api: nil),
         launchArguments: [String] = []
     ) {
         self.readLibraryRoot = readLibraryRoot
@@ -100,7 +104,14 @@ final class PlaybackSession {
         self.presentWindow = presentWindow
         self.scanCatalog = scanCatalog
         self.narrativeSummary = narrativeSummary
+        // The app passes the saved library; a bare session reads no BGM settings.
+        self.videoBGM =
+            videoBGM
+            ?? VideoBGMModel(
+                library: BGMLibraryModel(root: nil, volume: 1, defaultID: nil), settings: [:])
+        self.clips = clips
         self.launchArguments = launchArguments
+        self.videoBGM.follow(player)
     }
 
     var selectedVideo: VideoTranscript? {
@@ -357,6 +368,8 @@ final class PlaybackSession {
         browseAnchorID = nil
         timelineFollowsPlayback = true
         currentSeconds = seconds ?? 0
+        videoBGM.open(selectedVideo)
+        clips.open(selectedVideo?.movieURL)
         guard let video = selectedVideo else {
             player.replaceCurrentItem(with: nil)
             return
@@ -469,8 +482,25 @@ final class PlaybackSession {
         seek(to: hit.cue.startSeconds)
     }
 
+    /// Plays `clip` from range `index`; its later ranges follow on their own, over and over
+    /// when `loop` is set.
+    func play(_ clip: ClipPoint, range index: Int = 0, loop: Bool = false) {
+        guard let start = clips.start(clip, range: index, loop: loop) else { return }
+        resumeTimelineFollow()
+        seek(to: start)
+    }
+
     func updateCue(at seconds: Double) {
         currentSeconds = seconds
+        videoBGM.update(at: seconds)
+        switch clips.step(at: seconds) {
+        case .jump(let start):
+            player.seek(
+                to: CMTime(seconds: start, preferredTimescale: 600), toleranceBefore: .zero,
+                toleranceAfter: .zero)
+        case .finish: player.pause()
+        case .keep, .leave: break
+        }
         if let index = CueTimeline.index(at: seconds, in: utterances) {
             selectedUtteranceID = utterances[index].id
         } else {

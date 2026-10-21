@@ -368,6 +368,20 @@ the move need re-pinning, while content sha256 still verifies.
   `replay.separation_plan_refresh` or `replay.metal_asr_config`.
 
 
+## Clip points
+
+The web viewer's Worker computes clip points (切り抜き) per video and stores them in R2 under
+`clips/<movie key>.json` (same key as the excitement cache). Each clip lasts 10-30 s or 30-90 s in
+total and joins ranges of one stream in one of two stories: climax-first (the peak, then the
+lead-up to it) or hook-to-climax (a question or curious opening rising to the peak last). Its first
+3 s must be a strong hook (judged by `@cf/cloudflare/clef` for each possible opening; weak ones are
+dropped). Both viewers play the ranges back to back, once or in a loop, and list each clip's
+seconds, story, ranges and a title and summary from `@cf/zai-org/glm-5.3-flash`. Uploading a changed
+`data/<id>.json` (every sync that changes transcripts or excitement) queues the video through an R2
+event notification; unchanged inputs are never recomputed. TranscriptViewer reads them with
+`CLIPS_API_TOKEN` from `web-viewer/secrets.json` and the first `VIEWER_DOMAIN`; 切り抜きを再計算 in
+either viewer recomputes. Details: [web-viewer/README.md](../web-viewer/README.md#切り抜き).
+
 ## BGM library
 
 BGM is kept apart from TikTok/YouTube replays in `<library>/<video id>/`, where `<library>` is the

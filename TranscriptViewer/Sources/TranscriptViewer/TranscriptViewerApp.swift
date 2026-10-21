@@ -3,14 +3,21 @@ import SwiftUI
 @main
 struct TranscriptViewerApp: App {
     @State private var session: PlaybackSession
-    @State private var bgm = BGMLibraryModel()
+    @State private var bgm: BGMLibraryModel
 
     init() {
         self.init(arguments: Array(CommandLine.arguments.dropFirst()))
     }
 
     init(arguments: [String]) {
-        _session = State(initialValue: PlaybackSession(launchArguments: arguments))
+        let bgm = BGMLibraryModel()
+        _bgm = State(initialValue: bgm)
+        DebugCapture.listen()
+        _session = State(
+            initialValue: PlaybackSession(
+                videoBGM: VideoBGMModel(library: bgm),
+                clips: ClipsModel(api: ClipsModel.configured),
+                launchArguments: arguments))
     }
 
     var body: some Scene {
