@@ -804,3 +804,38 @@ def test_configured_python_version_must_be_an_exact_patch(fixture: Fixture) -> N
     fixture.root.joinpath(".python-version").write_text("3.12\n", encoding="utf-8")
     with pytest.raises(ReplayError, match="configured Python patch version"):
         fixture.plan()
+
+
+def test_a_recorded_derivation_of_the_source_is_prepared_and_reloaded(fixture: Fixture) -> None:
+    store = fixture.root / "store"
+    store.mkdir()
+    scaled = store / fixture.source.name
+    scaled.write_bytes(b"scaled picture")
+    _json(
+        store / "decodable.json",
+        {"source": str(fixture.source), "output": str(scaled), "outputSHA256": _sha(scaled)},
+    )
+    path = planner.prepare(fixture.edit, fixture.settings, fixture.work, source=scaled)
+    manifest = json.loads((fixture.work / "preparation.json").read_bytes())
+    assert manifest["source"] == str(scaled)
+    assert {"path": str(scaled), "sha256": _sha(scaled)} in manifest["inputs"]
+    assert planner._load(fixture.work / "preparation.json").source == scaled
+    assert path == fixture.work / "workflow.json"
+
+
+def test_a_source_without_its_derivation_record_is_refused(fixture: Fixture) -> None:
+    store = fixture.root / "store"
+    store.mkdir()
+    copy = store / fixture.source.name
+    copy.write_bytes(b"unrecorded copy")
+    with pytest.raises(ReplayError, match="no single derivation record"):
+        planner.prepare(fixture.edit, fixture.settings, fixture.work, source=copy)
+    _json(store / "decodable.json", {"source": str(fixture.source), "output": str(copy)})
+    with pytest.raises(ReplayError, match="does not record"):
+        planner.prepare(fixture.edit, fixture.settings, fixture.work, source=copy)
+    _json(
+        store / "decodable.json",
+        {"source": str(copy), "output": str(copy), "outputSHA256": _sha(copy)},
+    )
+    with pytest.raises(ReplayError, match="not a recorded derivation"):
+        planner.prepare(fixture.edit, fixture.settings, fixture.work, source=copy)

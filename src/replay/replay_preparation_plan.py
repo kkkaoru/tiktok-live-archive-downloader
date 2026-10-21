@@ -36,6 +36,8 @@ PROTOCOL = "replay-preparation-v1"
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_INPUTS = 220
 TOOL_NAMES = frozenset({"python", "ffmpeg", "ffprobe", "env"})
+# A derived source (re-encoded for native decoding, given a lead-in) records its origin.
+DERIVATION_RECORDS = ("decodable.json", "lead-in.json")
 SETTINGS_FIELDS = frozenset(
     {"version", "tools", "hfHome", "device", "clockTimeoutSeconds", "separationTimeoutSeconds"}
 )
@@ -278,11 +280,32 @@ def _code_paths() -> tuple[Path, ...]:
     )
 
 
+def _derived_source(original: Path, source: Path) -> Path:
+    """``source`` when its derivation records lead back to the edit's original, unchanged."""
+    current = source
+    for _ in range(len(DERIVATION_RECORDS) + 1):
+        if current == original:
+            return source
+        records = [current.parent / name for name in DERIVATION_RECORDS]
+        found = [path for path in records if path.is_file()]
+        _require(len(found) == 1, f"{current} has no single derivation record")
+        data = record(_read(found[0]))
+        _require(
+            data.get("output") == str(current)
+            and data.get("outputSHA256") == file_digest(current)
+            and isinstance(data.get("source"), str),
+            f"{found[0]} does not record {current} unchanged",
+        )
+        current = Path(str(data["source"]))
+    raise ReplayError("The source is not a recorded derivation of the edit's original")
+
+
 def _expected(
-    edit_root: Path, settings_path: Path, settings: Settings
+    edit_root: Path, settings_path: Path, settings: Settings, source: Path | None = None
 ) -> tuple[Path, tuple[Pin, ...]]:
     _local(_path(str(edit_root)), ROOT / "edits")
     config = load_config(edit_root)
+    media = config.source if source is None else _derived_source(config.source, source)
     references = (
         *(tool.pin for tool in settings.tools.values()),
         *_models(settings),
@@ -298,7 +321,7 @@ def _expected(
     paths = (
         edit_root / CONFIG_NAME,
         settings_path,
-        config.source,
+        media,
         *_code_paths(),
         ROOT / "pyproject.toml",
         ROOT / "uv.lock",
@@ -309,7 +332,7 @@ def _expected(
     for path in paths:
         supplied.setdefault(path, file_digest(path))
     _require(len(supplied) <= MAX_INPUTS, "Preparation input closure exceeds workflow budget")
-    return config.source, tuple(Pin(path, digest) for path, digest in sorted(supplied.items()))
+    return media, tuple(Pin(path, digest) for path, digest in sorted(supplied.items()))
 
 
 def _environment(preparation: Preparation) -> tuple[str, ...]:
@@ -440,17 +463,23 @@ def _write(path: Path, value: object) -> None:
         os.fsync(stream.fileno())
 
 
-def prepare(edit_root: Path, settings_path: Path, work: Path) -> Path:
-    """Create a non-overwriting plan only; replay.workflow owns execution and resume."""
+def prepare(
+    edit_root: Path, settings_path: Path, work: Path, *, source: Path | None = None
+) -> Path:
+    """Create a non-overwriting plan only; replay.workflow owns execution and resume.
+
+    ``source`` names a recorded derivation of the edit's original (a scaled or lead-in copy) to
+    prepare instead of the original itself.
+    """
     _local(_path(str(work)), ROOT / "edits" / "work")
     _require(
         work.parent.is_dir() and not work.exists(),
         "Use a new work root with an existing parent; inspect occupied/partial results",
     )
     settings = read_settings(settings_path)
-    source, pins = _expected(edit_root, settings_path, settings)
+    media, pins = _expected(edit_root, settings_path, settings, source)
     snapshot = InputHashSnapshot.capture((item.path, item.sha256) for item in pins)
-    preparation = Preparation(edit_root, settings_path, work, settings, source, pins)
+    preparation = Preparation(edit_root, settings_path, work, settings, media, pins)
     workflow = _workflow(preparation)
     snapshot.finish()
     _resolutions(preparation)
@@ -468,6 +497,7 @@ def prepare(edit_root: Path, settings_path: Path, work: Path) -> Path:
             "inputs": [item.data() for item in pins],
             "candidateOnly": True,
             "deliveryComplete": False,
+            **({} if source is None else {"source": str(media)}),
         },
     )
     _write(work / "workflow.json", workflow)
@@ -477,7 +507,7 @@ def prepare(edit_root: Path, settings_path: Path, work: Path) -> Path:
 def _load(path: Path) -> Preparation:
     data = record(_read(path))
     _require(
-        set(data) == PLAN_FIELDS
+        set(data) - {"source"} == PLAN_FIELDS
         and type(data["version"]) is int
         and data["version"] == 1
         and data["protocol"] == PROTOCOL
@@ -503,7 +533,8 @@ def _load(path: Path) -> Preparation:
     pins = tuple(_pin(item) for item in raw)
     _require(len({item.path for item in pins}) == len(pins), "Duplicate preparation input")
     settings = read_settings(settings_path)
-    source, expected = _expected(edit_root, settings_path, settings)
+    chosen = _path(data["source"]) if "source" in data else None
+    source, expected = _expected(edit_root, settings_path, settings, chosen)
     _require(pins == expected, "Preparation input hashes or dependency membership changed")
     _require(
         record(_read(work / "workflow.json"))
@@ -522,8 +553,10 @@ def _resolutions(preparation: Preparation) -> None:
         all(item in preparation.pins for item in _models(preparation.settings)),
         "Model cache alias changed",
     )
+    original = load_config(preparation.edit_root).source
     _require(
-        load_config(preparation.edit_root).source == preparation.source, "Source alias changed"
+        _derived_source(original, preparation.source) == preparation.source,
+        "Source alias changed",
     )
 
 
@@ -667,6 +700,7 @@ class Arguments(argparse.Namespace):
     work: Path
     plan: Path
     kind: Kind
+    source: Path | None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -676,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
     plan.add_argument("edit_root", type=Path)
     plan.add_argument("settings", type=Path)
     plan.add_argument("work", type=Path)
+    plan.add_argument("--source", type=Path, help="a recorded derivation of the original")
     verify = commands.add_parser("verify-media-clocks")
     verify.add_argument("plan", type=Path)
     verify.add_argument("kind", choices=("video", "audio", "separation"))
@@ -686,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.parse_args(argv, namespace=args)
     try:
         if args.action == "prepare":
-            print(prepare(args.edit_root, args.settings, args.work))
+            print(prepare(args.edit_root, args.settings, args.work, source=args.source))
         elif args.action == "produce":
             produce(args.plan, args.kind)
         else:
