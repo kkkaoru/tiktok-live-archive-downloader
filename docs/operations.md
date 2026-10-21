@@ -387,6 +387,19 @@ the library in its own **BGM** window (toolbar or ⌘B): search title/channel, p
 thumbnail shown, open the YouTube page, Reveal Finder, copy the path, or save a new URL.
 `storage_disposition` always keeps `bgm-library`.
 
+The BGM window's **デフォルトに設定** picks the BGM for videos without their own. Under the player
+a searchable chooser (artwork, デフォルト, BGMなし, every track) sets one video's BGM; it starts and
+pauses with the video, loops, and stays at 1.0x. 手動 is a fixed volume; 自動 keeps the BGM at the
+chosen offset (default −22 dB) below the video's level at the playhead (±5 s power mean, pauses
+under −50 dBFS held). The Viewer never decodes audio for this: the video's per-second levels are
+`edits/excitement-cache/levels-<movie key>.json` (written by `replay.excitement catalog` or
+`python -m replay.excitement levels MOVIE...`; the key is size plus first/last MiB, so moved or
+offloaded copies match) and the BGM's level is `track.json` `loudness` (written on `add`/`add-loop`;
+backfill with `python -m replay.bgm_library loudness`). Missing data shows 音量データなし and
+assumes −20 dBFS talk and a −10 dBFS BGM. Both modes follow the video's own volume and mute. The
+choice and volume are saved per recording ID (else movie file name) in the app's preferences, not
+in `edits/`.
+
 ### Looping BGM from a talk stream
 
 When a stream's BGM is a loop under continuous talk, rebuild it from the separation residual

@@ -12,6 +12,8 @@ public struct BGMTrack: Identifiable, Equatable, Sendable {
     public let duration: Double?
     /// A rebuilt BGM loop, played again from the start when it ends.
     public let loops: Bool
+    /// Mean level (dBFS) stored by `python -m replay.bgm_library loudness`; nil until measured.
+    public let loudness: Double?
 }
 
 /// Reads `ROOT/<video id>/track.json` written by `python -m replay.bgm_library add`.
@@ -38,6 +40,7 @@ public enum BGMLibrary {
         let audio: String
         let thumbnail: String
         let loop: Bool?
+        let loudness: Double?
     }
 
     /// The configured library, else the checkout's beside its edit library; nil outside a dist
@@ -128,7 +131,8 @@ public enum BGMLibrary {
             pageURL: page,
             audioURL: try regularFile(folder.appending(path: record.audio), in: folder),
             thumbnailURL: try regularFile(folder.appending(path: record.thumbnail), in: folder),
-            duration: record.duration, loops: record.loop ?? false)
+            duration: record.duration, loops: record.loop ?? false,
+            loudness: record.loudness.flatMap { $0.isFinite ? $0 : nil })
     }
 
     /// A plain file directly inside the track folder, never a link or a nested path.

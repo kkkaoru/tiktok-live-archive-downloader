@@ -10,6 +10,7 @@ final class BGMLibraryModel {
     /// Runs `python -m replay.bgm_library add URL` and returns its exit status and output.
     typealias Downloader = @Sendable (String, URL) async -> (status: Int32, output: String)
     static let volumeKey = "TranscriptViewer.bgmVolume"
+    static let defaultKey = "TranscriptViewer.defaultBGM"
 
     let root: URL?
     let player = AVPlayer()
@@ -36,12 +37,26 @@ final class BGMLibraryModel {
     }
     private var level: Float
     @ObservationIgnored private var volumeObservation: NSKeyValueObservation?
+    /// The BGM a video plays when it has none of its own.
+    var defaultID: BGMTrack.ID? {
+        didSet {
+            guard defaultID != oldValue else { return }
+            storeDefault(defaultID)
+            defaultChanged()
+        }
+    }
     var newURL = ""
     private(set) var isAdding = false
     private(set) var addMessage = ""
     @ObservationIgnored var storeVolume: (Float) -> Void = {
         UserDefaults.standard.set($0, forKey: BGMLibraryModel.volumeKey)
     }
+    @ObservationIgnored var storeDefault: (BGMTrack.ID?) -> Void = {
+        UserDefaults.standard.set($0, forKey: BGMLibraryModel.defaultKey)
+    }
+    /// Set by the video BGM, so only one BGM plays at a time.
+    @ObservationIgnored var willPlay: () -> Void = {}
+    @ObservationIgnored var defaultChanged: () -> Void = {}
     @ObservationIgnored var download: Downloader = { url, root in
         await BGMLibraryModel.runCheckoutDownloader(url, root, checkout: BGMLibraryModel.checkout)
     }
@@ -56,9 +71,11 @@ final class BGMLibraryModel {
     init(
         root: URL? = BGMLibrary.root(near: Bundle.main.bundleURL),
         volume: Float = UserDefaults.standard.object(forKey: BGMLibraryModel.volumeKey) as? Float
-            ?? 1
+            ?? 1,
+        defaultID: BGMTrack.ID? = UserDefaults.standard.string(forKey: BGMLibraryModel.defaultKey)
     ) {
         self.root = root
+        self.defaultID = defaultID
         level = min(max(volume, 0), 1)
         player.volume = level
         // The seek bar's own speaker control changes the same player; keep one shared value.
@@ -82,11 +99,19 @@ final class BGMLibraryModel {
     /// Starts the track, or pauses it when it is already playing.
     func togglePlayback(_ track: BGMTrack) {
         if playingID == track.id {
-            player.pause()
-            playingID = nil
+            pause()
             return
         }
         play(track)
+    }
+
+    func pause() {
+        player.pause()
+        playingID = nil
+    }
+
+    func toggleDefault(_ track: BGMTrack) {
+        defaultID = defaultID == track.id ? nil : track.id
     }
 
     private func play(_ track: BGMTrack) {
@@ -99,6 +124,7 @@ final class BGMLibraryModel {
                 forName: AVPlayerItem.didPlayToEndTimeNotification, object: item, queue: .main
             ) { [weak self] _ in MainActor.assumeIsolated { self?.restart() } }
             : nil
+        willPlay()
         player.play()
         playingID = track.id
     }

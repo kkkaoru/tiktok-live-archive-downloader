@@ -33,6 +33,13 @@ struct BGMLibraryView: View {
                             Text(track.title).lineLimit(2)
                             Text(track.channel).font(.caption).foregroundStyle(.secondary)
                         }
+                        if model.defaultID == track.id {
+                            Spacer()
+                            Image(systemName: "star.fill")
+                                .foregroundStyle(.yellow)
+                                .help("デフォルトBGM")
+                                .accessibilityLabel("デフォルトBGM")
+                        }
                     }
                     .frame(minHeight: Chrome.hit)
                     .tag(track.id)
@@ -147,6 +154,13 @@ struct BGMLibraryView: View {
                     .keyboardShortcut(.space, modifiers: [])
                     fileButtons(track)
                 }
+                Button(
+                    model.defaultID == track.id ? "デフォルトを解除" : "デフォルトに設定",
+                    systemImage: model.defaultID == track.id ? "star.slash" : "star"
+                ) {
+                    model.toggleDefault(track)
+                }
+                .help("BGMを登録していない動画で、このBGMを流します")
                 if model.playingID == track.id {
                     AudioControls(player: model.player).frame(height: Chrome.hit)
                 }
@@ -167,13 +181,5 @@ struct BGMLibraryView: View {
         }
     }
 
-    func thumbnail(_ track: BGMTrack) -> some View {
-        Group {
-            if let image = NSImage(contentsOf: track.thumbnailURL) {
-                Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
-            } else {
-                Image(systemName: "music.note")
-            }
-        }
-    }
+    func thumbnail(_ track: BGMTrack) -> some View { BGMThumbnail(track: track) }
 }
