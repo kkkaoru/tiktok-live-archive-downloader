@@ -63,6 +63,23 @@ def decoder_model() -> Any:
     return model
 
 
+def lazy_network(model: Path, *, sha256: str, device: str = "mps") -> Network:
+    """The pinned detector, hash-checked now but loaded onto the device only on first use.
+
+    A chunk with YOLO admission and masks never calls it, so it no longer pays the load.
+    """
+    if model.is_symlink() or not model.is_file() or fingerprint(model) != sha256:
+        raise ValueError("Expected a bounded, hash-verified local exported detector program")
+    loaded: list[Network] = []
+
+    def run(batch: NDArray[np.float32]) -> NDArray[np.float32]:
+        if not loaded:
+            loaded.append(load_network(model, sha256=sha256, device=device))
+        return loaded[0](batch)
+
+    return run
+
+
 def load_network(model: Path, *, sha256: str, device: str = "mps") -> Network:
     """Load the pinned exported detector program onto an explicit device; never fall back."""
     if (

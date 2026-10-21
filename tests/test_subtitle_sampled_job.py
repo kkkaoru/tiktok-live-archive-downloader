@@ -189,7 +189,7 @@ def test_main_loads_the_pinned_network_and_runs(
     monkeypatch.setattr(
         job, "render_repaired_video_fast", lambda video_job, **_: video_job.output.write_bytes(b"v")
     )
-    monkeypatch.setattr(mps, "load_network", lambda *_args, **_kw: _bar)
+    monkeypatch.setattr(mps, "lazy_network", lambda *_args, **_kw: _bar)
     assert job.main([str(path)]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "accepted": "attempt-sampled",
@@ -333,7 +333,7 @@ def test_main_pins_the_yolo_region_detector(
     }  # fmt: skip
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
-    monkeypatch.setattr(mps, "load_network", lambda *_args, **_kw: _bar)
+    monkeypatch.setattr(mps, "lazy_network", lambda *_args, **_kw: _bar)
     monkeypatch.setattr(yolo_regions, "load_detector", lambda settings: _caption_detector)
     monkeypatch.setattr(
         job, "render_repaired_video_fast", lambda video_job, **_: video_job.output.write_bytes(b"v")

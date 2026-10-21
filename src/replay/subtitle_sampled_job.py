@@ -357,7 +357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.config.stat().st_size > MAX_CONFIG_BYTES:
         raise ValueError("Chunk configuration exceeds its byte budget")
     config = record(json.loads(arguments.config.read_text(encoding="utf-8")))
-    network = mps.load_network(
+    network = mps.lazy_network(
         Path(str(config["detectorProgram"])), sha256=str(config["detectorProgramSHA256"])
     )
     region_pins: dict[str, str] = {}

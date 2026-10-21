@@ -156,3 +156,24 @@ def test_threaded_decode_matches_single_thread_masks() -> None:
     single = mps.MpsTextDetector(_bar, cpu_threads=1).detect([ROI, ROI, ROI])
     many = mps.MpsTextDetector(_bar, cpu_threads=4).detect([ROI, ROI, ROI])
     assert [mask.tobytes() for mask in many] == [mask.tobytes() for mask in single]
+
+
+def test_a_lazy_network_checks_now_and_loads_once_on_first_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "model.pt2"
+    model.write_bytes(b"program")
+    with pytest.raises(ValueError, match="hash-verified"):
+        mps.lazy_network(model, sha256="0" * 64, device="cpu")
+    loads: list[Path] = []
+
+    def load(path: Path, *, sha256: str, device: str) -> mps.Network:
+        loads.append(path)
+        return lambda batch: batch * 2
+
+    monkeypatch.setattr(mps, "load_network", load)
+    run = mps.lazy_network(model, sha256=fingerprint(model), device="cpu")
+    assert loads == []
+    assert run(np.ones(2, dtype=np.float32)).tolist() == [2.0, 2.0]
+    assert run(np.ones(1, dtype=np.float32)).tolist() == [2.0]
+    assert loads == [model]
