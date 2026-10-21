@@ -185,24 +185,31 @@ struct TranscriptRootView: View {
                                     }
                                 }
                                 .pickerStyle(.segmented)
+                                .controlSize(.large)
                                 .frame(width: 300)
                                 .accessibilityLabel("再生速度")
-                                Button("速度を切り替え", systemImage: "speedometer") {
+                                Button {
                                     session.playbackSpeed = session.playbackSpeed.next
+                                } label: {
+                                    iconLabel("速度を切り替え", systemImage: "speedometer")
                                 }
-                                .labelStyle(.iconOnly)
+                                .buttonStyle(.borderless)
                                 .keyboardShortcut("s", modifiers: [])
                                 .help("S: 再生速度を 0.5x→1.0x→1.5x→2.0x の順に切り替え")
-                                Button("10秒戻す", systemImage: "gobackward.10") {
+                                Button {
                                     session.skip(by: -10)
+                                } label: {
+                                    iconLabel("10秒戻す", systemImage: "gobackward.10")
                                 }
-                                .labelStyle(.iconOnly)
+                                .buttonStyle(.borderless)
                                 .keyboardShortcut(.leftArrow, modifiers: [])
                                 .help("←: 10秒戻す")
-                                Button("10秒送る", systemImage: "goforward.10") {
+                                Button {
                                     session.skip(by: 10)
+                                } label: {
+                                    iconLabel("10秒送る", systemImage: "goforward.10")
                                 }
-                                .labelStyle(.iconOnly)
+                                .buttonStyle(.borderless)
                                 .keyboardShortcut(.rightArrow, modifiers: [])
                                 .help("→: 10秒送る")
                                 Spacer()
@@ -381,6 +388,15 @@ struct TranscriptRootView: View {
             .accessibilityLabel("付近の発話")
             .accessibilityHint("スクロールすると再生への自動追従を止めます")
         }
+    }
+
+    /// An icon button's whole 44pt square is clickable; VoiceOver reads the title.
+    func iconLabel(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .labelStyle(.iconOnly)
+            .font(.title2)
+            .frame(width: Chrome.hit, height: Chrome.hit)
+            .contentShape(Rectangle())
     }
 
     func fileMenu(for video: VideoTranscript) -> some View {
