@@ -770,3 +770,10 @@ def test_asr_with_windows_assembles_the_windowed_recognition(
     steps.execute("asr", path, run=producers)
     assert "replay.asr_context_streams" not in modules(producers)
     assert producers.commands[2][-2:] == ["--target", "assemble"]
+
+
+def test_a_recording_is_named_by_its_replay_or_youtube_id() -> None:
+    assert steps.recording_name("7698733815817341702") == "replay-7698733815817341702"
+    assert steps.recording_name("youtube-Eg9-gl3Z954") == "youtube-Eg9-gl3Z954"
+    with pytest.raises(ReplayError, match="TikTok replay ID or youtube-<video id>"):
+        steps.recording_name("youtube-../x")

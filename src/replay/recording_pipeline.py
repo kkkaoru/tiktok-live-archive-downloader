@@ -42,6 +42,7 @@ from types import FrameType
 from replay import gpu_lease
 from replay import recording_caption_steps as captions
 from replay import recording_steps as steps
+from replay import source_decodable as decodable
 from replay import source_lead_in as lead_in
 from replay.core import ReplayError
 from replay.edit_completion import bind_source, bind_storage, load_config
@@ -155,26 +156,36 @@ def zero_origin_source(defaults: dict[str, object], edit_root: Path) -> Path:
     """The edit source; one whose video starts late is first rebound to its lead-in copy.
 
     The copy lives beside the delivery storage (``<deliveryRoot>/source-lead-in/<recording>``),
-    so the storage root never contains the source it was validated against.
+    so the storage root never contains the source it was validated against. A source in codecs the
+    native tools cannot decode (YouTube VP9/Opus) is first copied to decodable ones
+    (``source-decodable``); it only feeds the pipeline, since a YouTube config binds its original
+    beside its publication record. A source smaller than the delivery canvas is processed at its
+    own size: composition scales it up last (``fit``).
     """
     config = load_config(edit_root)
     if config.storage_root is None:
         raise ReplayError("The recording has no bound storage for a lead-in copy")
-    directory = config.storage_root.parent / lead_in.DIRECTORY / edit_root.name
+    tools = {"ffmpeg": str(defaults["ffmpeg"]), "ffprobe": str(defaults["ffprobe"])}
+    readable = decodable.prepared(
+        config.source, config.storage_root.parent / decodable.DIRECTORY / edit_root.name, **tools
+    )
     derived = lead_in.prepared(
-        config.source, directory,
-        ffmpeg=str(defaults["ffmpeg"]), ffprobe=str(defaults["ffprobe"]),
-    )  # fmt: skip
-    if derived != config.source:
+        readable, config.storage_root.parent / lead_in.DIRECTORY / edit_root.name, **tools
+    )
+    if readable == config.source and derived != config.source:
         bind_source(edit_root, derived)
     return derived
 
 
 def bind(replay_id: str, python: str, checkout: Path) -> Path:
-    """The recording's edit root, initialized from its completed download job when new."""
-    if not replay_id.isdigit():
-        raise ReplayError("A replay ID is decimal digits")
-    edit_root = checkout / "edits" / f"replay-{replay_id}"
+    """The recording's edit root, initialized from its completed download job when new.
+
+    A YouTube recording (``youtube-<id>``) is bound beforehand from its original and publication
+    record (``edit_completion init-youtube``); there is no download job to initialize it from.
+    """
+    edit_root = checkout / "edits" / steps.recording_name(replay_id)
+    if not replay_id.isdigit() and not (edit_root / "edit-config.json").exists():
+        raise ReplayError(f"Bind {edit_root.name} first with edit_completion init-youtube")
     if not (edit_root / "edit-config.json").exists():
         subprocess.run(
             [python, "-B", "-m", "replay.edit_completion", "init", str(edit_root),
@@ -192,7 +203,7 @@ def pipeline_config(
         "recording": replay_id,
         "editRoot": str(edit_root),
         "source": str(zero_origin_source(defaults, edit_root)),
-        "work": str(layout.directory / f"replay-{replay_id}"),
+        "work": str(layout.directory / steps.recording_name(replay_id)),
         "steps": str(layout.steps),
         "python": defaults["python"],
         "providerPython": defaults["providerPython"],
@@ -217,7 +228,7 @@ def write_once(path: Path, value: object) -> None:
 
 
 def layout_of(replay_id: str, defaults: dict[str, object], checkout: Path) -> Layout:
-    layout = Layout(Path(str(defaults["root"])) / f"replay-{replay_id}")
+    layout = Layout(Path(str(defaults["root"])) / steps.recording_name(replay_id))
     if not layout.directory.resolve().is_relative_to(checkout / "edits/work"):
         raise ReplayError("The pipeline root must live under the checkout's edits/work")
     return layout

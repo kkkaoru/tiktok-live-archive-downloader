@@ -97,7 +97,7 @@ class Captions:
         return record(self.data[key])
 
     def media(self, pipeline: Pipeline) -> Path:
-        return Path(str(self.data["mediaRoot"])) / f"replay-{pipeline.text('recording')}"
+        return Path(str(self.data["mediaRoot"])) / front.recording_name(pipeline.text("recording"))
 
 
 def captions_path(pipeline: Pipeline) -> Path:

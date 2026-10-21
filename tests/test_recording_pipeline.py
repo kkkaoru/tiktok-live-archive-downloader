@@ -235,8 +235,20 @@ def test_a_new_recording_is_bound_through_edit_completion(
 
 
 def test_a_replay_id_must_be_digits(tmp_path: Path) -> None:
-    with pytest.raises(ReplayError, match="decimal digits"):
+    with pytest.raises(ReplayError, match="TikTok replay ID or youtube-<video id>"):
         pipeline.bind("../x", "/py", tmp_path)
+
+
+def test_a_youtube_recording_must_be_bound_from_its_original_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: pytest.fail("no download job"))
+    with pytest.raises(ReplayError, match="Bind youtube-Eg9-gl3Z954 first"):
+        pipeline.bind("youtube-Eg9-gl3Z954", "/py", tmp_path)
+    root = tmp_path / "edits/youtube-Eg9-gl3Z954"
+    root.mkdir(parents=True)
+    (root / "edit-config.json").write_text("{}", encoding="utf-8")
+    assert pipeline.bind("youtube-Eg9-gl3Z954", "/py", tmp_path) == root
 
 
 def test_a_missing_source_is_refused(tmp_path: Path) -> None:
@@ -366,6 +378,7 @@ def test_a_late_video_source_is_rebound_to_its_lead_in_copy(
         storage_root: Path | None = tmp_path / "deliveries/replay-42"
 
     monkeypatch.setattr("replay.source_lead_in.prepared", prepared)
+    monkeypatch.setattr("replay.source_decodable.prepared", lambda source, *_a, **_k: source)
     monkeypatch.setattr(pipeline, "load_config", lambda _root: Config)
     monkeypatch.setattr(pipeline, "bind_source", lambda r, s: bound.append((r, s)))
     data: dict[str, object] = {"ffmpeg": "/ffmpeg", "ffprobe": "/ffprobe"}
@@ -382,3 +395,27 @@ def test_a_late_video_source_is_rebound_to_its_lead_in_copy(
     Config.storage_root = None
     with pytest.raises(ReplayError, match="no bound storage"):
         pipeline.zero_origin_source(data, root)
+
+
+def test_an_undecodable_source_is_copied_for_the_pipeline_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = edit_root(tmp_path)
+    monkeypatch.undo()
+    bound: list[tuple[Path, Path]] = []
+
+    class Config:
+        source = tmp_path / "source.mp4"
+        storage_root: Path | None = tmp_path / "deliveries/youtube-Eg9-gl3Z954"
+
+    monkeypatch.setattr(
+        "replay.source_decodable.prepared", lambda source, directory, **_k: directory / source.name
+    )
+    monkeypatch.setattr("replay.source_lead_in.prepared", lambda source, *_a, **_k: source)
+    monkeypatch.setattr(pipeline, "load_config", lambda _root: Config)
+    monkeypatch.setattr(pipeline, "bind_source", lambda r, s: bound.append((r, s)))
+    data: dict[str, object] = {"ffmpeg": "/ffmpeg", "ffprobe": "/ffprobe"}
+    assert pipeline.zero_origin_source(data, root) == (
+        tmp_path / "deliveries/source-decodable/replay-42/source.mp4"
+    )
+    assert bound == []

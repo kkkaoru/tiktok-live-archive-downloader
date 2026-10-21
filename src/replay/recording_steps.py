@@ -39,6 +39,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -97,6 +98,18 @@ YOLO_DEVICE, YOLO_DECODER = "mps", "videotoolbox"  # detector on the GPU, media-
 PREPARATION_CLOSURE = ("separation_pipeline_prepare", "code_dependency_inventory")
 PLAN_CLOSURE = ("separation_window_pipeline", "code_dependency_inventory")
 CLEANUP_REVISION = "p1"
+YOUTUBE_RECORDING = re.compile(r"youtube-[A-Za-z0-9_-]{11}")
+
+
+def recording_name(recording: str) -> str:
+    """A recording's folder name: ``replay-<id>`` for a TikTok replay, else its ``youtube-<id>``."""
+    if recording.isdigit():
+        return f"replay-{recording}"
+    if YOUTUBE_RECORDING.fullmatch(recording):
+        return recording
+    raise ReplayError("A recording is a TikTok replay ID or youtube-<video id>")
+
+
 CAPTION_ABSENCE = "caption-absence-v1"
 HASH_BLOCK = 1 << 24
 ENV = "/usr/bin/env"
@@ -322,8 +335,9 @@ def clocks(pipeline: Pipeline, run: Runner) -> dict[str, object]:
         tools = str(pipeline.reference("preparationTools"))
         edit_root = pipeline.text("editRoot")
         prepare = module(
-            pipeline, "replay_preparation_plan", "prepare", edit_root, tools, str(work)
-        )
+            pipeline, "replay_preparation_plan", "prepare", edit_root, tools, str(work),
+            "--source", str(pipeline.path_of("source")),
+        )  # fmt: skip
         run(prepare, log)
     run(workflow(pipeline, work / "workflow.json", work / "state", *CLOCK_STAGES), log)
     source = pipeline.path_of("source")
