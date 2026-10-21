@@ -471,3 +471,23 @@ def test_legacy_cut_requires_producer_evidence(legacy_tempo: Path) -> None:
     repin(legacy_tempo, "producerConfig", data)
     with pytest.raises(ReplayError, match="completed-selection binding"):
         verify(legacy_tempo)
+
+
+def test_a_slot_rendered_in_budget_pieces_is_covered_piece_by_piece(
+    tempo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("replay.clocked_tempo_audio.MAX_WINDOW_BYTES", 4000)
+    with pytest.raises(ReplayError, match="does not cover every cut"):
+        verify(tempo)
+    receipt = json.loads((tempo.parent / "producer-receipt.json").read_text(encoding="utf-8"))
+    receipt["cuts"] = [
+        {
+            "source_start_sample": start,
+            "source_end_sample": end,
+            "output_start_sample": start,
+            "output_end_sample": end,
+        }
+        for start, end in ((0, 250), (250, 500), (500, 750), (750, 800))
+    ]
+    repin(tempo, "producerReceipt", receipt)
+    verify(tempo)

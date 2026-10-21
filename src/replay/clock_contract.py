@@ -16,7 +16,7 @@ from replay.asr_clock_projection import _labels as pcm_labels
 from replay.asr_clock_projection import project_labels
 from replay.audio_clock import AudioFrameClock
 from replay.clocked_cut_audio import plan_slots
-from replay.clocked_tempo_audio import source_path
+from replay.clocked_tempo_audio import pieces, source_path
 from replay.continuous_quiet_plan import _labels as source_labels
 from replay.core import ReplayError
 from replay.cut_audio_support import _cuts, _local, _read
@@ -196,10 +196,16 @@ def _tempo(
     slots = plan_slots(
         clock, intervals, rate=rate, samples=samples, maximum_rate_change=float(bound)
     )
+    # A slot over the tempo window budget is rendered, and measured, in pieces.
+    placed = [
+        piece
+        for slot in slots
+        for piece in pieces(slot, slot.output_start, slot.output_end, channels * 2)
+    ]
     measurements = receipt.get("cuts")
-    if not isinstance(measurements, list) or len(measurements) != len(slots):
+    if not isinstance(measurements, list) or len(measurements) != len(placed):
         raise ReplayError("Tempo receipt does not cover every cut")
-    for slot, value in zip(slots, measurements, strict=True):
+    for slot, value in zip(placed, measurements, strict=True):
         row = record(value)
         if (
             row.get("source_start_sample") != slot.spans[0][0]
