@@ -1310,6 +1310,18 @@ not verify audible pitch, real-media playback, an actual Finder reveal, or compl
 visual/accessibility acceptance. Check those separately in the built app. The installer restarts only this checkout's running app after
 signing the replacement; it does not modify videos or transcripts.
 
+### Checking the running Viewer's screen
+
+`scripts/viewer-debug-capture.sh` asks this checkout's running dist app (over a distributed
+notification; nothing is clicked or focused) to write each visible window's accessibility report
+to `edits/work/viewer-debug/<stamp>/<n>-<title>.json`, then screenshots those windows by window
+number with `screencapture -l` and prints the folder. The report lists role, name, value and frame
+(window points from the top left, as in the PNG) of every element, plus `smallTargets` (interactive,
+below HIG's 28 pt macOS default) and `unlabeled`. Title-bar buttons, scroll-bar parts and zero-size
+elements are left out. The app keeps the latest 10 captures. Screenshots need Screen Recording for the
+terminal; an in-app drawing was rejected because it renders sidebar materials white. A rebuilt app
+can wait on macOS's removable-volume prompt before its library loads: the user must answer it.
+
 For an explicitly authorized existing-library run, build `transcript-summary` and
 use `generate --library edits --diagnostics edits/work/summary-debug`. Add
 `--include-text` only when local raw prompts/responses are needed; never publish
