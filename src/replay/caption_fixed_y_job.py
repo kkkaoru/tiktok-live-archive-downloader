@@ -248,25 +248,34 @@ def load_observed(window_index: Path) -> list[TrackingPosition]:
     return observed_only(samples)
 
 
-def load_yolo(track: Path, *, minimum_confidence: float) -> list[TrackingPosition]:
+def load_yolo(
+    track: Path, *, minimum_confidence: float, canvas_width: float
+) -> list[TrackingPosition]:
     """Face-top samples from a `yolo_track` evidence file; frames with 0 or 2+ faces are skipped.
 
     A frame with several faces is ambiguous, exactly as Vision's ambiguous frames are, and is not
     guessed. The sample time is the frame's presentation timestamp (v2 tracks); v1 tracks derived
     time from the frame index and drift on variable-frame-rate sources, so they are refused. The
     source's nominal rate is therefore irrelevant (it need not equal the output rate). The sample
-    position is the face box's horizontal centre and its top edge.
+    position is the face box's horizontal centre and its top edge, scaled from the tracked
+    source's pixels to the caption canvas (a 720x1280 source is composed onto 1080x1920).
     """
     data = json.loads(track.read_text(encoding="utf-8"))
     if data.get("protocol") != "yolo-face-caption-track-v2" or data.get("provenance") != "yolo":
         raise ReplayError("Not a timestamped (v2) YOLO face track")
     base = Fraction(str(data["timeBase"]))
+    width = data.get("width")
+    if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+        raise ReplayError("The YOLO face track records no source width")
+    scale = canvas_width / width
     samples: list[TrackingPosition] = []
     for row in data["frames"]:
         box = row["face"]
         if box is None or row["faceCount"] != 1 or box[4] < minimum_confidence:
             continue
-        samples.append(TrackingPosition(int(row["pts"]) * base, (box[0] + box[2]) / 2, box[1]))
+        samples.append(
+            TrackingPosition(int(row["pts"]) * base, (box[0] + box[2]) / 2 * scale, box[1] * scale)
+        )
     return sorted(samples, key=lambda sample: sample.time)
 
 
@@ -401,7 +410,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.yolo_track is None:
         observed = vision
     else:
-        yolo = load_yolo(args.yolo_track, minimum_confidence=args.yolo_minimum_confidence)
+        canvas = json.loads(args.calibration.read_text(encoding="utf-8"))["canvas"]
+        yolo = load_yolo(
+            args.yolo_track,
+            minimum_confidence=args.yolo_minimum_confidence,
+            canvas_width=float(canvas[0]),
+        )
         observed = merge_observed(vision, yolo, gap=args.yolo_gap_seconds)
     print(json.dumps(run_plan(args, observed)))
     return 0

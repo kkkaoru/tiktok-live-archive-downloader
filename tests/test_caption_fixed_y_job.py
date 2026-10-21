@@ -387,12 +387,15 @@ def test_a_second_plan_into_the_same_output_is_refused(tmp_path: Path) -> None:
         job.run_plan(job.parse(arguments), series)
 
 
-def track_file(path: Path, rows: list[dict[str, object]], *, rate: int = 30) -> Path:
+def track_file(
+    path: Path, rows: list[dict[str, object]], *, rate: int = 30, width: int = 1080
+) -> Path:
     path.write_text(
         json.dumps(
             {
                 "protocol": "yolo-face-caption-track-v2",
                 "provenance": "yolo",
+                "width": width,
                 "rate": rate,
                 "timeBase": "1/90000",
                 "frames": rows,
@@ -415,7 +418,9 @@ def test_yolo_samples_are_the_box_centre_and_top_of_single_confident_faces(tmp_p
         {"frame": 120, "pts": 4860000, "face": [0.0, 1.0, 2.0, 3.0, 0.3], "faceCount": 1,
          "captions": 0},
     ]  # fmt: skip
-    found = job.load_yolo(track_file(tmp_path / "t.json", rows), minimum_confidence=0.5)
+    found = job.load_yolo(
+        track_file(tmp_path / "t.json", rows), minimum_confidence=0.5, canvas_width=1080.0
+    )
     assert found == [
         TrackingPosition(Fraction(0), 210.0, 810.0),
         TrackingPosition(Fraction(52), 200.0, 800.0),
@@ -426,19 +431,19 @@ def test_a_track_of_another_protocol_is_refused(tmp_path: Path) -> None:
     other = tmp_path / "other.json"
     other.write_text(json.dumps({"protocol": "x", "provenance": "yolo"}), encoding="utf-8")
     with pytest.raises(ReplayError, match="Not a timestamped"):
-        job.load_yolo(other, minimum_confidence=0.5)
+        job.load_yolo(other, minimum_confidence=0.5, canvas_width=1080.0)
     untimed = tmp_path / "v1.json"
     untimed.write_text(
         json.dumps({"protocol": "yolo-face-caption-track-v1", "provenance": "yolo"}),
         encoding="utf-8",
     )
     with pytest.raises(ReplayError, match="Not a timestamped"):
-        job.load_yolo(untimed, minimum_confidence=0.5)
+        job.load_yolo(untimed, minimum_confidence=0.5, canvas_width=1080.0)
 
 
 def test_a_track_of_a_source_at_another_rate_is_read_by_its_timestamps(tmp_path: Path) -> None:
     slow = track_file(tmp_path / "slow.json", [], rate=24)
-    assert job.load_yolo(slow, minimum_confidence=0.5) == []
+    assert job.load_yolo(slow, minimum_confidence=0.5, canvas_width=1080.0) == []
 
 
 def test_yolo_fills_only_the_gaps_between_vision_samples() -> None:
@@ -486,3 +491,22 @@ def test_the_command_line_plans_from_a_yolo_track_without_a_vision_index(tmp_pat
         str(tmp_path / "cuts.json"),
         str(track),
     }
+
+
+def test_a_smaller_source_track_is_scaled_onto_the_caption_canvas(tmp_path: Path) -> None:
+    rows: list[dict[str, object]] = [
+        {"frame": 0, "pts": 0, "face": [100.0, 400.0, 300.0, 600.0, 0.9], "faceCount": 1,
+         "captions": 0},
+    ]  # fmt: skip
+    track = track_file(tmp_path / "t.json", rows, width=720)
+    assert job.load_yolo(track, minimum_confidence=0.5, canvas_width=1080.0) == [
+        TrackingPosition(Fraction(0), 300.0, 600.0)
+    ]
+    widthless = tmp_path / "w.json"
+    widthless.write_text(
+        json.dumps({"protocol": "yolo-face-caption-track-v2", "provenance": "yolo",
+                    "timeBase": "1/90000", "frames": []}),
+        encoding="utf-8",
+    )  # fmt: skip
+    with pytest.raises(ReplayError, match="no source width"):
+        job.load_yolo(widthless, minimum_confidence=0.5, canvas_width=1080.0)
