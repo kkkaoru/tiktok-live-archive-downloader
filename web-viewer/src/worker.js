@@ -8,6 +8,8 @@
 // after a Cloudflare Turnstile check (no Turnstile keys configured: shares stay closed).
 // Until X_CLIENT_ID is configured, HTTP Basic (BASIC_USER / BASIC_PASS) stays
 // as the only gate so a half-configured deploy never opens the site.
+import { enqueue, lookup, MOVIE_KEY, refresh, requestOf } from "./clips.ts";
+
 const SESSION_COOKIE = "tv_session";
 const OAUTH_COOKIE = "tv_oauth";
 const SESSION_SECONDS = 60 * 60 * 24 * 30;
@@ -20,12 +22,15 @@ const SHARE_MAX_DAYS = 365;
 const SHARE_PASS_COOKIE = "tv_share";
 const SHARE_PASS_SECONDS = 60 * 60 * 12;
 const TURNSTILE_VERIFY = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const CLIPS_PATH = /^\/api\/clips\/([A-Za-z0-9._-]+)(\.json|\/reload)$/;
 let allowCache = { at: 0, users: [] };
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/s/")) return shareRoute(request, url, env);
+    // The Mac viewer has no X login: it reads and reloads clips with the CLIPS_API_TOKEN bearer.
+    if (CLIPS_PATH.test(url.pathname) && (await clipsBearer(request, env))) return clipsRoute(request, url, env, { admin: true, bearer: true, queue: true });
     if (url.pathname === "/robots.txt") {
       return new Response("User-agent: *\nDisallow: /\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     }
@@ -42,6 +47,7 @@ export default {
         return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
       }
       if (url.pathname === "/api/me") return json({ username: session.u, admin: isAdmin(session.u, env) });
+      if (CLIPS_PATH.test(url.pathname)) return clipsRoute(request, url, env, { admin: isAdmin(session.u, env), bearer: false, queue: !session.dbg });
       if (url.pathname === "/admin" || url.pathname.startsWith("/api/admin/")) {
         if (!isAdmin(session.u, env)) return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
         if (url.pathname === "/admin") return adminPage();
@@ -68,6 +74,7 @@ export default {
     if (url.pathname === "/api/catalog") {
       return r2Json(request, env, "catalog.json");
     }
+    if (CLIPS_PATH.test(url.pathname)) return clipsRoute(request, url, env, { admin: true, bearer: false, queue: true });
     const dataMatch = url.pathname.match(/^\/api\/videos\/([A-Za-z0-9._-]+)\.json$/);
     if (dataMatch) {
       return r2Json(request, env, `data/${dataMatch[1]}.json`);
@@ -82,7 +89,50 @@ export default {
     }
     return env.ASSETS.fetch(request);
   },
+
+  // R2 event notifications for data/<id>.json and the viewers' own requests: one video per message.
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      const request = requestOf(message.body);
+      try {
+        if (request) console.log(JSON.stringify({ clips: request.videoId, outcome: await refresh(env, request, new Date()) }));
+        message.ack();
+      } catch (error) {
+        console.error(JSON.stringify({ clips: request?.videoId, error: String(error) }));
+        message.retry();
+      }
+    }
+  },
 };
+
+async function clipsBearer(request, env) {
+  const header = request.headers.get("Authorization") || "";
+  const token = env.CLIPS_API_TOKEN || "";
+  return token.length >= 32 && header.startsWith("Bearer ") && (await sameSecret(header.slice(7), token));
+}
+
+// GET returns the stored clips (a missing record is queued and reads as pending); POST …/reload
+// recomputes them (admins, the bearer, or Basic mode). Pages poll while the status is pending.
+async function clipsRoute(request, url, env, { admin, bearer, queue }) {
+  const [, videoId, kind] = url.pathname.match(CLIPS_PATH);
+  const expected = kind === "/reload" ? "POST" : "GET";
+  if (request.method !== expected) return new Response("Method not allowed", { status: 405 });
+  if (kind === "/reload") {
+    if (!admin) return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
+    // Cookie sessions only from this site's own pages, like the admin API.
+    if (!bearer && request.headers.get("Origin") !== url.origin) return new Response("Bad request", { status: 400 });
+    await enqueue(env, { videoId, force: true }, new Date());
+    return json({ status: "pending", force: true });
+  }
+  const key = url.searchParams.get("key");
+  if (key !== null && !MOVIE_KEY.test(key)) return json({ error: "invalid key" }, 400);
+  const found = await lookup(env, { videoId, key, now: new Date() });
+  // Read-only debug sessions never queue work.
+  if (found.status !== "missing" || !queue) return json(found);
+  if (!(await env.MEDIA.head(`data/${videoId}.json`))) return json(found, 404);
+  await enqueue(env, { videoId, force: false }, new Date());
+  return json({ status: "pending", force: false });
+}
 
 function redirect(location) {
   return new Response(null, { status: 302, headers: { Location: location, "Cache-Control": "no-store" } });
@@ -530,6 +580,7 @@ async function shareRoute(request, url, env) {
     return new Response(page.body, { status: page.status, headers });
   }
   if (path === "/api/catalog") return json({ videos: [video], share: { expiresAt: share.expiresAt } });
+  if (path === `/api/clips/${video.id}.json`) return json(await lookup(env, { videoId: video.id, key: null, now: new Date() }));
   if (path === `/api/videos/${video.id}.json`) {
     const obj = await env.MEDIA.get(`data/${video.id}.json`);
     return obj ? new Response(obj.body, { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }) : shareGone(url);

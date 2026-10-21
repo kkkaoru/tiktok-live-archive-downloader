@@ -435,3 +435,103 @@ it("falls back to a text card and escapes names when no preview image exists", a
     image.status,
   ]).toStrictEqual([true, true, true, 404]);
 });
+
+const CLIPS_TOKEN = "c".repeat(40);
+const CLIP_RECORD = {
+  version: 1,
+  videoId: "v1",
+  movieKey: "a".repeat(32),
+  inputHash: "h",
+  models: { score: "s", summary: "m" },
+  createdAt: "t",
+  clips: [],
+};
+
+function clipEnvironment() {
+  const sent: unknown[] = [];
+  const env = {
+    ...shareEnvironment(),
+    CLIPS_API_TOKEN: CLIPS_TOKEN,
+    CLIPS_QUEUE: { send: async (body: unknown) => sent.push(body) },
+  };
+  return { env, sent };
+}
+
+it("queues clips that are missing and reads them once stored", async () => {
+  const { env, sent } = clipEnvironment();
+  const get = () => shareCall(env, "/api/clips/v1.json", { headers: { Cookie: cookie } });
+  const first = await (await get()).json();
+  env.MEDIA.store.set("clips/videos/v1.json", JSON.stringify({ movieKey: "a".repeat(32) }));
+  env.MEDIA.store.set(`clips/${"a".repeat(32)}.json`, JSON.stringify(CLIP_RECORD));
+  env.MEDIA.store.delete("clips/pending/v1.json");
+  const second = await (await get()).json();
+  const unknown = await shareCall(env, "/api/clips/v9.json", { headers: { Cookie: cookie } });
+  expect([first, sent, second.status, unknown.status]).toStrictEqual([
+    { status: "pending", force: false },
+    [{ videoId: "v1", force: false }],
+    "ready",
+    404,
+  ]);
+});
+
+it("reloads clips only for same-origin admins or the bearer token", async () => {
+  const { env, sent } = clipEnvironment();
+  const reload = (headers: Record<string, string>) =>
+    shareCall(env, "/api/clips/v1/reload", { method: "POST", headers });
+  const crossSite = await reload({ Cookie: cookie });
+  const admin = await reload({ Cookie: cookie, Origin: "https://example.test" });
+  const bearer = await reload({ Authorization: `Bearer ${CLIPS_TOKEN}` });
+  const wrongBearer = await reload({ Authorization: "Bearer wrong" });
+  const get = await shareCall(env, "/api/clips/v1/reload", { headers: { Cookie: cookie } });
+  expect([
+    crossSite.status,
+    admin.status,
+    bearer.status,
+    wrongBearer.status,
+    get.status,
+    sent,
+  ]).toStrictEqual([400, 200, 200, 401, 405, [{ videoId: "v1", force: true }]]);
+});
+
+it("lets the bearer read clips with its own movie key", async () => {
+  const { env } = clipEnvironment();
+  env.MEDIA.store.set(`clips/${"a".repeat(32)}.json`, JSON.stringify(CLIP_RECORD));
+  const headers = { Authorization: `Bearer ${CLIPS_TOKEN}` };
+  const ready = await shareCall(env, `/api/clips/v1.json?key=${"a".repeat(32)}`, { headers });
+  const invalid = await shareCall(env, "/api/clips/v1.json?key=x", { headers });
+  expect([(await ready.json()).status, invalid.status]).toStrictEqual(["ready", 400]);
+});
+
+it("serves a shared video's clips without queueing work", async () => {
+  const { env, sent } = clipEnvironment();
+  const token = await createShare(env, { edited: true });
+  const pass = await passChallenge(env, token);
+  const response = await shareCall(env, `/s/${token}/api/clips/v1.json`, {
+    headers: { Cookie: pass },
+  });
+  expect([await response.json(), sent]).toStrictEqual([{ status: "missing" }, []]);
+});
+
+it("acks processed queue messages and retries failures", async () => {
+  const { env } = clipEnvironment();
+  env.MEDIA.store.set("data/bad.json", "{}");
+  const log: string[] = [];
+  const message = (body: unknown) => ({
+    body,
+    ack: () => log.push("ack"),
+    retry: () => log.push("retry"),
+  });
+  vi.spyOn(console, "log").mockImplementation(() => undefined);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  await worker.queue(
+    {
+      messages: [
+        message({ object: { key: "data/none.json" } }),
+        message({ videoId: "bad" }),
+        message("x"),
+      ],
+    },
+    env,
+  );
+  expect(log).toStrictEqual(["ack", "retry", "ack"]);
+});
