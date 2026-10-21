@@ -1,4 +1,5 @@
 import json
+import os
 import wave
 from fractions import Fraction as F
 from pathlib import Path
@@ -288,3 +289,14 @@ def test_invalid_config(config: Path, tmp_path: Path, key: str, value: object) -
             sha256=file_digest(config),
             maximum_rate_change=0.3,
         )
+
+
+def test_identity_ignores_reads_but_not_writes(tmp_path: Path) -> None:
+    path = tmp_path / "source.wav"
+    path.write_bytes(b"pcm")
+    before = job.identity(path)
+    status = path.stat()
+    os.utime(path, ns=(status.st_atime_ns + 5_000_000_000, status.st_mtime_ns))
+    assert job.identity(path) == before
+    path.write_bytes(b"pcm2")
+    assert job.identity(path) != before

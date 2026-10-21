@@ -44,6 +44,12 @@ class CutSlot:
         return sum(end - start for start, end in self.spans)
 
 
+def identity(path: Path) -> tuple[int, int, int, int]:
+    """File identity, size and content clock; reading it (atime) does not count as a change."""
+    status = path.stat()
+    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
+
+
 def sample_boundary(time: Fraction, rate: int) -> int:
     """Nearest absolute sample boundary, half-sample ties toward earlier time."""
     return math.ceil(time * rate - Fraction(1, 2))
@@ -165,7 +171,7 @@ def render(
     end = slots[-1].output_end if output_end is None else output_end
     if not 0 <= output_start < end <= slots[-1].output_end or output.exists():
         raise ValueError("Invalid output window or existing output")
-    before = source.stat()
+    before = identity(source)
     with wave.open(str(source), "rb") as reader, output.open("xb") as handle:
         if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
             raise ValueError("Clocked cuts require PCM16")
@@ -181,7 +187,7 @@ def render(
                         end=min(first + BLOCK, high) - slot.output_start,
                     )
                     writer.writeframesraw(block.astype("<i2").tobytes())
-    if source.stat() != before:
+    if identity(source) != before:
         raise ValueError("Source changed while writing clocked cuts")
     return end - output_start
 

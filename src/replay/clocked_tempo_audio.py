@@ -21,7 +21,7 @@ from replay.audio_clock import AudioFrameClock
 from replay.caption_io import _string
 from replay.caption_measured_job import _json, _local, _object, _pin, _rational
 from replay.caption_native_layout import NativeCaptionLayout
-from replay.clocked_cut_audio import CutSlot, plan_slots, sample_boundary
+from replay.clocked_cut_audio import CutSlot, identity, plan_slots, sample_boundary
 from replay.continuous_cut_job import MAX_CLOCK_BYTES, MAX_CONFIG_BYTES, MAX_PCM_BYTES
 from replay.foreground_evidence import _bound_bytes
 from replay.stages import file_digest
@@ -217,7 +217,7 @@ def render(
     end = slots[-1].output_end if output_end is None else output_end
     if not 0 <= output_start < end <= slots[-1].output_end:
         raise ValueError("Invalid tempo output window")
-    before = source.stat()
+    before = identity(source)
     measurements: list[TempoMeasurement] = []
     with wave.open(str(source), "rb") as reader, output.open("xb") as handle:
         width = reader.getnchannels() * 2
@@ -237,7 +237,7 @@ def render(
                         ]
                     )
                     measurements.append(measured)
-    if source.stat() != before:
+    if identity(source) != before:
         raise ValueError("Source changed during tempo rendering")
     return tuple(measurements)
 
