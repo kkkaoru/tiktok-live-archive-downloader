@@ -183,3 +183,23 @@ def test_shared_components_give_the_same_lines() -> None:
     assert np.array_equal(
         support.crossing_lines(roi, frame, found), support.crossing_lines(roi, frame)
     )
+
+
+def test_a_missed_line_stacked_under_a_recognised_one_is_keyed() -> None:
+    roi = _roi()
+    roi[3:15, 40:48] = PINK  # recognised digit
+    roi[24:36, 41:49] = PINK  # the same-sized digit below it that the detector missed
+    roi[24:36, 5:13] = PINK  # same size but beside no box: scene
+    mask = support.key_mask(roi, support.FrameBoxes((100, 50), ((140, 53, 148, 65),)))
+    assert (int(mask[30, 45]), int(mask[30, 9])) == (255, 0)
+
+
+def test_stacked_lines_skip_specks_far_rows_and_frames_without_boxes() -> None:
+    roi = _roi()
+    roi[24:26, 41:49] = PINK  # a speck, not a line
+    frame = support.FrameBoxes((100, 50), ((140, 53, 148, 65),))
+    assert int(support.stacked_lines(roi, frame).sum()) == 0
+    roi = _roi()
+    roi[28:40, 41:49] = PINK  # a line-sized component more than one line height away
+    assert int(support.stacked_lines(roi, frame).sum()) == 0
+    assert int(support.stacked_lines(roi, support.FrameBoxes((0, 0), ())).sum()) == 0

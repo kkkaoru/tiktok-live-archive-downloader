@@ -6,7 +6,10 @@ mask; scene pixels of the same hue outside those boxes are never touched. One ex
 caption line that scrolls in or out of the band: it is clipped by the band edge, so the detector
 cannot recognise it. A caption-coloured component that touches the band's top or bottom row, is
 no taller than one recognised line and lines up horizontally with a recognised box is such a
-clipped line and is keyed as well. The supplement is a mask input only: it proves neither text
+clipped line and is keyed as well. So is a line stacked next to a recognised one that the
+detector missed (a lone counter digit under another): a separate caption-coloured component of
+about one line's height, within one line height above or below a box and aligned with it. The
+supplement is a mask input only: it proves neither text
 absence nor repair quality.
 """
 
@@ -120,12 +123,45 @@ def crossing_lines(roi: Image, frame: FrameBoxes, found: Components | None = Non
     return np.asarray(keep[labels], dtype=np.uint8)
 
 
+def stacked_lines(roi: Image, frame: FrameBoxes, found: Components | None = None) -> Image:
+    """0/1 mask of caption-coloured components forming a missed line beside a recognised box.
+
+    A component qualifies when its height is between half and one recognised line height, the
+    vertical gap to a box is at most one line height and at least half of its width lies within
+    that box's horizontal span (widened by the box margin). Smaller specks stay scene pixels.
+    """
+    height, width = roi.shape[:2]
+    if not frame.boxes:
+        return np.zeros((height, width), dtype=np.uint8)
+    line_height = max(bottom - top for _, top, _, bottom in frame.boxes)
+    boxes = [
+        (left - frame.origin[0] - BOX_MARGIN, top - frame.origin[1], right - frame.origin[0])
+        for left, top, right, _ in frame.boxes
+    ]
+    bottoms = [bottom - frame.origin[1] for *_, bottom in frame.boxes]
+    count, labels, stats = components(pink(roi)) if found is None else found
+    keep = np.zeros(count, dtype=np.uint8)
+    for label in range(1, count):
+        x, y, w, h = (int(stats[label, k]) for k in range(4))
+        if not line_height / 2 <= h <= line_height:
+            continue
+        for (start, top, end), bottom in zip(boxes, bottoms, strict=True):
+            gap = max(top - (y + h), y - bottom)
+            aligned = max(0, min(x + w, end + BOX_MARGIN) - max(x, start))
+            if 0 <= gap <= line_height and aligned >= MINIMUM_ALIGNED_SHARE * w:
+                keep[label] = 1
+    return np.asarray(keep[labels], dtype=np.uint8)
+
+
 def key_mask(roi: Image, frame: FrameBoxes) -> Image:
     """Caption-coloured pixels (plus their outline) inside the frame's line boxes, as 0/255."""
     kernel = np.ones((OUTLINE_KERNEL, OUTLINE_KERNEL), np.uint8)
     pinked = pink(roi)  # one colour conversion and one labelling serve every step below
     found = components(pinked)
-    edge = np.maximum(clipped_lines(roi, frame, found), crossing_lines(roi, frame, found))
+    edge = np.maximum(
+        np.maximum(clipped_lines(roi, frame, found), crossing_lines(roi, frame, found)),
+        stacked_lines(roi, frame, found),
+    )
     allowed = np.maximum(
         box_mask(roi.shape[:2], frame.origin, frame.boxes),
         np.asarray(cv2.dilate(edge, kernel), dtype=np.uint8),
