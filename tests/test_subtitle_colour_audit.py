@@ -134,11 +134,24 @@ def test_band_rows_and_reused_bands_give_the_full_frame_counts(tmp_path: Path) -
     assert counts == [300, 300]
 
 
+def test_source_bands_decoded_ahead_replace_the_source_decode(tmp_path: Path) -> None:
+    original = _video(tmp_path / "original.mp4", pink=True)
+    band = (7, 76)
+    bands = list(audit._frames("ffmpeg", original, 0.0, [0, 9], SIZE, band))
+    counts = audit.colour_counts(
+        ffmpeg="ffmpeg", source=tmp_path / "missing.mp4", source_start=0.0,
+        cleaned=tmp_path / "missing.mp4", indices=[0, 9], boxes=_boxes(), size=SIZE, band=band,
+        cleaned_bands=bands, source_bands=bands,
+    )  # fmt: skip
+    assert counts == [300, 300]
+
+
 def test_boxes_near_the_band_edge_are_counted_on_full_frames(tmp_path: Path) -> None:
     original = _video(tmp_path / "original.mp4", pink=True)
     counts = audit.colour_counts(
         ffmpeg="ffmpeg", source=original, source_start=0.0, cleaned=original,
         indices=[0], boxes=_boxes(), size=SIZE, band=(30, 40), cleaned_bands=[],
+        source_bands=[],
     )  # fmt: skip
     assert counts == [300]
 

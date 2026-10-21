@@ -12,6 +12,7 @@ import json
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
@@ -279,6 +280,20 @@ def real_collaborators(
         raise ValueError("auditTile must be an integer from 1 to 4")
 
     audited: dict[tuple[Path, tuple[int, ...]], list[Image]] = {}
+    gated = config.get("colourGate") is True
+    # The colour gate's source rows depend only on the source and the frames: decode them
+    # while the band audit recognises the candidate.
+    ahead: dict[tuple[Path, tuple[int, ...]], Future[list[Image]]] = {}
+    decoder = ThreadPoolExecutor(max_workers=1)
+
+    def source_bands(indices: tuple[int, ...]) -> list[Image]:
+        return list(
+            colour_audit._frames(
+                str(config.get("ffmpeg", "ffmpeg")), source,
+                float(clock.pts[0] * clock.time_base), indices, canvas,
+                band_audit.audit_band(envelope, canvas),
+            )
+        )  # fmt: skip
 
     def audit(video: Path, indices: Sequence[int]) -> Mapping[int, FrameObservation]:
         # A repaired candidate's timeline starts at zero, not at the chunk's source time.
@@ -298,6 +313,9 @@ def real_collaborators(
             )  # fmt: skip
 
         decoded: list[Image] = []
+        ahead.clear()
+        if gated:
+            ahead[(video, tuple(indices))] = decoder.submit(source_bands, tuple(indices))
         observed = band_audit.band_audit(
             video, indices, clock=relative, canvas=canvas, envelope=envelope, tile=audit_tile,
             work=work, recognise=recognise, ffmpeg=str(config.get("ffmpeg", "ffmpeg")),
@@ -315,6 +333,7 @@ def real_collaborators(
             raise ValueError("Admission lacks per-frame entries")
         boxes = [_entry_boxes(entry) for entry in entries]
         bands = audited.pop((video, tuple(indices)), None)
+        pending = ahead.pop((video, tuple(indices)), None)
         return colour_audit.colour_counts(
             ffmpeg=str(config.get("ffmpeg", "ffmpeg")),
             source=source,
@@ -325,6 +344,7 @@ def real_collaborators(
             size=canvas,
             band=None if bands is None else band_audit.audit_band(envelope, canvas),
             cleaned_bands=bands,
+            source_bands=None if pending is None else pending.result(),
         )
 
     def caption_coloured(residuals: Sequence[Residual]) -> list[bool]:

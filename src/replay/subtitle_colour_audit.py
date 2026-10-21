@@ -92,21 +92,27 @@ def colour_counts(
     size: tuple[int, int],
     band: tuple[int, int] | None = None,
     cleaned_bands: Sequence[Image] | None = None,
+    source_bands: Sequence[Image] | None = None,
 ) -> list[int]:
     """Unchanged caption-colour pixels per audited frame (``indices`` ascending, unique).
 
     ``band`` (the band audit's rows) reads only those rows of both videos, and
-    ``cleaned_bands`` reuses the band audit's decoded candidate instead of decoding it again.
+    ``cleaned_bands`` reuses the band audit's decoded candidate instead of decoding it again;
+    ``source_bands`` likewise holds the source's ``band`` rows decoded ahead (``_frames``).
     Both apply only when every audited box lies ``REACH`` rows inside the band, so the counts
     equal the full-frame ones; otherwise the full frames are decoded.
     """
     if list(indices) != sorted(set(indices)) or not indices:
         raise ValueError("Audited frame indices must be ascending and unique")
     if band is not None and not inside(band, [boxes[index] for index in indices]):
-        band, cleaned_bands = None, None
+        band, cleaned_bands, source_bands = None, None, None
     origin = 0 if band is None else crop_origin(band[0])
     shape = (size[1] if band is None else band[1], size[0])
-    originals = _frames(ffmpeg, source, source_start, indices, size, band)
+    originals = (
+        iter(source_bands)
+        if band is not None and source_bands is not None
+        else _frames(ffmpeg, source, source_start, indices, size, band)
+    )
     repaired = (
         iter(cleaned_bands)
         if cleaned_bands is not None
