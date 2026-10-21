@@ -9,6 +9,7 @@ counts as done only when Compressor reports `Successful` and a nonempty output e
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -30,8 +31,14 @@ SUBMIT_TIMEOUT_SECONDS = 120
 MONITOR_TIMEOUT_SECONDS = 60
 MONITOR_RETRY_BACKOFF_SECONDS = (5.0, 15.0)
 # A Compressor alpha job takes ~5 s; a longer poll left every slot idle between jobs.
-POLL_SECONDS = 3.0
-LOST_POLLS = 100
+# Every `-monitor -once` CLI call leaves one RegisterProExtension helper behind (hundreds stall
+# LaunchServices), so batches poll slowly and share one machine-wide snapshot per interval.
+# A caption part renders in about ten seconds with two in flight, so a longer poll idles
+# Compressor; ten seconds still cuts the calls about four-fold against one poll per batch.
+POLL_SECONDS = 10.0
+SHARED_SNAPSHOT_SECONDS = 8.0
+LOST_POLLS = 30  # about 5 minutes absent from the history
+SHARED_MONITOR = Path(__file__).resolve().parents[2] / "edits/work/compressor-monitor"
 MAX_JOBS = 20_000
 MAX_IN_FLIGHT = 64
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
@@ -389,6 +396,7 @@ class Batch:
     sleep: Callable[[float], None]
     helper_guard_directory: Path | None = None
     submit_workers: int = 1
+    shared_monitor: Path | None = None
     monitor_response: str | None = None
     monitor_pin: dict[str, object] | None = None
     monitor_statuses: dict[str, str] = field(default_factory=dict)
@@ -463,6 +471,38 @@ class Batch:
         return parse_status(self.runner(arguments))
 
     def snapshot(self) -> dict[str, str]:
+        """One machine-wide `-monitor -once` per interval, shared by every batch process.
+
+        A snapshot another batch took less than ``SHARED_SNAPSHOT_SECONDS`` ago is a real
+        Compressor observation of every job, so it is reused instead of calling the CLI again.
+        """
+        if self.shared_monitor is None:
+            return self._snapshot()
+        self.shared_monitor.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cache = self.shared_monitor / "snapshot.json"
+        with (self.shared_monitor / "snapshot.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                saved = json.loads(cache.read_text(encoding="utf-8"))
+                fresh = 0 <= time.time() - float(saved["at"]) < SHARED_SNAPSHOT_SECONDS
+            except (OSError, ValueError, KeyError, TypeError):
+                fresh = False
+            if fresh:
+                text = str(saved["response"])
+                statuses = parse_snapshot(text)
+                self.monitor_response, self.monitor_pin = text, None
+                self.monitor_statuses = statuses
+                return statuses
+            statuses = self._snapshot()
+            partial = cache.with_suffix(".partial")
+            partial.write_text(
+                json.dumps({"at": time.time(), "response": self.monitor_response}),
+                encoding="utf-8",
+            )
+            partial.replace(cache)
+            return statuses
+
+    def _snapshot(self) -> dict[str, str]:
         """Retry only transient monitor timeouts; never invent an observation."""
         arguments = [
             str(self.executable),
@@ -748,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep,
             helper_guard_directory=args.helper_guard_directory,
             submit_workers=args.submit_workers,
+            shared_monitor=SHARED_MONITOR,
         )
         jobs = read_jobs(args.jobs)
         finished = run(

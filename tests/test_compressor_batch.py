@@ -46,6 +46,13 @@ class FakeCompressor:
         return f'[{{ "jobStatus" : {{ "status" : "{status}", "jobid" : "J1" }}}}]'
 
 
+@pytest.fixture(autouse=True)
+def _private_shared_monitor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each test drives its own fake CLI sequence: no snapshot reuse unless a test opts in.
+    monkeypatch.setattr(batch, "SHARED_MONITOR", tmp_path / "shared-monitor")
+    monkeypatch.setattr(batch, "SHARED_SNAPSHOT_SECONDS", 0.0)
+
+
 def job_file(tmp_path: Path) -> tuple[Path, Path]:
     source, preset = tmp_path / "part.moti", tmp_path / "alpha.setting"
     source.write_text("motion", encoding="utf-8")
@@ -1413,7 +1420,7 @@ def test_refill_skips_idle_sleep_but_processing_slots_remain_bounded(tmp_path: P
         "monitor",
         "submit:third.mov",
         "monitor",
-        "sleep:3.0",
+        f"sleep:{batch.POLL_SECONDS}",
         "monitor",
     ]
     assert output.read_bytes() == b"first"
@@ -1452,7 +1459,7 @@ def test_reappearing_job_resets_consecutive_missing_history_budget(
     worker = batch.Batch(state, Path("/Compressor"), "test", runner, sleeps.append)
     assert batch.run(batch.read_jobs(jobs), worker, in_flight=1) == 1
     assert calls == 4
-    assert sleeps == [3.0, 3.0, 3.0]
+    assert sleeps == [batch.POLL_SECONDS] * 3
     assert output.read_bytes() == b"movie"
     assert json.loads(receipt.read_text(encoding="utf-8"))["status"] == "Successful"
     assert all("-jobpath" not in arguments for arguments in fake.calls)
@@ -1491,7 +1498,13 @@ def test_purged_history_preserves_bytes_and_receipt_while_refilling_independent_
     worker = batch.Batch(state, Path("/Compressor"), "test", runner, sleep)
     with pytest.raises(ReplayError, match="alpha-0000.*receipts are untouched"):
         batch.run([first, independent], worker, in_flight=1)
-    assert events == ["monitor", "sleep:3.0", "monitor", "submit:independent", "monitor"]
+    assert events == [
+        "monitor",
+        f"sleep:{batch.POLL_SECONDS}",
+        "monitor",
+        "submit:independent",
+        "monitor",
+    ]
     assert receipt.read_bytes() == b'{"status":"submitted","jobID":"J1"}'
     assert output.read_bytes() == b"retained movie"
     assert independent.output.read_bytes() == b"new movie"
@@ -1546,3 +1559,31 @@ def test_parallel_partial_submission_reconciles_accepted_ids_without_resubmittin
     assert monitored == ["monitor"]
     assert output.read_bytes() == b"first movie"
     assert last.output.read_bytes() == b"last movie"
+
+
+def test_batches_share_one_recent_monitor_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(arguments: Sequence[str]) -> str:
+        calls.append(list(arguments))
+        return '[{"jobStatus":{"jobid":"J1","status":"Successful"}}]'
+
+    monkeypatch.setattr(batch, "SHARED_SNAPSHOT_SECONDS", 60.0)
+    shared = tmp_path / "monitor"
+    first, second = (
+        batch.Batch(tmp_path / name, Path("/Compressor"), "test", runner, lambda _s: None,
+                    shared_monitor=shared)
+        for name in ("a", "b")
+    )  # fmt: skip
+    assert first.snapshot() == second.snapshot() == {"J1": "Successful"}
+    assert len(calls) == 1
+    assert second.monitor_response == first.monitor_response
+    monkeypatch.setattr(batch, "SHARED_SNAPSHOT_SECONDS", 0.0)
+    second.snapshot()
+    assert len(calls) == 2
+    (shared / "snapshot.json").write_text("not json", encoding="utf-8")
+    monkeypatch.setattr(batch, "SHARED_SNAPSHOT_SECONDS", 60.0)
+    first.snapshot()
+    assert len(calls) == 3
