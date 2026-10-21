@@ -33,6 +33,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(
                 200, open(f"{ROOT}/data/{m.group(1)}.json", "rb").read(), "application/json"
             )
+        m = re.match(r"/api/clips/([\w.-]+)\.json$", path)
+        if m:
+            clips = f"{ROOT}/data/clips/{m.group(1)}.json"
+            if not os.path.exists(clips):
+                return self.send(200, b'{"status":"missing"}', "application/json")
+            with open(clips, "rb") as stream:
+                body = b'{"status":"ready","record":' + stream.read() + b"}"
+            return self.send(200, body, "application/json")
         self.send(404, b"not found", "text/plain")
 
     def log_message(self, *args):

@@ -96,6 +96,38 @@ bun run debug /api/me       # 管理者の読み取り専用セッションで�
 - コメントの時刻は元動画基準です。無音カット済みの編集版字幕ではずれるため、元動画の時刻で再生する
   動画だけに使います。コメント本文・投稿者名は公開データに含めません（件数と文字数のみ）。
 
+## 切り抜き
+
+動画ごとに、盛り上がりと文字起こしから切り抜き候補をCloudflare上で作り、R2に保存します。
+
+- 長さは合計 **10〜30秒（短尺）か30〜90秒（長尺）** のどちらか。1つの切り抜きは同じ配信の**複数の範囲**を
+  含められ、再生すると範囲を順に続けて再生します（Web版・Mac版とも）。秒数と各範囲の時刻を表示します。
+- 構成は次の2つのどちらか。どちらも**最初の3秒が強い引き**であることを必須とし、最初の範囲は候補の中で
+  最も引きの強い発話から始めます。
+  - **山場→経緯**: 一番の盛り上がりを最初に流し、その後にそこへ至る経緯を時系列で流す。
+  - **引き→山場**: 疑問や気になる起点から始まり、最後の範囲が一番の盛り上がりになる。
+- 作り方（`src/clips.ts`）: 盛り上がりのピーク（最大10か所）ごとに、ピークとその直前3区間から発話の
+  切れ目に合わせた5〜15秒の単位を取り出し、`@cf/cloudflare/clef` に「面白いか」「疑問・起点になるか」
+  「前の単位と話がつながるか」と、各単位の冒頭候補（最初の3発話）ごとに「最初の3秒が強い引きか」を問います
+  （64問ずつ順に送信）。つながった単位の列から2つの構成を短尺・長尺で作り、引きが弱いものは採用しません。
+  タイトルと要約は構成を伝えて `@cf/zai-org/glm-5.3-flash` で作ります。
+- 再生: 「▶ 再生」は範囲を順に1回、「🔁 ループ再生」は最後の範囲の後に最初へ戻って繰り返します
+  （範囲の外へ移動すると切り抜き再生をやめます）。Mac版も同じです。
+- キャッシュ: R2の `clips/<movieKey>.json`。movieKeyは動画のサイズと先頭・末尾1MiBのSHA-256
+  （`replay.excitement.movie_key` と同じ）で、Workerは動画をダウンロードせずに範囲読み取りで求めます。
+  字幕・盛り上がり・アルゴリズム版・モデルのハッシュが同じなら再計算しません。再計算でも範囲が同じ切り抜きの要約は再利用します。
+- 自動実行: R2の `data/*.json` への保存（同期で字幕・盛り上がりが変わったとき）がイベント通知で
+  キュー `transcript-viewer-clips` に入り、Workerの `queue()` が1本ずつ計算します。未計算の動画を開いたときも
+  キューに入ります（計算中は画面が15秒ごとに確認）。
+- 再計算: Web版の動画ページの「切り抜きを再計算」（管理者のみ）、Mac版の同名ボタン、または
+  `POST /api/clips/<id>/reload`。
+- API: `GET /api/clips/<id>.json[?key=<movieKey>]` → `ready`（record付き）/`pending`/`missing`/`mismatch`
+  （渡したmovieKeyが公開中の動画と違う）。ログイン済みセッションのほか、`secrets.json` の
+  `CLIPS_API_TOKEN` をBearerで送るとこのAPIだけ使えます（Mac版用）。共有リンクでは読み取りのみ。
+- 初回の設定（済み）: `cf queues create --queue-name transcript-viewer-clips`、
+  `cf r2 buckets event-notifications update <queue-id> --bucket-name transcript-viewer-media --rules '[{"actions":["PutObject","CompleteMultipartUpload","CopyObject"],"prefix":"data/","suffix":".json"}]'`、
+  `bun run deploy`。
+
 ## 要約
 
 要約は `transcript-summary generate`（端末内のApple Intelligence。リポジトリのREADME参照）で
