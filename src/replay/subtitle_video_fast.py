@@ -550,9 +550,6 @@ def render_refilled_video(
     if len(supports) != job.frames:
         raise ValueError("One repair support per frame is required")
     span = supports.span()
-    if span is None:
-        raise ValueError("No repaired pixel to refill")
-    top, bottom = span
 
     # One reused frame buffer: each frame is decoded into it, its band rows are replaced in
     # place and it is written from there (no per-frame copy and no ``tobytes`` copy).
@@ -571,7 +568,13 @@ def render_refilled_video(
             raise RuntimeError("FFmpeg refill decode failed")
 
     log = job.output.with_suffix(job.output.suffix + ".refill.log")
-    bands = refill(supports.sources(top, bottom), (top, bottom))
+    if span is None:
+        # The planned regions held no caption pixel: the source frames are the result.
+        top = bottom = 0
+        bands: Iterator[Image] | NDArray[np.uint8] = (frame[0:0] for _ in range(job.frames))
+    else:
+        top, bottom = span
+        bands = refill(supports.sources(top, bottom), (top, bottom))
     encode = _encode_command(job)
     with (
         (

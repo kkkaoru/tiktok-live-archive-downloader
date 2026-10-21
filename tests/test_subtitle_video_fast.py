@@ -495,6 +495,19 @@ def test_refill_needs_one_support_per_frame_and_some_repair(tmp_path: Path) -> N
     empty(np.zeros((SIZE, SIZE), dtype=bool), frame)
     with pytest.raises(ValueError, match="One repair support per frame"):
         render_refilled_video(job, empty, lambda bands, rows: np.zeros(0, np.uint8))
-    empty(np.zeros((SIZE, SIZE), dtype=bool), frame)
-    with pytest.raises(ValueError, match="No repaired pixel"):
-        render_refilled_video(job, empty, lambda bands, rows: np.zeros(0, np.uint8))
+
+
+def test_a_chunk_without_repaired_pixels_is_encoded_unchanged(tmp_path: Path) -> None:
+    source = tmp_path / "source.mkv"
+    make_source(source, 3)
+    empty = SupportStore(SIZE, (0, 0))
+    for _ in range(3):
+        empty(np.zeros((SIZE, SIZE), dtype=bool), np.zeros((SIZE, SIZE, 3), dtype=np.uint8))
+
+    def refill(bands: Iterator[Image], rows: tuple[int, int]) -> NDArray[np.uint8]:
+        raise AssertionError("nothing to refill")
+
+    output = tmp_path / "unchanged.mp4"
+    job = VideoRepairJob(source, output, SIZE, SIZE, 3, ())
+    assert render_refilled_video(job, empty, refill) == 3
+    assert output.stat().st_size > 0
