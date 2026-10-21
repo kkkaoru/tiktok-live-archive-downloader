@@ -51,6 +51,8 @@ MAX_BIN_SECONDS: int = 60
 MERGE_GAP_SECONDS: float = 1.5
 PCM_RATE: int = 8000
 SILENCE_DB: float = -96.0
+# Quieter seconds are pauses: they never pull a mean level (or a BGM under it) down.
+AUDIBLE_DB: float = -50.0
 PEAK_COUNT: int = 5
 PEAK_SEPARATION_BINS: int = 5
 SMOOTHING: tuple[float, float, float] = (0.25, 0.5, 0.25)
@@ -180,6 +182,12 @@ def _pcm_seconds(movie: Path) -> Iterator[float]:
             yield 20 * math.log10(rms / 32768) if rms > 0 else SILENCE_DB
     if process.returncode != 0:
         raise ReplayError(f"ffmpeg failed to decode audio ({process.returncode})")
+
+
+def mean_level(levels: Sequence[float]) -> float | None:
+    """Power mean (dBFS) of the audible seconds; None when every second is a pause."""
+    audible = [10 ** (level / 10) for level in levels if level > AUDIBLE_DB]
+    return 10 * math.log10(sum(audible) / len(audible)) if audible else None
 
 
 def speech_loudness(
@@ -529,6 +537,19 @@ def build_catalog(catalog: Path, *, options: CatalogOptions) -> list[str]:
     return lines
 
 
+def cache_movies(movies: Sequence[Path], *, cache: Path) -> int:
+    """Decode each movie's levels once; prints `<key> <seconds> <movie>` or a failure."""
+    status = 0
+    for movie in movies:
+        try:
+            seconds = len(cached_levels(movie, cache=cache))
+            print(f"{movie_key(movie)} {seconds} {movie}", flush=True)
+        except (ReplayError, OSError) as error:
+            print(f"failed {movie} ({error})", flush=True)
+            status = 1
+    return status
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m replay.excitement", description=__doc__)
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="loudness/chat cache")
@@ -543,7 +564,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     many.add_argument("--catalog", type=Path, required=True)
     many.add_argument("--fetch-chat", action="store_true", help="download YouTube live chat")
     many.add_argument("--youtube-edits", type=Path, help="root of <video id>/filter.txt edits")
+    levels = commands.add_parser(
+        "levels", help="cache per-second levels only (TranscriptViewer's automatic BGM volume)"
+    )
+    levels.add_argument("movies", type=Path, nargs="+")
     args = parser.parse_args(argv)
+    if args.command == "levels":
+        return cache_movies(args.movies, cache=args.cache)
     if args.command == "build":
         sources = Sources(args.transcript, args.duration, args.movie, args.chat, args.cut_filter)
         written = build(sources, cache=args.cache)

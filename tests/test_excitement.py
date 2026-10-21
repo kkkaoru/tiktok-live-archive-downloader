@@ -545,3 +545,23 @@ def test_main_builds_with_a_cut_filter(tmp_path: Path, capsys: pytest.CaptureFix
         [3, 0, 0],
         f"{tmp_path}/a.srt.excitement.json\n",
     ]
+
+
+def test_mean_level_averages_power_over_audible_seconds() -> None:
+    assert excitement.mean_level([-90.0, -60.0]) is None
+    assert round(excitement.mean_level([-20.0, -20.0, -90.0]) or 0.0, 6) == -20.0
+    assert round(excitement.mean_level([-10.0, -20.0]) or 0.0, 2) == -12.6
+
+
+def test_main_caches_levels_of_each_movie_and_reports_failures(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    movie = make_movie(tmp_path / "a.m4a")
+    missing = tmp_path / "missing.m4a"
+
+    code = excitement.main(["--cache", str(tmp_path / "cache"), "levels", str(movie), str(missing)])
+
+    key = excitement.movie_key(movie)
+    assert code == 1
+    assert capsys.readouterr().out.splitlines()[0] == f"{key} 3 {movie}"
+    assert (tmp_path / "cache" / f"levels-{key}.json").is_file()
