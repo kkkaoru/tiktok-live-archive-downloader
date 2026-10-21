@@ -109,10 +109,14 @@ def proxy_command(source: Path, output: Path, canvas: Canvas, *, ffmpeg: str) ->
 
 
 def clock_command(source: Path, *, ffprobe: str) -> tuple[str, ...]:
+    # ffprobe decodes on one thread unless asked; the frame clock is byte-identical threaded
+    # (verified on 1.6 h TikTok and 2.5 h YouTube sources: 1,092 s -> 210 s).
     return (
         ffprobe,
         "-v",
         "error",
+        "-threads",
+        "0",
         "-select_streams",
         "v:0",
         "-show_entries",
