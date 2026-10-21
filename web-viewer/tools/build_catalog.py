@@ -126,6 +126,33 @@ def load_summary(transcript_path):
         return None
 
 
+def current_excitement(transcript_path):
+    """The excitement estimate beside a transcript, only while it was made from that transcript."""
+    p = transcript_path + ".excitement.json"
+    if not os.path.isfile(transcript_path) or not os.path.isfile(p):
+        return None
+    try:
+        inputs = json.loads(Path(p).read_text(encoding="utf-8")).get("inputs") or {}
+    except ValueError:
+        return None
+    digest = hashlib.sha256(Path(transcript_path).read_bytes()).hexdigest()
+    return load_excitement(transcript_path) if inputs.get("transcriptSha256") == digest else None
+
+
+def kept_data(data_path, video, out):
+    """Copies a kept recording's published data, adding an excitement estimate computed since."""
+    target = os.path.join(out, video["id"] + ".json")
+    transcript = video.get("transcriptPath")
+    excite = current_excitement(transcript) if transcript else None
+    if excite is None:
+        shutil.copyfile(data_path, target)
+        return
+    data = json.loads(Path(data_path).read_text(encoding="utf-8"))
+    data["excitement"] = excite
+    with open(target, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+
+
 def load_excitement(transcript_path):
     """Per-bin excitement scores written by `python -m replay.excitement`."""
     p = transcript_path + ".excitement.json"
@@ -355,7 +382,7 @@ def main():
                 or not os.path.isfile(data_path)
             ):
                 continue
-            shutil.copyfile(data_path, os.path.join(a.out, video["id"] + ".json"))
+            kept_data(data_path, video, a.out)
             videos.append({**video, "kept": True})
             delivered.add(folder)
             issues.append(f"kept published: {folder} (local delivery not found)")
