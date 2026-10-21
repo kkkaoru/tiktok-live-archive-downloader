@@ -12,6 +12,7 @@ import pytest
 from replay import bgm_library
 from replay.core import ReplayError
 
+MEASURE = bgm_library.loudness
 URL = "https://www.youtube.com/watch?v=CYzeUrG3p9o"
 METADATA = {
     "id": "CYzeUrG3p9o",
@@ -22,6 +23,12 @@ METADATA = {
     "timestamp": 1778238018,
     "formats": [{"url": "https://signed.example/secret"}],
 }
+
+
+@pytest.fixture(autouse=True)
+def stored_loudness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fake media never decodes; the real measurement has its own tests."""
+    monkeypatch.setattr(bgm_library, "loudness", lambda _audio: -12.0)
 
 
 def fake_run(
@@ -117,6 +124,7 @@ def test_a_track_is_added_once_and_published_complete(
     assert record["audio"] == "Free BGM one [CYzeUrG3p9o].m4a"
     assert record["thumbnail"] == "Free BGM one [CYzeUrG3p9o].jpg"
     assert record["channel"] == "Sharou"
+    assert record["loudness"] == -12.0
     assert "secret" not in json.dumps(record)
     assert not (root / ".partial-CYzeUrG3p9o").exists()
     assert bgm_library.add(URL, root=root, ffmpeg="/bin/ffmpeg") == ("CYzeUrG3p9o", "present")
@@ -292,3 +300,48 @@ def test_an_unmounted_library_volume_is_never_created(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         bgm_library.add(URL, root=tmp_path / "Volumes/ssd/bgm-library", ffmpeg="/bin/ffmpeg")
     assert not (tmp_path / "Volumes").exists()
+
+
+def test_loudness_is_the_mean_level_of_the_audible_seconds(tmp_path: Path) -> None:
+    tone = tmp_path / "tone.m4a"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+         "-ac", "1", str(tone)],
+        check=True,
+    )  # fmt: skip
+    silence = tmp_path / "silence.m4a"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "2",
+         str(silence)],
+        check=True,
+    )  # fmt: skip
+    assert MEASURE(tone, cache=tmp_path / "cache") == -21.1
+    assert MEASURE(silence, cache=tmp_path / "cache") is None
+
+
+def test_the_loudness_command_fills_only_missing_levels(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "bgm"
+    for identifier, value in [
+        ("aaaaaaaaaaa", {"audio": "a.m4a"}),
+        ("bbbbbbbbbbb", {"audio": "b.m4a", "loudness": -9.5}),
+        ("ccccccccccc", {"audio": "../c.m4a"}),
+    ]:
+        (root / identifier).mkdir(parents=True)
+        (root / identifier / "track.json").write_text(json.dumps(value), encoding="utf-8")
+
+    code = bgm_library.main(["loudness", "--root", str(root)])
+
+    assert code == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "measured aaaaaaaaaaa -12.0",
+        "present bbbbbbbbbbb",
+        "failed ccccccccccc (invalid audio name)",
+    ]
+    assert json.loads((root / "aaaaaaaaaaa/track.json").read_text(encoding="utf-8")) == {
+        "audio": "a.m4a",
+        "loudness": -12.0,
+    }
+    assert sorted(path.name for path in (root / "aaaaaaaaaaa").iterdir()) == ["track.json"]
+    assert bgm_library.measure_library(root, force=True)[1] == "measured bbbbbbbbbbb -12.0"

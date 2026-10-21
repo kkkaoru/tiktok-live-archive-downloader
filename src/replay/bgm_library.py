@@ -3,7 +3,9 @@
 Each track lives in `ROOT/<video id>/` as `<title> [<id>].m4a` (title, channel and artwork
 embedded), `<title> [<id>].jpg` and `track.json`. The audio is 24-bit Apple Lossless: YouTube's
 best audio stream (usually Opus) decoded once, so no second lossy generation is added and Final
-Cut Pro, Logic Pro and AVFoundation all read it. A track is either the video's own audio or,
+Cut Pro, Logic Pro and AVFoundation all read it. `loudness` is the audio's mean level, measured
+like a replay's per-second levels (`replay.excitement`), so TranscriptViewer sets a BGM under a
+video from stored numbers instead of decoding audio. A track is either the video's own audio or,
 for a talk stream, a looping BGM rebuilt locally (`replay.bgm_loop`) and marked `loop`. A track
 is staged in a hidden directory and renamed into place only after its audio decodes, so a listed
 track is always complete. Only an allowlist of metadata is stored; signed media URLs never are.
@@ -15,6 +17,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -23,6 +26,7 @@ from pathlib import Path
 
 from replay.bgm_loop import opened
 from replay.core import ReplayError
+from replay.excitement import DEFAULT_CACHE, cached_levels, mean_level
 from replay.recordings import record
 from replay.youtube_delivery import source_stem
 
@@ -40,6 +44,7 @@ ENCODE_TIMEOUT_SECONDS = 1800
 LOSSLESS_CODEC = ("-c:a", "alac", "-sample_fmt", "s32p", "-bits_per_raw_sample", "24")
 SOURCE_STEM = ".source"
 SECONDS_PER_MINUTE = 60
+LEVEL_DIGITS = 2
 
 # Fills the staging directory; returns the metadata, audio, thumbnail and record overrides.
 Stage = Callable[[Path], tuple[object, Path, Path, dict[str, object]]]
@@ -95,6 +100,34 @@ def _only(directory: Path, suffix: str) -> Path:
     if len(found) != 1:
         raise ReplayError(f"Expected one {suffix} file in {directory.name}, found {len(found)}")
     return found[0]
+
+
+def loudness(audio: Path, *, cache: Path = DEFAULT_CACHE) -> float | None:
+    """Mean level (dBFS) of the track's audible seconds; None for a silent track."""
+    level = mean_level(cached_levels(audio, cache=cache))
+    return None if level is None else round(level, LEVEL_DIGITS)
+
+
+def measure_library(root: Path, *, force: bool = False) -> list[str]:
+    """Add `loudness` to every track record lacking it (or all with `force`)."""
+    lines: list[str] = []
+    for path in sorted(root.glob("*/track.json")):
+        value = record(json.loads(path.read_text(encoding="utf-8")))
+        audio = value.get("audio")
+        if "loudness" in value and not force:
+            lines.append(f"present {path.parent.name}")
+            continue
+        if not isinstance(audio, str) or Path(audio).name != audio:
+            lines.append(f"failed {path.parent.name} (invalid audio name)")
+            continue
+        value["loudness"] = loudness(path.parent / audio)
+        temporary = path.with_name(".track.json.partial")
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, path)
+        lines.append(f"measured {path.parent.name} {value['loudness']}")
+    return lines
 
 
 def decodes(audio: Path, ffmpeg: str) -> bool:
@@ -183,6 +216,7 @@ def _publish(
             loop=overrides.pop("loop", False) is True,
         )  # fmt: skip
         value.update(overrides)
+        value["loudness"] = loudness(audio)
         with (staging / "track.json").open("x", encoding="utf-8") as stream:
             json.dump(value, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
@@ -272,8 +306,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     looping.add_argument("--root", type=Path, help="default: edits/bgm-library.json or edits")
     looping.add_argument("--ffmpeg", default=shutil.which("ffmpeg") or "ffmpeg")
     looping.add_argument("--replace", action="store_true", help="swap out an existing track")
+    measuring = commands.add_parser("loudness", help="store each track's mean level")
+    measuring.add_argument("--root", type=Path, help="default: edits/bgm-library.json or edits")
+    measuring.add_argument("--force", action="store_true", help="measure tracks that have one")
     args = parser.parse_args(argv)
     args.root = args.root or library_root()
+    if args.command == "loudness":
+        lines = measure_library(args.root, force=args.force)
+        print("\n".join(lines), flush=True)
+        return int(any(line.startswith("failed") for line in lines))
     if args.command == "add-loop":
         identifier, state = add_loop(
             args.url, args.audio, root=args.root, ffmpeg=args.ffmpeg, replace=args.replace
