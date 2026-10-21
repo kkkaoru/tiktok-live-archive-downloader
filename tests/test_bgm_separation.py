@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import mlx.core as mx
 import numpy as np
 import pytest
 from numpy.typing import NDArray
@@ -688,3 +689,25 @@ def test_instrumental_level_measures_full_scale_sine() -> None:
         instrumental_level([[], []])
     with pytest.raises(ValueError, match="numbers"):
         instrumental_level([[True]])
+
+
+def test_gather_merge_matches_the_scatter_add_merge() -> None:
+    freq_indices = [np.array([0, 1, 2]), np.array([2, 3]), np.array([3, 4, 5])]
+    counts = np.array([1, 1, 2, 2, 1, 1, 1, 1], dtype=np.float32)
+    split = SimpleNamespace(
+        filterbank=SimpleNamespace(freq_indices=freq_indices, num_bands_per_freq=counts)
+    )
+    generator = np.random.default_rng(7)
+    masks = [
+        mx.array(generator.standard_normal((1, 4, len(indices) * 2)).astype(np.float32))
+        for indices in freq_indices
+    ]
+    expected = mx.zeros((1, 8, 4, 2))
+    for indices, mask in zip(freq_indices, masks, strict=True):
+        reshaped = mask.reshape(1, 4, len(indices), 2).transpose(0, 2, 1, 3)
+        for position, index in enumerate(indices.tolist()):
+            expected = expected.at[:, index, :, :].add(reshaped[:, position, :, :])
+    expected = expected / mx.array(counts).reshape(1, -1, 1, 1)
+    merged = bgm._gather_merge(mx, split)(masks, 8)
+    assert np.array_equal(np.asarray(merged), np.asarray(expected))
+    assert np.asarray(merged)[0, 6:].tolist() == [[[0.0, 0.0]] * 4] * 2

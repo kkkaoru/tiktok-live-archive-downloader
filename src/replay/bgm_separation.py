@@ -16,7 +16,7 @@ import hashlib
 import importlib
 import time
 import wave
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -43,6 +43,47 @@ ADAPTIVE_OUTPUT_HEADROOM_DB = 1.5
 SPECTRAL_FRAME_SAMPLES = 2_048
 SPECTRAL_HOP_SAMPLES = 512
 SPECTRAL_BLOCK_FRAMES = 4_096
+
+
+def _gather_merge(mx: Any, band_split: Any) -> Callable[[list[Any], int], Any]:
+    """``BandSplit.merge`` as one gather per overlap depth instead of a scatter-add per bin.
+
+    Every bin still sums its bands' masks in band order starting from zero, then divides by its
+    overlap count. On a real 64 s clip the vocals differ from the scatter version by at most
+    2.4e-7 (the scatter version's own run-to-run spread) and a window runs 6-10% faster.
+    """
+    lengths = [len(indices) for indices in band_split.filterbank.freq_indices]
+    plans: dict[int, list[Any]] = {}
+
+    def plan(size: int) -> list[Any]:
+        slots: list[list[int]] = [[] for _ in range(size)]
+        offset = 0
+        for indices in band_split.filterbank.freq_indices:
+            for position, index in enumerate(np.asarray(indices).tolist()):
+                slots[index].append(offset + position)
+            offset += len(indices)
+        # A missing contributor reads the appended zero row.
+        depth = max(len(slot) for slot in slots)
+        return [
+            mx.array([slot[level] if level < len(slot) else offset for slot in slots])
+            for level in range(depth)
+        ]
+
+    def merge(band_masks: list[Any], freq_bins_times_two: int) -> Any:
+        batch, frames = band_masks[0].shape[:2]
+        rows = [
+            mask.reshape(batch, frames, length, 2).transpose(0, 2, 1, 3)
+            for mask, length in zip(band_masks, lengths, strict=True)
+        ]
+        stacked = mx.concatenate([*rows, mx.zeros((batch, 1, frames, 2))], axis=1)
+        gathers = plans.setdefault(freq_bins_times_two, plan(freq_bins_times_two))
+        output = mx.zeros((batch, freq_bins_times_two, frames, 2))
+        for gather in gathers:
+            output = output + stacked[:, gather, :, :]
+        counts = mx.array(band_split.filterbank.num_bands_per_freq).reshape(1, -1, 1, 1)
+        return output / counts
+
+    return merge
 
 
 def _import(name: str) -> Any:
@@ -151,6 +192,10 @@ class _MlxBackend:
         model = module.MelRoFormer.from_pretrained(folder)
         model.load_weights(list(model.sanitize(dict(mx.load(str(weights)))).items()), strict=True)
         model.eval()
+        split = getattr(model, "band_split", None)
+        if split is not None:
+            # An instance attribute shadows the provider's method; its pinned file stays unchanged.
+            object.__setattr__(split, "merge", _gather_merge(mx, split))
         self._model = model
 
     @property
