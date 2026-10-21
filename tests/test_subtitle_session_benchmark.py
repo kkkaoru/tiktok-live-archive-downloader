@@ -40,7 +40,11 @@ def frames(points: tuple[Fraction, ...]) -> list[dict[str, object]]:
             "height": 96,
             "lines": [
                 {
-                    "text": "春雨 Hello" + "春夏秋冬雨雲花風月空"[round(float(point) * 90) % 10],
+                    # Captions change wording: a fixed label's misreads would be refused as a band.
+                    "text": "".join(
+                        "春夏秋冬雨雲花風月空"[(round(float(point) * 90) + shift) % 10]
+                        for shift in (0, 3, 7)
+                    ),
                     "confidence": 0.9,
                     "boundsClipped": False,
                     "region": {"x": 1, "y": 60, "width": 50, "height": 16},
