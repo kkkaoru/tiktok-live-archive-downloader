@@ -290,3 +290,15 @@ def test_paging_refuses_a_region_narrower_than_one_grapheme() -> None:
     fit = IndivisibleFit((), layout=Narrow(), maximum_height=None)
     with pytest.raises(CaptionLayoutError, match="No grapheme fits"):
         fit.pages("ラオ")
+
+
+def test_a_unit_whose_token_lost_a_recognizer_loop_binds_no_source_support() -> None:
+    # "ルンルン…ル" keeps only its tail "ル" after the loop is dropped; joined with the next
+    # "ン" it spells "ルン", which the original fragments do not.
+    tokens = (
+        SpokenToken("ルン" * 20 + "ル", 0, 0.05, "u"),
+        SpokenToken("ン", 0.05, 0.8, "u"),
+        SpokenToken("ル", 0.8, 1.0, "u"),
+        SpokenToken("ン", 1.0, 1.3, "u"),
+    )
+    IndivisibleFit(tokens, layout=Measurements(), maximum_height=None)

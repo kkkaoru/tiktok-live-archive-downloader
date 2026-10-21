@@ -1,5 +1,6 @@
 """Timed, final ASR tokens; no character-proportional timing or stale carry-over."""
 
+import re
 from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -16,6 +17,11 @@ ELONGATION_VOWELS = frozenset("ぁぃぅぇぉァィゥェォ")
 # A recognizer loop such as "ッハッハ…" or "FFFF…" repeats one short unit many times.
 DEGENERATE_UNIT_MAXIMUM = 3
 DEGENERATE_MINIMUM_REPEATS = 8
+# Speech stays under about ten syllables a second; a loop crams far more units into its time.
+LOOP_UNITS_PER_SECOND = 15.0
+LOOP_RUN = re.compile(
+    rf"(.{{1,{DEGENERATE_UNIT_MAXIMUM}}}?)\1{{{DEGENERATE_MINIMUM_REPEATS - 1},}}"
+)
 SENTENCE_ENDS = ("。", "！", "？", "!", "?")
 # A short hiragana tail such as "よ" or "よね" closes the preceding words. It stays
 # on their caption instead of being shown alone after a switch.
@@ -170,15 +176,70 @@ def owned_tokens(
     )
 
 
+def _repeated_unit(text: str) -> tuple[str, int] | None:
+    """The short unit a text only repeats, and how many times; None for other text."""
+    compact = "".join(character for character in text if character not in PUNCTUATION)
+    for unit in range(1, DEGENERATE_UNIT_MAXIMUM + 1):
+        if (
+            compact
+            and len(compact) % unit == 0
+            and compact == compact[:unit] * (len(compact) // unit)
+        ):
+            return compact[:unit], len(compact) // unit
+    return None
+
+
 def _degenerate_repetition(text: str) -> bool:
     """Whole-token repetition of one short unit is a recognizer loop, not speech."""
-    compact = "".join(character for character in text if character not in PUNCTUATION)
-    return any(
-        len(compact) >= unit * DEGENERATE_MINIMUM_REPEATS
-        and len(compact) % unit == 0
-        and compact == compact[:unit] * (len(compact) // unit)
-        for unit in range(1, DEGENERATE_UNIT_MAXIMUM + 1)
+    repeated = _repeated_unit(text)
+    return repeated is not None and repeated[1] >= DEGENERATE_MINIMUM_REPEATS
+
+
+def _without_loop(token: SpokenToken) -> SpokenToken:
+    """Drop a loop run inside one token ("ララ…ラなん" keeps "なん"); a whole loop stays for
+    the whole-token check, and repeated small vowels or marks still lengthen their word."""
+    text = LOOP_RUN.sub(
+        lambda match: (
+            match.group(0) if set(match.group(1)) <= ELONGATION_VOWELS | NON_LEXICAL_MARKS else ""
+        ),
+        token.text,
     )
+    dense = len(token.text) >= LOOP_UNITS_PER_SECOND * max(token.end - token.start, 1e-9)
+    if not dense or not text.strip() or text == token.text:
+        return token
+    return replace(token, text=text)
+
+
+def _loop_runs(tokens: tuple[SpokenToken, ...]) -> set[int]:
+    """Indices of consecutive tokens that repeat one short unit, together a recognizer loop.
+
+    A loop is often cut into pieces ("ララ", "ラララ…") that each stay below the whole-token
+    threshold; together they repeat the unit at least ``DEGENERATE_MINIMUM_REPEATS`` times and
+    faster than ``LOOP_UNITS_PER_SECOND`` (a sung "ラ, ラ, ラ" stays).
+    """
+    loops: set[int] = set()
+    first = 0
+    while first < len(tokens):
+        repeated = _repeated_unit(tokens[first].text)
+        last = first
+        # Repeated small vowels or marks lengthen the word before them ("こぉぉぉ"): no loop.
+        if repeated is not None and not set(repeated[0]) <= ELONGATION_VOWELS | NON_LEXICAL_MARKS:
+            count = repeated[1]
+            while last + 1 < len(tokens):
+                following = _repeated_unit(tokens[last + 1].text)
+                if following is None or following[0] != repeated[0]:
+                    break
+                count += following[1]
+                last += 1
+            seconds = max(tokens[last].end - tokens[first].start, 1e-9)
+            if (
+                last > first
+                and count >= DEGENERATE_MINIMUM_REPEATS
+                and count >= LOOP_UNITS_PER_SECOND * seconds
+            ):
+                loops.update(range(first, last + 1))
+        first = last + 1
+    return loops
 
 
 def _lexical_tokens(
@@ -193,9 +254,13 @@ def lexical_token_sources(
     """Preserve source indices through lexical joins without changing source clocks."""
     result: list[SpokenToken] = []
     indices: list[tuple[int, ...]] = []
+    loops = _loop_runs(tokens)
     for index, token in enumerate(tokens):
         if result and token.start < result[-1].start:
             raise ValueError("Speech tokens are not ordered")
+        if index in loops:
+            continue
+        token = _without_loop(token)
         word_mark = word_mark_gap is not None and _word_mark_continuation(
             result, token, maximum_gap=word_mark_gap
         )

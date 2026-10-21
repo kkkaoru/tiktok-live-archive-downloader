@@ -191,6 +191,12 @@ def support_occurrences(tokens: tuple[SpokenToken, ...]) -> list[_Occurrence]:
         intact = caption_linguistics._atomic_ends(unit.text) == frozenset({len(unit.text)})
         if maximum <= policy.maximum_context_seconds and (anchored or intact):
             indices = tuple(index for member in selected for index in sources[member])
+            # A recognizer loop dropped from inside a token leaves display text the original
+            # fragments no longer spell; such a unit has no exact source support to bind.
+            if support_key("".join(tokens[index].text for index in indices)) != support_key(
+                unit.text
+            ):
+                continue
             identity = _identity(tokens, unit, indices)
             bind_aliases((SupportAlias(unit.text, identity),))
             result.append(_Occurrence(unit, identity, (len(members), maximum), anchored))

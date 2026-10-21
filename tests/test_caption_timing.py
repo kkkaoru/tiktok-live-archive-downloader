@@ -663,3 +663,34 @@ def test_scoped_final_layout_receives_each_real_occurrence(
         ("語", (SpokenToken("語", 0, 0.2, "one"),)),
         ("語", (SpokenToken("語", 2, 2.3, "two"),)),
     ]
+
+
+def test_a_recognizer_loop_split_across_tokens_is_dropped_but_short_repeats_stay() -> None:
+    from replay.caption_timing import SpokenToken, lexical_token_sources
+
+    texts = ("ラ", "ララ", "ラララ", "ララ", "ラ", "なん", "はは", "はは")
+    sung = tuple(
+        SpokenToken("ラ", 10 + index * 0.3, 10.2 + index * 0.3, "a") for index in range(10)
+    )
+    assert [word.text for word in lexical_token_sources(sung)[0]] == ["ラ"] * 10
+    tokens = tuple(
+        SpokenToken(text, index * 0.01, index * 0.01 + 0.01, "a")
+        for index, text in enumerate(texts)
+    )
+    words, indices = lexical_token_sources(tokens)
+    assert [word.text for word in words] == ["なん", "はは", "はは"][: len(words)]
+    assert indices[0] == (5,)
+
+
+def test_a_loop_run_inside_one_token_is_dropped_and_its_tail_kept() -> None:
+    from replay.caption_timing import SpokenToken, lexical_token_sources
+
+    tokens = (
+        SpokenToken("ラ" * 100 + "なん", 0.0, 0.45, "a"),
+        SpokenToken("こぉぉぉぉぉぉぉぉぉ", 0.5, 1.0, "a"),
+    )
+    words, _ = lexical_token_sources(tokens)
+    assert [(word.text, word.start, word.end) for word in words] == [
+        ("なん", 0.0, 0.45),
+        ("こぉぉぉぉぉぉぉぉぉ", 0.5, 1.0),
+    ]
