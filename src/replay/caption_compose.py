@@ -38,6 +38,8 @@ MAX_GROUP_SECONDS = 600
 WIDTH, HEIGHT = 1080, 1920
 BIT_RATE = 20_000_000
 REQUEST_TIMEOUT = 7200
+# Ticks of the native 1/60000 s timescale a retry ends each clip early by (far below a frame).
+TRIM_TICKS = 2
 AUDIO_ARGUMENTS = ("-c:a", "aac", "-b:a", "256k", "-ar", "44100", "-ac", "2")
 
 Packets = Callable[[Path], int]
@@ -297,11 +299,36 @@ def render_group(row: dict[str, object], requests: Path, call: Call, packets: Pa
     directory.mkdir(mode=0o700, parents=True)
     response = requests / f"{name}.response.json"
     response.unlink(missing_ok=True)
-    call(requests / f"{name}.json", response)
+    try:
+        call(requests / f"{name}.json", response)
+    except (subprocess.CalledProcessError, ReplayError):
+        # AVFoundation can refuse to read a composition whose clip ends on certain exact
+        # boundaries ("Cannot start reading the composed video"; youtube-Eg9 g013 at 3520.05 s);
+        # ending each clip TRIM_TICKS earlier reads, and the planned frame count is still checked.
+        if response.exists():
+            response.rename(requests / f"{name}.failed-response.json")
+        shutil.rmtree(directory)
+        directory.mkdir(mode=0o700, parents=True)
+        call(trimmed(requests, name), response)
     outputs = group_output(directory, name)
     if len(outputs) != 1 or packets(outputs[0]) != frames:
         raise ReplayError(f"{name} did not render its planned {frames} frames")
     return "completed"
+
+
+def trimmed(requests: Path, name: str) -> Path:
+    """A retry request whose clips each end ``TRIM_TICKS`` of the native timescale earlier."""
+    body = record(json.loads((requests / f"{name}.json").read_text(encoding="utf-8")))
+    clips = record(body["recipe"])["clips"]
+    if not isinstance(clips, list):
+        raise ReplayError(f"{name} has no clip list")
+    for clip in clips:
+        selection = record(record(clip)["selection"])
+        selection["durationSeconds"] = float(str(selection["durationSeconds"])) - TRIM_TICKS / 60000
+    path = requests / f"{name}.retry.json"
+    path.unlink(missing_ok=True)
+    write_json(path, body)
+    return path
 
 
 def media_edit_call(server: Path, server_sha256: str) -> Call:

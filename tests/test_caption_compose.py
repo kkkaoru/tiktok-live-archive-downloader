@@ -261,3 +261,26 @@ def test_a_recorded_render_with_other_frames_is_refused(tmp_path: Path) -> None:
     )
     with pytest.raises(ReplayError, match="does not hold its planned frames"):
         compose.load_parts(parts, lambda _path: 59, states)
+
+
+def test_a_refused_composition_is_retried_once_with_clips_ending_two_ticks_early(
+    tmp_path: Path,
+) -> None:
+    requests = planned(tmp_path)
+    calls: list[str] = []
+    succeed = rendering(tmp_path, calls)
+
+    def call(arguments: Path, response: Path) -> None:
+        if not calls:
+            calls.append(arguments.name)
+            response.write_text('{"error": "exited 1"}', encoding="utf-8")
+            raise subprocess.CalledProcessError(1, ["media_edit"])
+        succeed(arguments, response)
+
+    assert compose.render(requests, call, workers=1, packets=size) == {"g000": "completed"}
+    assert calls == ["g000.json", "g000.retry.json"]
+    original = json.loads((requests / "g000.json").read_text(encoding="utf-8"))
+    retry = json.loads((requests / "g000.retry.json").read_text(encoding="utf-8"))
+    assert original["recipe"]["clips"][0]["selection"]["durationSeconds"] == 2.0
+    assert retry["recipe"]["clips"][0]["selection"]["durationSeconds"] == 2.0 - 2 / 60000
+    assert (requests / "g000.failed-response.json").read_text() == '{"error": "exited 1"}'
