@@ -377,3 +377,15 @@ def test_final_subframe_cannot_be_extended_beyond_duration() -> None:
     caption = PositionedCue(CaptionCue("last", 0.99, 1), 540, 300)
     with pytest.raises(ValueError, match="no frame support"):
         fcp_measured.ensure_display_frames([caption], rate=30, duration=Fraction(1))
+
+
+def test_a_delay_of_one_display_frame_is_allowed_near_a_frame_boundary() -> None:
+    # 0.02 s after a frame boundary, widened to the next frame end: the next caption's first
+    # display frame moves from 1933 to 1934, although its start moves by more than 1/30 s.
+    hidden = PositionedCue(CaptionCue("あるにゃん", 64.40266666666666, 64.42266666666667), 540, 0)
+    following = PositionedCue(CaptionCue("ある", 64.42266666666667, 64.603), 540, 0)
+    widened, count = fcp_measured.ensure_display_frames(
+        [hidden, following], rate=30, duration=Fraction(70)
+    )
+    assert count == 1
+    assert widened[1].cue.start == 1934 / 30

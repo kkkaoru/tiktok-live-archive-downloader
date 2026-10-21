@@ -141,7 +141,7 @@ def ensure_display_frames(
     """Give every caption at least one display frame without losing its text.
 
     A caption shown on no frame is extended to the end of its first frame, and
-    the following caption may move by at most one frame. Denser independent
+    the following caption's first display frame may move by at most one frame. Denser independent
     replacements must be replanned; delay must never accumulate silently.
     Text, order and positions are unchanged.
     """
@@ -155,7 +155,9 @@ def ensure_display_frames(
         if end <= first:
             end = min(first + Fraction(1, rate), duration)
             widened += 1
-        if start - display_time(item.cue.start) > Fraction(1, rate):
+        # The budget is one display frame: the caption's first shown frame may move by one,
+        # however close to a frame boundary its recognized start falls.
+        if first * rate - math.ceil(display_time(item.cue.start) * rate) > 1:
             raise ValueError("Caption density exceeds one-frame display-delay budget")
         if end > duration or end <= first or end <= start:
             raise ValueError("Caption has no frame support inside the declared duration")
