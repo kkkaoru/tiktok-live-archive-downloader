@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 from collections.abc import Iterator
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,7 +55,7 @@ def detect(images: list[np.ndarray]) -> list[SimpleNamespace]:
 
 def test_every_frame_is_detected_in_batches_and_encoded(tmp_path: Path) -> None:
     output = tmp_path / "o.mp4"
-    sink = overlay.encoder(output, size=(48, 64), rate=30, ffmpeg="ffmpeg")
+    sink = overlay.encoder(output, size=(48, 64), rate=Fraction(30000, 1001), ffmpeg="ffmpeg")
     timing = overlay.render(frames(5), detect, sink, batch=2, label="t")
     assert timing["frames"] == 5.0
     probe = subprocess.run(
@@ -66,7 +67,9 @@ def test_every_frame_is_detected_in_batches_and_encoded(tmp_path: Path) -> None:
 
 
 def test_an_invalid_batch_and_a_failing_encoder_are_refused(tmp_path: Path) -> None:
-    sink = overlay.encoder(tmp_path / "a.mp4", size=(48, 64), rate=30, ffmpeg="ffmpeg")
+    sink = overlay.encoder(
+        tmp_path / "a.mp4", size=(48, 64), rate=Fraction(30000, 1001), ffmpeg="ffmpeg"
+    )
     with pytest.raises(ReplayError, match="Invalid batch"):
         overlay.render(frames(1), detect, sink, batch=0, label="t")
     sink.kill()

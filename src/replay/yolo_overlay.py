@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +72,7 @@ def caption_scores(results: Sequence[Any]) -> list[list[float]]:
 
 
 def encoder(
-    output: Path, *, size: tuple[int, int], rate: int, ffmpeg: str
+    output: Path, *, size: tuple[int, int], rate: Fraction, ffmpeg: str
 ) -> subprocess.Popen[bytes]:
     command = [
         ffmpeg, "-v", "error", "-nostdin", "-n", "-f", "rawvideo", "-pix_fmt", "bgr24",
