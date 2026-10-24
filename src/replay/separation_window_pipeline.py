@@ -98,7 +98,8 @@ class PipelineBudget:
             )
             and self.max_samples <= MAX_SAMPLES
             and self.timeout_seconds <= 86400
-            and self.window.workers == 2
+            # A second GPU worker adds no throughput (0.39 vs 0.42 s per window), only ~2-5 GB.
+            and self.window.workers in (1, 2)
             and self.window.max_samples == CHUNK,
             "Invalid pipeline budget",
         )

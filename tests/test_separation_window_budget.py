@@ -755,6 +755,21 @@ def test_fixed_plan_rejects_invalid_fields(
         window.load_plan(path, directory)
 
 
+@pytest.mark.parametrize("workers,accepted", [(1, True), (2, True), (3, False)])
+def test_probe_plan_takes_one_or_two_workers(
+    fixed_plan: tuple[Path, Path], workers: int, accepted: bool
+) -> None:
+    path, directory = fixed_plan
+    data = read(path)
+    record(data["budget"])["workers"] = workers
+    replace_json(path, data)
+    if accepted:
+        assert window.load_plan(path, directory).budget.workers == workers
+    else:
+        with pytest.raises(ReplayError, match="budget"):
+            window.load_plan(path, directory)
+
+
 def test_source_identity_and_model_hash_changes_stop_before_inference(
     fixed_plan: tuple[Path, Path],
 ) -> None:

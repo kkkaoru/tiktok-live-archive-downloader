@@ -363,6 +363,18 @@ def test_invalid_pipeline_budget(plan: Path, field: str, value: int) -> None:
         pipeline.load_plan(plan)
 
 
+@pytest.mark.parametrize("workers,accepted", [(1, True), (2, True), (3, False)])
+def test_one_or_two_window_workers(plan: Path, workers: int, accepted: bool) -> None:
+    data = read(plan)
+    record(record(data["budget"])["window"])["workers"] = workers
+    replace_json(plan, data)
+    if accepted:
+        assert pipeline.load_plan(plan).budget.window.workers == workers
+    else:
+        with pytest.raises(ReplayError, match="budget"):
+            pipeline.load_plan(plan)
+
+
 def test_declared_ast_provider_model_pins(plan: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     selected = pipeline.load_plan(plan)
     monkeypatch.setattr(pipeline, "code_inputs", lambda: {"missing": "a" * 64})

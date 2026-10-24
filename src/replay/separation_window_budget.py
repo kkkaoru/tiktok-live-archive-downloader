@@ -223,7 +223,7 @@ def load_plan(path: Path, directory: Path) -> ProbePlan:
     )
     directory = local_directory(directory)
     require(
-        budget.workers == 2
+        budget.workers in (1, 2)
         and budget.max_samples == samples
         and canonical(data.get("outputDirectory")) == directory,
         "Probe plan clock/output changed",
