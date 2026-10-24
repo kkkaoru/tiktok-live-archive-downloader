@@ -41,6 +41,9 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Memory
     scratch = tmp_path / "edits/work"
     scratch.mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
+    # The entry requires a fresh provider process; an earlier test in this one may have imported it.
+    for name in [key for key in sys.modules if key.split(".")[0] == "mlx_whisper"]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
     for name in ("TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "NUMBA_CACHE_DIR"):
         monkeypatch.setenv(name, str(scratch))
     monkeypatch.setattr(entry, "DEFAULT_MODEL", tmp_path / "model")
