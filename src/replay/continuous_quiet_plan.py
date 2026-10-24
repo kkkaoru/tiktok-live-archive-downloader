@@ -9,7 +9,7 @@ from bisect import bisect_right
 from dataclasses import asdict
 from fractions import Fraction
 from itertools import groupby
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 
 from replay.audio_clock import AudioFrameClock
@@ -23,7 +23,37 @@ from replay.recordings import record
 from replay.stages import file_digest
 from replay.waveform_quiet import measured_quiet_runs
 
-JITTER_GAP = Fraction(1, 1000)
+# The quiet peak threshold (the waveform_quiet default) for a stem written at the fixed
+# extraction gain (separation_pipeline_prepare.GAIN_DB) and unit output gain.
+QUIET_THRESHOLD_DBFS = -60.0
+FIXED_EXTRACTION_GAIN_DB = -0.1
+MODEL_INPUT_NAME = "model-input.wav"  # separation_pipeline_prepare's and delivery_audio's input
+
+
+def jitter_gaps(clock: AudioFrameClock) -> dict[Fraction, Fraction]:
+    """Gaps between decoded frames that are timestamp jitter: each frame end -> next start.
+
+    A gap counts as jitter when it is shorter than half the frame before it and the clock's
+    drift (PTS time against summed decoded samples) since the last real gap stays within one
+    frame after it. Encoder rounding (2064 for 2048 samples) or 40/60 ms FLV steps for 42.67 ms
+    frames qualify; a dropped frame leaves a gap of about one frame, stays a gap and becomes the
+    reference the following drift is measured from.
+    """
+    origin = clock.pts[0] * clock.time_base
+    reference = Fraction(0)
+    gaps: dict[Fraction, Fraction] = {}
+    for index in range(len(clock.pts) - 1):
+        frame = Fraction(clock.samples[index], clock.sample_rate)
+        end = clock.pts[index] * clock.time_base + frame
+        start = clock.pts[index + 1] * clock.time_base
+        drift = start - origin - Fraction(clock.sample_ends[index], clock.sample_rate)
+        if start <= end:
+            continue
+        if start - end < frame / 2 and abs(drift - reference) < frame:
+            gaps[end] = start
+        else:
+            reference = drift
+    return gaps
 
 
 def source_quiet(
@@ -38,8 +68,8 @@ def source_quiet(
     individually quiet owners on exact rational intervals. An overlapping loud
     or unknown owner protects the interval; quiet owners never cancel it by an
     averaged waveform. Zero owners is missing support, never measured silence;
-    only a timestamp-jitter gap of at most ``JITTER_GAP`` seconds, which holds no
-    decoded sample at all, joins the quiet spans on both of its sides.
+    only a timestamp-jitter gap (``jitter_gaps``), which holds no decoded sample at
+    all, joins the quiet spans on both of its sides.
     """
     rate = clock.sample_rate if measurement_rate is None else measurement_rate
     if type(rate) is not int or not 8000 <= rate <= 192000:
@@ -76,18 +106,14 @@ def source_quiet(
     # Aggregate all simultaneous boundaries before evaluating the next half-open
     # interval. Merge exact touching support, not nearby float timestamps.
     result: list[tuple[Fraction, Fraction]] = []
+    joins = jitter_gaps(clock)
     owners = quiet_owners = 0
     previous = Fraction(0)
     events.sort(key=lambda event: event[0])
     for point, group in groupby(events, key=lambda event: event[0]):
-        if (
-            0 < point - previous <= JITTER_GAP
-            and owners == 0
-            and result
-            and result[-1][1] == previous
-        ):
-            # Encoder timestamps step a few samples past a frame's end (2064 for 2048 samples):
-            # nothing plays there, so it must not split one quiet run into frame-sized pieces.
+        if joins.get(previous) == point and owners == 0 and result and result[-1][1] == previous:
+            # Nothing plays in a jitter gap, so it must not split one quiet run into frame-sized
+            # pieces.
             result[-1] = (result[-1][0], point)
         if previous < point and owners > 0 and owners == quiet_owners:
             beginning = previous
@@ -203,6 +229,62 @@ def _labels(data: dict[str, object]) -> tuple[ClockLabel, ...]:
     return tuple(result)
 
 
+def stem_gain_db(stereo: Path, digest: str) -> float:
+    """The static gain separation applied to this PCM relative to the fixed-gain audio the quiet
+    threshold was set on, from pinned records only; PCM without those records (made before the
+    gains existed) has no offset.
+
+    The quiet input is either the separated stem, or (older transcription flows) the separation
+    model input itself. A stem carries the measured extraction gain beyond the fixed −0.1 dB plus
+    the writer's output gain (its separation ``result.json`` must pin it); a model input carries
+    only the extraction gain (its PCM preparation receipt must pin it)."""
+    if stereo.name == MODEL_INPUT_NAME:
+        return _extraction_gain(stereo.parent / "pcm-preparation.json", stereo, digest)
+    result_path = stereo.parent / "result.json"
+    if not result_path.exists():
+        return 0.0
+    result = _read(result_path)
+    outputs = result.get("outputs")
+    if not isinstance(outputs, list) or not any(
+        record(item).get("path") == str(stereo) and record(item).get("sha256") == digest
+        for item in outputs
+    ):
+        raise ReplayError("The separation receipt does not pin this stem")
+    model_input = Path(str(result.get("modelInput")))
+    receipt = model_input.parent / "pcm-preparation.json"
+    return _number(result.get("outputGainDB", 0.0)) + _extraction_gain(receipt, model_input, None)
+
+
+def _extraction_gain(receipt_path: Path, model_input: Path, digest: str | None) -> float:
+    """The measured extraction gain beyond the fixed one, from the PCM preparation receipt's
+    pinned ``input-gain.json``; 0 without a receipt or a measured gain. With ``digest`` the
+    receipt must pin that model input."""
+    if not receipt_path.exists():
+        return 0.0
+    receipt = _read(receipt_path)
+    if digest is not None and record(receipt.get("output", {})).get("sha256") != digest:
+        raise ReplayError(f"The PCM preparation receipt does not pin {model_input}")
+    pinned = record(receipt.get("inputGain", {}))
+    if not pinned:
+        return 0.0
+    gain_path = Path(str(pinned.get("path")))
+    if file_digest(gain_path) != pinned.get("sha256"):
+        raise ReplayError("The extraction gain record differs from its pin")
+    return _number(_read(gain_path).get("gainDB")) - FIXED_EXTRACTION_GAIN_DB
+
+
+def _number(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+        raise ReplayError("A recorded stem gain is not a finite number")
+    return float(value)
+
+
+def quiet_threshold_dbfs(stereo: Path, digest: str) -> float:
+    """The quiet peak threshold, moved with the stem's recorded static gain so the same audio
+    is quiet whatever level separation wrote it at."""
+    return QUIET_THRESHOLD_DBFS + stem_gain_db(stereo, digest)
+
+
 def run(config: Path, output: Path, *, ffmpeg: str) -> tuple[CutSpan, ...]:
     """Produce candidate cuts, never a non-speech or perceptual-quality certificate."""
     if (
@@ -296,10 +378,12 @@ def run(config: Path, output: Path, *, ffmpeg: str) -> tuple[CutSpan, ...]:
             check=True,
             timeout=3600,
         )
+    threshold = quiet_threshold_dbfs(*bindings["stereoPCM"])
     with peaks.open(encoding="utf-8") as lines:
         quiet = measured_quiet_runs(
-            lines, sample_count=samples, sample_rate=rate, window_samples=window
-        )
+            lines, sample_count=samples, sample_rate=rate, window_samples=window,
+            threshold_dbfs=threshold,
+        )  # fmt: skip
     mapped = source_quiet(quiet, clock, measurement_rate=rate)
     cuts = quiet_cut_frames(mapped, _labels(labels), source_frames=source_frames, fps=fps)
     snapshot.finish()
@@ -308,6 +392,7 @@ def run(config: Path, output: Path, *, ffmpeg: str) -> tuple[CutSpan, ...]:
         "clock": "source-presentation",
         "fps": fps,
         "sourceFrames": source_frames,
+        "quietThresholdDBFS": threshold,
         "cuts": [asdict(cut) for cut in cuts],
         "sourceQuiet": [asdict(span) for span in mapped],
         "parentSHA256": {str(path): digest for path, digest in bindings.values()},

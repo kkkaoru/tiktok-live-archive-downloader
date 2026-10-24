@@ -108,8 +108,9 @@ def _verify_quiet(
         samples, rate = stream.getnframes(), stream.getframerate()
     with peaks.open(encoding="utf-8") as lines:
         measured = measured_quiet_runs(
-            lines, sample_count=samples, sample_rate=rate, window_samples=max(1, rate // 50)
-        )
+            lines, sample_count=samples, sample_rate=rate, window_samples=max(1, rate // 50),
+            threshold_dbfs=quiet.quiet_threshold_dbfs(*bindings["stereoPCM"]),
+        )  # fmt: skip
     mapped = quiet.source_quiet(measured, clock, measurement_rate=rate)
     video = read_clock(bindings["videoClock"][0])
     frames = ceil((video.pts[-1] + video.last_duration) * video.time_base * fps)
