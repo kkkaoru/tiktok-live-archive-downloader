@@ -9,10 +9,12 @@ from pathlib import Path
 
 import pytest
 
+from replay import packet_clock, stages
 from replay import replay_preparation_plan as planner
 from replay.bgm_separation import MODEL_NAME, MODEL_REVISION
 from replay.core import ReplayError
 from replay.edit_completion import REQUIRED_STAGES
+from replay.input_hash_cache import InputHashCache
 from replay.input_hash_snapshot import InputHashSnapshot
 from replay.recordings import record
 from replay.stages import StageError, run_stage
@@ -630,31 +632,59 @@ def test_runtime_pins_require_explicit_bounded_local_inputs(
         fixture.plan()
 
 
-@pytest.mark.parametrize("kind", ["video", "audio"])
-def test_successful_shared_clock_call_seals_producer_evidence(
-    fixture: Fixture, kind: planner.Kind, monkeypatch: pytest.MonkeyPatch
+def test_successful_shared_video_clock_call_seals_producer_evidence(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture.plan()
     calls: list[list[str]] = []
 
     def successful(arguments: list[str]) -> int:
         calls.append(arguments)
-        _json(Path(arguments[2]), _video() if kind == "video" else _audio())
+        _json(Path(arguments[1]), _video())
+        return 0
+
+    monkeypatch.setattr(packet_clock, "main", successful)
+    assert planner.main(["produce", str(fixture.work / "preparation.json"), "video"]) == 0
+    planner.verify_media_clocks(fixture.work / "preparation.json", "video")
+    assert calls == [
+        [
+            str(fixture.source),
+            str(fixture.work / "video-clock.json"),
+            "--ffprobe",
+            str(fixture.root / "tools" / "ffprobe"),
+            "--ffmpeg",
+            str(fixture.root / "tools" / "ffmpeg"),
+        ]
+    ]
+    receipt = record(json.loads(fixture.work.joinpath("video-clock.producer.json").read_bytes()))
+    assert receipt["sharedProducerCompleted"] is True
+    assert receipt["deliveryComplete"] is False
+
+
+def test_successful_shared_audio_clock_call_seals_producer_evidence(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture.plan()
+    calls: list[list[str]] = []
+
+    def successful(arguments: list[str]) -> int:
+        calls.append(arguments)
+        _json(Path(arguments[2]), _audio())
         return 0
 
     monkeypatch.setattr(planner, "media_main", successful)
-    assert planner.main(["produce", str(fixture.work / "preparation.json"), kind]) == 0
-    planner.verify_media_clocks(fixture.work / "preparation.json", kind)
+    assert planner.main(["produce", str(fixture.work / "preparation.json"), "audio"]) == 0
+    planner.verify_media_clocks(fixture.work / "preparation.json", "audio")
     assert calls == [
         [
-            "clock" if kind == "video" else "audio-clock",
+            "audio-clock",
             str(fixture.source),
-            str(fixture.work / f"{kind}-clock.json"),
+            str(fixture.work / "audio-clock.json"),
             "--ffprobe",
             str(fixture.root / "tools" / "ffprobe"),
         ]
     ]
-    receipt = record(json.loads(fixture.work.joinpath(f"{kind}-clock.producer.json").read_bytes()))
+    receipt = record(json.loads(fixture.work.joinpath("audio-clock.producer.json").read_bytes()))
     assert receipt["sharedProducerCompleted"] is True
     assert receipt["deliveryComplete"] is False
 
@@ -692,10 +722,10 @@ def test_failed_clock_call_preserves_partial_output_without_success_evidence(
     fixture.plan()
 
     def failed(arguments: list[str]) -> int:
-        _json(Path(arguments[2]), _video())
+        _json(Path(arguments[1]), _video())
         return 1
 
-    monkeypatch.setattr(planner, "media_main", failed)
+    monkeypatch.setattr(packet_clock, "main", failed)
     with pytest.raises(ReplayError, match="producer failed"):
         planner.produce(fixture.work / "preparation.json", "video")
     assert fixture.work.joinpath("video-clock.json").is_file()
@@ -821,6 +851,107 @@ def test_a_recorded_derivation_of_the_source_is_prepared_and_reloaded(fixture: F
     assert {"path": str(scaled), "sha256": _sha(scaled)} in manifest["inputs"]
     assert planner._load(fixture.work / "preparation.json").source == scaled
     assert path == fixture.work / "workflow.json"
+
+
+def _crop(fixture: Fixture) -> tuple[Path, Path]:
+    """A vertical crop of a decodable copy of the fixture's original: (copy, crop)."""
+    decodable, vertical = fixture.root / "decodable", fixture.root / "vertical"
+    decodable.mkdir()
+    vertical.mkdir()
+    copy, crop = decodable / fixture.source.name, vertical / fixture.source.name
+    copy.write_bytes(b"decodable copy")
+    crop.write_bytes(b"vertical crop")
+    _json(
+        decodable / "decodable.json",
+        {"source": str(fixture.source), "output": str(copy), "outputSHA256": _sha(copy)},
+    )
+    _json(
+        vertical / "vertical.json",
+        {"source": str(copy), "output": str(crop), "outputSHA256": _sha(crop)},
+    )
+    return copy, crop
+
+
+def test_each_process_reads_the_derived_media_once_at_start_and_once_at_the_end(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy, crop = _crop(fixture)
+    caches: list[InputHashCache] = []
+
+    class Recorded(InputHashCache):
+        def prime(self) -> None:
+            caches.append(self)
+            super().prime()
+
+    ordinary: list[Path] = []
+    uncached = stages._uncached_file_digest
+
+    def counted(path: Path) -> str:
+        ordinary.append(path)
+        return uncached(path)
+
+    monkeypatch.setattr(planner, "InputHashCache", Recorded)
+    monkeypatch.setattr(stages, "_uncached_file_digest", counted)
+
+    def audio_clock(arguments: list[str]) -> int:
+        _json(Path(arguments[2]), _audio())
+        return 0
+
+    monkeypatch.setattr(planner, "media_main", audio_clock)
+    planner.prepare(fixture.edit, fixture.settings, fixture.work, source=crop)
+    plan = fixture.work / "preparation.json"
+    planner.produce(plan, "audio")
+    planner.verify_media_clocks(plan, "audio")
+    # The original has no derivation record and is not hashed by the derivation check.
+    assert [cache.hash_reads for cache in caches] == [4, 4, 4]
+    assert copy not in ordinary and crop not in ordinary and fixture.source not in ordinary
+
+
+def test_media_changed_during_a_producer_is_refused_before_its_evidence(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture.plan()
+
+    def tampering(arguments: list[str]) -> int:
+        _json(Path(arguments[2]), _audio())
+        fixture.source.write_bytes(b"synthetic recording, changed")
+        return 0
+
+    monkeypatch.setattr(planner, "media_main", tampering)
+    with pytest.raises(StageError, match="changed"):
+        planner.produce(fixture.work / "preparation.json", "audio")
+    assert not (fixture.work / "audio-clock.producer.json").exists()
+
+
+def test_lineage_stops_at_a_record_without_a_source(fixture: Fixture) -> None:
+    store = fixture.root / "store"
+    store.mkdir()
+    copy = store / fixture.source.name
+    copy.write_bytes(b"copy")
+    _json(store / "decodable.json", {"output": str(copy)})
+    assert planner._lineage(copy) == (copy,)
+
+
+def test_a_vertical_crop_of_a_decodable_copy_traces_back_to_the_original(
+    fixture: Fixture,
+) -> None:
+    decodable, vertical = fixture.root / "decodable", fixture.root / "vertical"
+    decodable.mkdir()
+    vertical.mkdir()
+    copy, crop = decodable / fixture.source.name, vertical / fixture.source.name
+    copy.write_bytes(b"decodable copy")
+    crop.write_bytes(b"vertical crop")
+    _json(
+        decodable / "decodable.json",
+        {"source": str(fixture.source), "output": str(copy), "outputSHA256": _sha(copy)},
+    )
+    _json(
+        vertical / "vertical.json",
+        {"source": str(copy), "output": str(crop), "outputSHA256": _sha(crop)},
+    )
+    planner.prepare(fixture.edit, fixture.settings, fixture.work, source=crop)
+    manifest = json.loads((fixture.work / "preparation.json").read_bytes())
+    assert manifest["source"] == str(crop)
 
 
 def test_a_source_without_its_derivation_record_is_refused(fixture: Fixture) -> None:

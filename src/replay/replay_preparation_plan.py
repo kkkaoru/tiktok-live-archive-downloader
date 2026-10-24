@@ -15,10 +15,13 @@ import re
 import stat
 import sys
 import wave
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from replay import packet_clock
 from replay.audio_clock import AudioFrameClock
 from replay.bgm_separation import MODEL_CONFIG_SHA256, MODEL_NAME, MODEL_REVISION, MODEL_SHA256
 from replay.code_dependency_inventory import capture
@@ -27,6 +30,7 @@ from replay.delivery_audio import separate, verify_material
 from replay.delivery_media import MAX_CLOCK_BYTES, parse_clock
 from replay.delivery_media import main as media_main
 from replay.edit_config import CONFIG_NAME, load_config
+from replay.input_hash_cache import InputHashCache, input_hash_context
 from replay.input_hash_snapshot import InputHashSnapshot
 from replay.recordings import record
 from replay.stages import StageError, file_digest
@@ -37,7 +41,8 @@ MAX_METADATA_BYTES = 1024 * 1024
 MAX_INPUTS = 220
 TOOL_NAMES = frozenset({"python", "ffmpeg", "ffprobe", "env"})
 # A derived source (re-encoded for native decoding, given a lead-in) records its origin.
-DERIVATION_RECORDS = ("decodable.json", "lead-in.json")
+# source_decodable, source_vertical (a 9:16 crop) and source_lead_in, in pipeline order.
+DERIVATION_RECORDS = ("decodable.json", "vertical.json", "lead-in.json")
 SETTINGS_FIELDS = frozenset(
     {"version", "tools", "hfHome", "device", "clockTimeoutSeconds", "separationTimeoutSeconds"}
 )
@@ -300,6 +305,48 @@ def _derived_source(original: Path, source: Path) -> Path:
     raise ReplayError("The source is not a recorded derivation of the edit's original")
 
 
+def _lineage(media: Path) -> tuple[Path, ...]:
+    """``media`` and the derived files it came from, which ``_derived_source`` hashes.
+
+    Found without hashing or validation; the original (no record of its own) is not hashed.
+    """
+
+    def recorded(path: Path) -> list[Path]:
+        return [path.parent / name for name in DERIVATION_RECORDS if (path.parent / name).is_file()]
+
+    found = [media]
+    for _ in range(len(DERIVATION_RECORDS)):
+        records = recorded(found[-1])
+        if len(records) != 1:
+            break
+        origin = record(_read(records[0])).get("source")
+        if not isinstance(origin, str) or Path(origin) in found or len(recorded(Path(origin))) != 1:
+            break
+        found.append(Path(origin))
+    return tuple(found)
+
+
+@contextmanager
+def _media_reads(media: Path) -> Iterator[InputHashCache]:
+    """Hash the source media once at the start; the caller's ``verify()`` reads it again.
+
+    The derivation check, the pin and the input snapshot each hashed a derived source, so one
+    process read a 9.3 GB source 7 times (2026-10-23); in between, every use is identity-checked.
+    """
+    cache = InputHashCache(_lineage(media))
+    with input_hash_context(cache):
+        cache.prime()
+        yield cache
+
+
+def _plan_media(path: Path) -> Path:
+    """The media a preparation manifest names, for ``_media_reads`` (``_load`` validates it)."""
+    data = record(_read(path))
+    if "source" in data:
+        return _path(data["source"])
+    return load_config(_path(data["editRoot"])).source
+
+
 def _expected(
     edit_root: Path, settings_path: Path, settings: Settings, source: Path | None = None
 ) -> tuple[Path, tuple[Pin, ...]]:
@@ -477,12 +524,14 @@ def prepare(
         "Use a new work root with an existing parent; inspect occupied/partial results",
     )
     settings = read_settings(settings_path)
-    media, pins = _expected(edit_root, settings_path, settings, source)
-    snapshot = InputHashSnapshot.capture((item.path, item.sha256) for item in pins)
-    preparation = Preparation(edit_root, settings_path, work, settings, media, pins)
-    workflow = _workflow(preparation)
-    snapshot.finish()
-    _resolutions(preparation)
+    with _media_reads(source or load_config(edit_root).source) as reads:
+        media, pins = _expected(edit_root, settings_path, settings, source)
+        snapshot = InputHashSnapshot.capture((item.path, item.sha256) for item in pins)
+        preparation = Preparation(edit_root, settings_path, work, settings, media, pins)
+        workflow = _workflow(preparation)
+        snapshot.finish()
+        _resolutions(preparation)
+        reads.verify()
     work.mkdir(mode=0o700)
     (work / "scratch").mkdir(mode=0o700)
     (work / "cache").mkdir(mode=0o700)
@@ -647,6 +696,11 @@ def _domain(preparation: Preparation, kind: Kind) -> None:
 
 def produce(path: Path, kind: Kind) -> None:
     """Call shared producers once and seal evidence only after successful completion."""
+    with _media_reads(_plan_media(path)) as reads:
+        _produce(path, kind, reads)
+
+
+def _produce(path: Path, kind: Kind, reads: InputHashCache) -> None:
     preparation = _load(path)
     outputs = (*_outputs(preparation, kind), _producer_path(preparation, kind))
     _require(
@@ -664,33 +718,39 @@ def produce(path: Path, kind: Kind) -> None:
             device=preparation.settings.device,
         )
     else:
-        code = media_main(
-            [
-                "clock" if kind == "video" else "audio-clock",
-                str(preparation.source),
-                str(preparation.work / f"{kind}-clock.json"),
-                "--ffprobe",
-                str(preparation.settings.tools["ffprobe"].path),
-            ]
+        arguments = [
+            str(preparation.source),
+            str(preparation.work / f"{kind}-clock.json"),
+            "--ffprobe",
+            str(preparation.settings.tools["ffprobe"].path),
+        ]
+        ffmpeg = str(preparation.settings.tools["ffmpeg"].path)
+        code = (
+            packet_clock.main([*arguments, "--ffmpeg", ffmpeg])
+            if kind == "video"
+            else media_main(["audio-clock", *arguments])
         )
         _require(code == 0, "Shared clock producer failed; partial output is retained")
     _domain(preparation, kind)
     snapshot.finish()
     _resolutions(preparation)
+    reads.verify()
     _write(_producer_path(preparation, kind), _producer_data(preparation, kind))
 
 
 def verify_media_clocks(path: Path, kind: Kind) -> None:
     """Read-only source-bound domain checks, with true-content endpoint pin checks."""
-    preparation = _load(path)
-    snapshot = InputHashSnapshot.capture((item.path, item.sha256) for item in preparation.pins)
-    _verify_producer(preparation, kind)
-    if kind == "separation":
-        _verify_producer(preparation, "video")
-        _verify_producer(preparation, "audio")
-    _domain(preparation, kind)
-    snapshot.finish()
-    _resolutions(preparation)
+    with _media_reads(_plan_media(path)) as reads:
+        preparation = _load(path)
+        snapshot = InputHashSnapshot.capture((item.path, item.sha256) for item in preparation.pins)
+        _verify_producer(preparation, kind)
+        if kind == "separation":
+            _verify_producer(preparation, "video")
+            _verify_producer(preparation, "audio")
+        _domain(preparation, kind)
+        snapshot.finish()
+        _resolutions(preparation)
+        reads.verify()
 
 
 class Arguments(argparse.Namespace):
