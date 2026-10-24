@@ -243,6 +243,29 @@ def canonical_deliveries(folder, name, roots=()):
     return found
 
 
+def offloaded_delivery(name, base, roots):
+    """A delivery kept only in R2: the entry of its recording's offload.json (in any root)."""
+    for root in roots:
+        record = os.path.join(root, name, "offload.json")
+        if not os.path.isfile(record):
+            continue
+        files = json.loads(Path(record).read_text(encoding="utf-8")).get("files", [])
+        for item in files:
+            path = item.get("localPath", "")
+            if item.get("role") == "delivery" and os.path.basename(path) == base:
+                return None if os.path.lexists(path) else item
+    return None
+
+
+def published_duration(keep, vid):
+    """The duration the published catalog lists for a video (an offloaded movie is not probed)."""
+    catalog = os.path.join(keep or "", "catalog.json")
+    if not keep or not os.path.isfile(catalog):
+        return None
+    videos = json.loads(Path(catalog).read_text(encoding="utf-8"))["videos"]
+    return next((v.get("duration") for v in videos if v["id"] == vid), None)
+
+
 def find_original(folder, name, youtube_originals, roots=()):
     """Pre-edit source: edit-config.json `source` (size-validated), else the
     YouTube originals layout `<stamp>_youtube-<id>/<same>.{mp4,mkv}`.
@@ -265,6 +288,22 @@ def find_original(folder, name, youtube_originals, roots=()):
         media = [h for h in hits if h.lower().endswith((".mp4", ".mkv"))]
         if len(media) == 1:
             return media[0]
+    return None
+
+
+def channel_of(name, original, issues):
+    """A YouTube video's channel ID from channel.json beside its original; viewers map it to a
+    label through the worker's /api/channels.json."""
+    if not name.startswith("youtube-"):
+        return None
+    p = os.path.join(os.path.dirname(original), "channel.json") if original else None
+    try:
+        channel_id = json.loads(Path(p).read_text(encoding="utf-8"))["channel_id"] if p else None
+    except (OSError, ValueError, KeyError, TypeError):
+        channel_id = None
+    if isinstance(channel_id, str) and re.fullmatch(r"UC[A-Za-z0-9_-]{22}", channel_id):
+        return channel_id
+    issues.append(f"no channel: {name} (default streamer)")
     return None
 
 
@@ -307,6 +346,11 @@ def main():
                     choices, unverified = canonical_deliveries(folder, name, a.root), False
                 if not choices:
                     continue
+                # A transcript left by a retired revision has no movie; never let it compete
+                # with the one playable delivery.
+                playable = [c for c in choices if c[0]]
+                if len(choices) > 1 and len(playable) == 1:
+                    choices = playable
                 if len(choices) > 1:  # prefer the one carrying saved summaries
                     with_sum = [c for c in choices if load_summary(c[1])]
                     if len(with_sum) == 1:
@@ -319,6 +363,10 @@ def main():
                     os.path.basename(movie) if movie else os.path.basename(transcript)[:-4] + ".mp4"
                 )
                 vid = base[:-4]
+                # R2-only movie: its data is rebuilt and published; the movie itself has no
+                # localPath, so the sync never uploads it again.
+                offloaded = offloaded_delivery(name, base, a.root) if movie is None else None
+                playable = movie is not None or offloaded is not None
                 if vid in seen_ids:
                     continue
                 seen_ids.add(vid)
@@ -333,18 +381,27 @@ def main():
                 with open(os.path.join(a.out, vid + ".json"), "w", encoding="utf-8") as fh:
                     json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
                 original = find_original(folder, name, a.youtube_originals, a.root)
-                if movie is None and not original:
+                if not playable and not original:
                     continue  # a transcript alone has nothing to play
+                channel_id = channel_of(name, original, issues)
+                if a.no_duration:
+                    seconds = None
+                elif offloaded:
+                    seconds = published_duration(a.keep, vid)
+                else:
+                    seconds = duration(movie or original)
                 videos.append(
                     {
                         "id": vid,
                         "streamer": a.streamer,
                         "title": name
                         + (" [未検証候補]" if unverified else "")
-                        + ("" if movie else " [文字起こし先行・元動画]"),
+                        + ("" if playable else " [文字起こし先行・元動画]"),
                         "broadcastStartJST": stamp_label(base),
-                        "movie": base if movie else None,
-                        "size": os.path.getsize(movie or original),
+                        "movie": base if playable else None,
+                        "size": offloaded["bytes"]
+                        if offloaded
+                        else os.path.getsize(movie or original),
                         # MKV originals are served as a generated H.264 MP4 proxy
                         # (same basename, .mp4); the uploader creates it from localPath.
                         "original": (
@@ -358,11 +415,12 @@ def main():
                             if original
                             else None
                         ),
-                        "duration": None if a.no_duration else duration(movie or original),
+                        "duration": seconds,
                         "transcriptPath": os.path.abspath(transcript),
                         "cueCount": len(cues),
                         "hasSummary": data["summary"] is not None,
                         "localPath": os.path.abspath(movie) if movie else None,
+                        **({"channelId": channel_id} if channel_id else {}),
                     }
                 )
             except Exception as e:  # fail-closed per recording, like the native scan
@@ -383,7 +441,10 @@ def main():
             ):
                 continue
             kept_data(data_path, video, a.out)
-            videos.append({**video, "kept": True})
+            channel_id = channel_of(folder, (video.get("original") or {}).get("localPath"), issues)
+            videos.append(
+                {**video, "kept": True, **({"channelId": channel_id} if channel_id else {})}
+            )
             delivered.add(folder)
             issues.append(f"kept published: {folder} (local delivery not found)")
     if a.raw:
