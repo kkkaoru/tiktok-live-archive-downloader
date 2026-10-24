@@ -3,6 +3,7 @@
 import hashlib
 import json
 import subprocess
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,6 +183,53 @@ def test_the_pinned_checkpoint_is_loaded_as_a_batch_detector(
         )
     )
     assert detect(frames(2)) == [[(960.0, 0.0, 1.0, 1.0)], [(960.0, 0.0, 1.0, 1.0)]]
+
+
+class PredictorRecorder(FakeModel):
+    predictors: list[object] = []
+
+    def predict(self, images: list[NDArray[np.uint8]], **options: object) -> list[SimpleNamespace]:
+        PredictorRecorder.predictors.append(options["predictor"])
+        return super().predict(images, **options)
+
+
+def test_the_detector_runs_nms_on_cpu_predictions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import torch
+    from ultralytics.models.yolo.detect.predict import DetectionPredictor
+
+    weights = tmp_path / "w.pt"
+    weights.write_bytes(b"weights")
+    config = tmp_path / "config"
+    (config / "Ultralytics").mkdir(parents=True)
+    settings: dict[str, object] = {name: False for name in ("sync", "clearml", "comet", "dvc",
+                                   "mlflow", "raytune", "wandb", "tensorboard")}  # fmt: skip
+    settings |= {"datasets_dir": str(tmp_path), "runs_dir": str(tmp_path)}
+    (config / "Ultralytics" / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+    monkeypatch.setattr("ultralytics.models.yolo.model.YOLO", PredictorRecorder)
+    seen: list[tuple[str, object, object]] = []
+
+    def postprocess(
+        self: object, preds: torch.Tensor, img: object, orig_imgs: object, **kwargs: object
+    ) -> list[str]:
+        seen.append((preds.device.type, img, kwargs))
+        return ["boxes"]
+
+    monkeypatch.setattr(DetectionPredictor, "postprocess", postprocess)
+    detect = regions.load_detector(
+        regions.YoloSettings(
+            weights, hashlib.sha256(b"weights").hexdigest(), config, tmp_path, 640, "cpu"
+        )
+    )
+    detect(frames(1))
+    predictor = PredictorRecorder.predictors[-1]
+    assert isinstance(predictor, type) and issubclass(predictor, DetectionPredictor)
+    run: Callable[..., object] = object.__new__(predictor).postprocess
+    on_mps = torch.zeros(1, 5, 3, device="mps")
+    assert run(on_mps, "img", "orig", iou=0.5) == ["boxes"]
+    assert run((on_mps, "extra"), "img", "orig") == ["boxes"]
+    assert seen == [("cpu", "img", {"iou": 0.5}), ("cpu", "img", {})]
 
 
 def test_chunk_frames_follow_the_clock_across_a_timestamp_gap(tmp_path: Path) -> None:

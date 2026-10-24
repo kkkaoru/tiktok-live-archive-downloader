@@ -16,7 +16,7 @@ Neither proves removal quality: repair, the OCR audit and the colour-residual ga
 
 import os
 import subprocess
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -87,7 +87,7 @@ def region_of(
 
 def chunk_frames(
     source: Path, clock: VideoFrameClock, *, canvas: tuple[int, int], ffmpeg: str
-) -> Iterator[Image]:
+) -> Generator[Image]:
     """Every chunk frame scaled to the training width (BGR), selected exactly as the renderer does.
 
     Like the repair renderer, frames are chosen by presentation timestamp from the chunk's first
@@ -243,14 +243,28 @@ def load_detector(settings: YoloSettings) -> Detector:
     check_settings(settings.config_directory, settings.work)
     os.environ["YOLO_CONFIG_DIR"] = str(settings.config_directory)
     os.environ["ULTRALYTICS_OFFLINE"] = "1"
+    from ultralytics.models.yolo.detect.predict import DetectionPredictor
     from ultralytics.models.yolo.model import YOLO
+
+    class CpuNmsPredictor(DetectionPredictor):
+        """Ultralytics detection with NMS on the CPU (the same boxes).
+
+        On MPS its per-image boolean indexing waits for the GPU once per image; beside a running
+        STTN fill that took a 900-frame chunk 9.2 s against 3.4 s with one copy per batch.
+        """
+
+        def postprocess(self, preds: Any, img: Any, orig_imgs: Any, **kwargs: Any) -> Any:
+            prediction = preds[0] if isinstance(preds, (list, tuple)) else preds
+            original: Callable[..., Any] = super().postprocess  # untyped in Ultralytics
+            return original(prediction.cpu(), img, orig_imgs, **kwargs)
 
     model = YOLO(str(settings.weights))
 
     def detect(images: list[Image]) -> list[list[Corners]]:
         results = model.predict(
-            images, imgsz=settings.imgsz, device=settings.device, conf=CONFIDENCE, verbose=False
-        )
+            images, imgsz=settings.imgsz, device=settings.device, conf=CONFIDENCE, verbose=False,
+            predictor=CpuNmsPredictor,
+        )  # fmt: skip
         return caption_boxes(list(results))
 
     return detect
