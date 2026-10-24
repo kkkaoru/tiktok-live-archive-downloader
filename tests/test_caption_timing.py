@@ -694,3 +694,21 @@ def test_a_loop_run_inside_one_token_is_dropped_and_its_tail_kept() -> None:
         ("なん", 0.0, 0.45),
         ("こぉぉぉぉぉぉぉぉぉ", 0.5, 1.0),
     ]
+
+
+def test_an_elongation_run_is_cut_after_two_caption_lines_but_a_short_one_stays() -> None:
+    from replay.caption_timing import SpokenToken, lexical_token_sources
+
+    dense = (
+        SpokenToken("ふぉ", 39.5, 39.8, "a"),
+        SpokenToken("ぉ" * 6, 39.8, 40.0, "a"),
+        SpokenToken("ぉ" * 40, 40.0, 40.1, "a"),
+        SpokenToken("ぉ" * 15, 40.1, 41.0, "a"),
+    )
+    held = (
+        SpokenToken("こぉ", 0.0, 0.3, "a"),
+        SpokenToken("ぉぉぉ", 0.3, 1.0, "a"),
+        SpokenToken("ぉぉぉぉぉ", 1.0, 2.0, "a"),
+    )
+    assert [word.text for word in lexical_token_sources(dense)[0]] == ["ふぉ", "ぉ" * 6]
+    assert len(lexical_token_sources(held)[0]) == 3

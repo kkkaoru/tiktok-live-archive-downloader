@@ -14,6 +14,8 @@ PUNCTUATION = frozenset("、。！？!?.,;:…「」『』（）()\"' ")
 # recognized word, and cannot fit the caption width.
 NON_LEXICAL_MARKS = frozenset("ー〜～")
 ELONGATION_VOWELS = frozenset("ぁぃぅぇぉァィゥェォ")
+# About two full-width caption lines: a held vowel never needs more to read as held.
+ELONGATION_MAXIMUM = 24
 # A recognizer loop such as "ッハッハ…" or "FFFF…" repeats one short unit many times.
 DEGENERATE_UNIT_MAXIMUM = 3
 DEGENERATE_MINIMUM_REPEATS = 8
@@ -222,8 +224,7 @@ def _loop_runs(tokens: tuple[SpokenToken, ...]) -> set[int]:
     while first < len(tokens):
         repeated = _repeated_unit(tokens[first].text)
         last = first
-        # Repeated small vowels or marks lengthen the word before them ("こぉぉぉ"): no loop.
-        if repeated is not None and not set(repeated[0]) <= ELONGATION_VOWELS | NON_LEXICAL_MARKS:
+        if repeated is not None:
             count = repeated[1]
             while last + 1 < len(tokens):
                 following = _repeated_unit(tokens[last + 1].text)
@@ -232,7 +233,13 @@ def _loop_runs(tokens: tuple[SpokenToken, ...]) -> set[int]:
                 count += following[1]
                 last += 1
             seconds = max(tokens[last].end - tokens[first].start, 1e-9)
-            if (
+            if set(repeated[0]) <= ELONGATION_VOWELS | NON_LEXICAL_MARKS:
+                # Small vowels or marks lengthen the word before them ("こぉぉぉ"); only a run
+                # split over tokens faster than speech loses what passes two caption lines
+                # ("ふぉ" + 30 tokens of "ぉ" at 35/s cannot be measured); a held one stays whole.
+                if last > first and count >= LOOP_UNITS_PER_SECOND * seconds:
+                    loops.update(_past_elongation(tokens, first, last))
+            elif (
                 last > first
                 and count >= DEGENERATE_MINIMUM_REPEATS
                 and count >= LOOP_UNITS_PER_SECOND * seconds
@@ -240,6 +247,16 @@ def _loop_runs(tokens: tuple[SpokenToken, ...]) -> set[int]:
                 loops.update(range(first, last + 1))
         first = last + 1
     return loops
+
+
+def _past_elongation(tokens: tuple[SpokenToken, ...], first: int, last: int) -> list[int]:
+    """Indices of a run's elongation tokens once together they exceed ``ELONGATION_MAXIMUM``."""
+    total, past = 0, []
+    for index in range(first, last + 1):
+        total += len(tokens[index].text)
+        if total > ELONGATION_MAXIMUM:
+            past.append(index)
+    return past
 
 
 def _lexical_tokens(
