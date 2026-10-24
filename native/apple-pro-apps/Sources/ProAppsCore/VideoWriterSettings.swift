@@ -23,6 +23,16 @@ enum VideoWriterSettings {
       codec = .hevc
       profile = kVTProfileLevel_HEVC_Main_AutoLevel as String
     }
+    var compression: [String: Any] = [
+      AVVideoAverageBitRateKey: encoding.averageBitRate,
+      AVVideoAllowFrameReorderingKey: encoding.allowFrameReordering,
+      AVVideoExpectedSourceFrameRateKey: frameRate,
+      AVVideoProfileLevelKey: profile,
+    ]
+    if encoding.prioritizeSpeed == true {
+      compression[kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String] = true
+      compression[kVTCompressionPropertyKey_MaximizePowerEfficiency as String] = false
+    }
     return [
       AVVideoCodecKey: codec,
       AVVideoWidthKey: width,
@@ -32,12 +42,7 @@ enum VideoWriterSettings {
         AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
         AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
       ],
-      AVVideoCompressionPropertiesKey: [
-        AVVideoAverageBitRateKey: encoding.averageBitRate,
-        AVVideoAllowFrameReorderingKey: encoding.allowFrameReordering,
-        AVVideoExpectedSourceFrameRateKey: frameRate,
-        AVVideoProfileLevelKey: profile,
-      ],
+      AVVideoCompressionPropertiesKey: compression,
     ]
   }
 

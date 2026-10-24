@@ -158,6 +158,19 @@ struct EditSinglePassTests {
     #expect(decoded.video?.captionAppearance == Self.appearance)
     #expect(decoded.video?.styledCaptions == [Self.caption])
   }
+
+  @Test func speedPriorityIsOptionalAndOmittedWhenUnset() throws {
+    let json = Data(
+      #"{"codec":"hevc","averageBitRate":10000000,"allowFrameReordering":false}"#.utf8)
+    let decoded = try JSONDecoder().decode(EditEncoding.self, from: json)
+    #expect(decoded.prioritizeSpeed == nil)
+    #expect(
+      !String(decoding: try JSONEncoder().encode(decoded), as: UTF8.self).contains("prioritize"))
+    let fast = Data(
+      #"{"codec":"hevc","averageBitRate":10000000,"allowFrameReordering":false,"prioritizeSpeed":true}"#
+        .utf8)
+    #expect(try JSONDecoder().decode(EditEncoding.self, from: fast).prioritizeSpeed == true)
+  }
 }
 
 struct FCPXMLTimelineTests {

@@ -3,6 +3,7 @@ import CoreImage
 import CoreText
 import Foundation
 import Testing
+import VideoToolbox
 
 @testable import ProAppsCore
 
@@ -317,6 +318,22 @@ struct SinglePassRenderTests {
       EditEncoding(codec: .hevc, averageBitRate: 6_000_000, allowFrameReordering: true),
       width: 64, height: 64, frameRate: 60)
     #expect(hevc[AVVideoCodecKey] as? AVVideoCodecType == .hevc)
+    let speedKey = kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String
+    let plain = try #require(hevc[AVVideoCompressionPropertiesKey] as? [String: Any])
+    #expect(plain[speedKey] == nil)
+    let fast = VideoWriterSettings.output(
+      EditEncoding(
+        codec: .hevc, averageBitRate: 6_000_000, allowFrameReordering: false,
+        prioritizeSpeed: true),
+      width: 1080, height: 1920, frameRate: 30)
+    let fastCompression = try #require(fast[AVVideoCompressionPropertiesKey] as? [String: Any])
+    #expect(fastCompression[speedKey] as? Bool == true)
+    #expect(
+      fastCompression[kVTCompressionPropertyKey_MaximizePowerEfficiency as String] as? Bool
+        == false)
+    let writer = try AVAssetWriter(
+      outputURL: try directory().appendingPathComponent("probe.mp4"), fileType: .mp4)
+    #expect(writer.canApply(outputSettings: fast, forMediaType: .video))
     #expect(
       VideoWriterSettings.pixelBuffers(width: 2, height: 4)[kCVPixelBufferHeightKey as String]
         as? Int == 4)

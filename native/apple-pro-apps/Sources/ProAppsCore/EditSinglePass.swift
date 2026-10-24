@@ -11,11 +11,17 @@ public struct EditEncoding: Codable, Equatable, Sendable {
   public let averageBitRate: Int
   /// False disables B-frames (frame reordering), matching `-bf 0`.
   public let allowFrameReordering: Bool
+  /// True asks the hardware encoder to favor speed over quality and leaves power
+  /// efficiency off; omission keeps the encoder's default rate/quality trade-off.
+  public let prioritizeSpeed: Bool?
 
-  public init(codec: Codec, averageBitRate: Int, allowFrameReordering: Bool) {
+  public init(
+    codec: Codec, averageBitRate: Int, allowFrameReordering: Bool, prioritizeSpeed: Bool? = nil
+  ) {
     self.codec = codec
     self.averageBitRate = averageBitRate
     self.allowFrameReordering = allowFrameReordering
+    self.prioritizeSpeed = prioritizeSpeed
   }
 }
 

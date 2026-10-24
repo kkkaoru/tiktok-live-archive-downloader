@@ -83,7 +83,7 @@ extension ToolSpec {
               "codec": string(["h264", "hevc"]),
               "averageBitRate": integer(
                 EditEncoding.bitRates.lowerBound, EditEncoding.bitRates.upperBound),
-              "allowFrameReordering": boolean,
+              "allowFrameReordering": boolean, "prioritizeSpeed": boolean,
             ], ["codec", "averageBitRate", "allowFrameReordering"]),
         ], ["width", "height", "frameRate", "resizeMode"]),
       "additionalVideo": array(
