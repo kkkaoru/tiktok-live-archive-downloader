@@ -15,7 +15,9 @@ from replay import subtitle_detector_mps as mps
 from replay import subtitle_sampled_job as job
 from replay import subtitle_sampled_run as runner
 from replay import subtitle_yolo_regions as yolo_regions
+from replay import yolo_boxes
 from replay.local_asr import fingerprint
+from replay.recordings import record
 from replay.subtitle_repair_audit import Residual
 from replay.subtitle_stream import SubtitleSpan
 from replay.subtitle_video import VideoRepairJob
@@ -464,3 +466,58 @@ def test_residual_boxes_join_caption_frames_only() -> None:
     assert above_masks[0]["region"] == {"x": -5, "y": -18, "width": 35, "height": 46}
     with pytest.raises(ValueError, match="per-frame entries"):
         job.with_residual({"frames": 3}, [], {0: [(1, 1, 2, 2)]})
+
+
+def test_stored_yolo_boxes_supply_the_regions_without_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _configuration(tmp_path, residual=0.3)
+    pts = record(config["clock"])["pts"]
+    assert isinstance(pts, list)
+    scale = int(str(config["width"])) / 640
+
+    def no_decode(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("stored boxes must not decode the chunk again")
+
+    monkeypatch.setattr(yolo_regions, "chunk_frames", no_decode)
+    box = (120.0 * scale, 180.0 * scale, 520.0 * scale, 240.0 * scale)
+    tools, _ = job.real_collaborators(
+        config, network=_bar, render=_fake_render, stored_boxes=[[box]] * len(pts)
+    )
+    receipt = runner.run(tmp_path / "chunk", tools, stride=13, pins={})
+    assert receipt["accepted"] == "attempt-sampled"
+
+
+def test_main_uses_stored_boxes_and_skips_the_detector_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _configuration(tmp_path, residual=0.3)
+    config.update(output=str(tmp_path / "out"), stride=13, detectorProgram="d.pt2",
+                  detectorProgramSHA256="0" * 64, yoloBoxes=str(tmp_path / "boxes"),
+                  sourceSHA256="5" * 64)  # fmt: skip
+    config["regionDetector"] = {
+        "kind": "yolo", "weights": "w.pt", "sha256": "1" * 64, "configDirectory": "c",
+        "work": "w", "imgsz": 640,
+    }  # fmt: skip
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    asked: list[tuple[Path, str, str, int]] = []
+
+    def load(directory: Path, pts: object, **keywords: object) -> list[list[object]]:
+        asked.append((directory, str(keywords["source_sha256"]), str(keywords["weights_sha256"]),
+                      int(str(keywords["imgsz"]))))  # fmt: skip
+        assert isinstance(pts, tuple)
+        return [[] for _ in pts]
+
+    def no_model(_settings: object) -> object:
+        raise AssertionError("the detector model must not load when boxes are stored")
+
+    monkeypatch.setattr(mps, "lazy_network", lambda *_args, **_kw: _bar)
+    monkeypatch.setattr(yolo_boxes, "load", load)
+    monkeypatch.setattr(yolo_regions, "load_detector", no_model)
+    monkeypatch.setattr(
+        job, "render_repaired_video_fast", lambda video_job, **_: video_job.output.write_bytes(b"v")
+    )
+    assert job.main([str(path)]) == 0
+    assert asked == [(tmp_path / "boxes", "5" * 64, "1" * 64, 640)]
+    assert capsys.readouterr().out.splitlines()[0] == "YOLO_BOXES stored"

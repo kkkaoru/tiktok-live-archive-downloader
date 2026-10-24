@@ -9,6 +9,10 @@ evidence file that names the checkpoint and the video by sha256 and holds, per s
 single face box chosen by one fixed rule (highest confidence; the number of faces is kept so
 ambiguity stays visible) and the caption box count. Boxes are reported in source pixels. The
 evidence is detection output, not a measurement: callers decide where it may replace Vision.
+
+With ``--boxes`` every frame is detected once and the sampled rows are taken from that same pass
+(the same predictions, so the same rows), while ``yolo_boxes`` streams each frame's caption boxes
+into range files that the source-caption cleanup reads instead of detecting its chunks again.
 """
 
 import argparse
@@ -16,12 +20,14 @@ import hashlib
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 from bisect import bisect_left
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -30,7 +36,9 @@ from typing import Any, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
+from replay import packet_clock
 from replay.core import ReplayError
+from replay.delivery_media import read_clock
 from replay.mps_graph_cache import released_mps_graphs
 from replay.yolo_labels import CAPTION, FACE
 from replay.yolo_train import check_checkpoint, check_settings
@@ -44,8 +52,6 @@ MAX_BATCH = 64
 FACE_RULE = "highest-confidence face box; faceCount keeps the number of faces above the floor"
 DECODERS = ("videotoolbox", "software")
 PREFETCH_FRAMES = 128
-# One decoded frame, the decoder's failure, or the end of the stream.
-Prefetched = tuple[int, NDArray[np.uint8]] | BaseException | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +89,9 @@ class ModelLike(Protocol):
         conf: float,
         verbose: bool,
     ) -> Sequence[ResultLike]: ...
+
+
+Sink = Callable[[Sequence[tuple[int, NDArray[np.uint8]]], Sequence[ResultLike]], None]
 
 
 class Adapter:
@@ -134,8 +143,16 @@ def track(
     batch: int,
     device: str,
     imgsz: int,
+    sink: Sink | None = None,
+    keep: Callable[[int], bool] = lambda _number: True,
+    breaks: int | None = None,
 ) -> tuple[list[Row], float]:
-    """Run the detector over `frames` in batches; return the rows and the seconds spent in it."""
+    """Run the detector over `frames` in batches; return the rows and the seconds spent in it.
+
+    ``sink`` sees every batch with its results; only frames ``keep`` accepts become rows. With
+    ``breaks`` no batch spans a multiple of it (a cleanup chunk boundary), so every batch is
+    composed exactly as a chunk's own detection composes it.
+    """
     if not 1 <= batch <= MAX_BATCH:
         raise ReplayError("Invalid batch size")
     rows: list[Row] = []
@@ -157,13 +174,18 @@ def track(
         seconds += time.monotonic() - started
         if len(results) != len(pending):
             raise ReplayError("Detector returned a different number of results")
+        if sink is not None:
+            sink(pending, results)
         rows.extend(
             row_from(number, result.boxes, scale=scale)
             for (number, _), result in zip(pending, results, strict=True)
+            if keep(number)
         )
         pending.clear()
 
     for item in frames:
+        if breaks is not None and pending and item[0] % breaks == 0:
+            flush()
         pending.append(item)
         if len(pending) == batch:
             flush()
@@ -182,6 +204,7 @@ def video_frames(
     rate: int | Fraction,
     ffmpeg: str,
     decoder: str = "software",
+    decode_log: Path | None = None,
 ) -> Generator[tuple[int, NDArray[np.uint8]]]:
     """Decode frames start, start+step, ... below `end`, scaled to the training width (BGR).
 
@@ -189,6 +212,7 @@ def video_frames(
     ffmpeg stops reading when the range is done instead of decoding to the end of the file. With
     ``videotoolbox`` the frames stay on the media engine until the sampled ones are downloaded;
     the scaling is the same software filter, so the pixels match the software decoder's.
+    ``decode_log`` receives a ``showinfo`` line per decoded frame: the PTS actually decoded.
     """
     if not 0 <= start < end or step < 1 or rate < 1:
         raise ReplayError("Invalid frame range or step")
@@ -199,15 +223,25 @@ def video_frames(
     hardware = decoder == "videotoolbox"
     accelerated = ["-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld"]
     download = "hwdownload,format=nv12," if hardware else ""
+    shown = "" if decode_log is None else "showinfo,"
     command = [
-        ffmpeg, "-v", "error", "-nostdin", *(accelerated if hardware else []),
+        ffmpeg, "-v", "error" if decode_log is None else "info", "-nostdin",
+        *(accelerated if hardware else []),
         "-ss", f"{float(start / rate):.6f}", "-i", str(source),
-        "-vf", f"select='not(mod(n,{step}))',{download}scale={TRAIN_WIDTH}:{scaled}",
+        "-vf", f"{shown}select='not(mod(n,{step}))',{download}scale={TRAIN_WIDTH}:{scaled}",
         "-frames:v", str(count), "-fps_mode", "passthrough",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]  # fmt: skip
     size = TRAIN_WIDTH * scaled * 3
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL) as process:
+    with (
+        nullcontext(None) if decode_log is None else decode_log.open("wb") as log,
+        subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            stderr=None if decode_log is None else log,
+        ) as process,
+    ):
         if process.stdout is None:
             raise ReplayError("ffmpeg gave no output stream")
         number = start
@@ -218,9 +252,7 @@ def video_frames(
         raise ReplayError("ffmpeg failed while decoding frames")
 
 
-def prefetched(
-    frames: Generator[tuple[int, NDArray[np.uint8]]], depth: int = PREFETCH_FRAMES
-) -> Generator[tuple[int, NDArray[np.uint8]]]:
+def prefetched[T](frames: Generator[T], depth: int = PREFETCH_FRAMES) -> Generator[T]:
     """Yield `frames` while a thread keeps decoding up to `depth` frames ahead.
 
     The detector then waits for the decoder only when decoding is the slower side. A decoder
@@ -229,10 +261,11 @@ def prefetched(
     """
     if depth < 1:
         raise ReplayError("Invalid prefetch depth")
-    buffer: queue.Queue[Prefetched] = queue.Queue(depth)
+    # One decoded frame, the decoder's failure, or the end of the stream.
+    buffer: queue.Queue[T | BaseException | None] = queue.Queue(depth)
     stop = threading.Event()
 
-    def put(item: Prefetched) -> bool:
+    def put(item: T | BaseException | None) -> bool:
         while not stop.is_set():
             try:
                 buffer.put(item, timeout=0.2)
@@ -280,14 +313,17 @@ def sha256(path: Path) -> str:
 
 
 def presentation_clock(source: Path, ffprobe: str) -> Clock:
-    """Packet timestamps of the first video stream, sorted into display order (no decoding)."""
+    """Packet timestamps of the first video stream, sorted into display order (no decoding).
+
+    Packets the edit list discards (flag ``D``) give no frame and are left out.
+    """
     out = subprocess.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
-         "stream=time_base:packet=pts", "-of", "json", str(source)],
+         "stream=time_base:packet=pts,flags", "-of", "json", str(source)],
         capture_output=True, text=True, check=True, timeout=600,
     ).stdout  # fmt: skip
     data = json.loads(out)
-    pts = sorted(int(packet["pts"]) for packet in data["packets"])
+    pts = sorted(int(packet["pts"]) for packet in data["packets"] if "D" not in packet["flags"])
     if not pts or len(set(pts)) != len(pts):
         raise ReplayError("The video stream has no or duplicate presentation timestamps")
     return Clock(tuple(pts), Fraction(str(data["streams"][0]["time_base"])))
@@ -374,20 +410,53 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
-    return parser.parse_args(argv)
+    parser.add_argument("--boxes", type=Path, help="also stream every frame's caption boxes here")
+    parser.add_argument("--frame-clock", type=Path, help="the decoded clock the boxes are keyed by")
+    parser.add_argument(
+        "--chunk-frames", type=int, default=900, help="with --boxes: the cleanup chunk size"
+    )
+    arguments = parser.parse_args(argv)
+    if (arguments.boxes is None) != (arguments.frame_clock is None):
+        parser.error("--boxes and --frame-clock go together")
+    return arguments
 
 
-def run(args: argparse.Namespace, model: ModelLike) -> dict[str, object]:
+def decoded_clock(decode_log: Path, frame_clock: Path, *, end: int) -> None:
+    """Refuse a packet clock whose first ``end`` PTS are not the ones the decoder output."""
+    observed = [
+        int(value)
+        for value in re.findall(rb"\bn:\s*\d+\s+pts:\s*(-?\d+)\s", decode_log.read_bytes())
+    ]
+    expected = list(read_clock(frame_clock).pts[:end])
+    if observed[: len(expected)] != expected:
+        raise packet_clock.refuse(
+            frame_clock,
+            consumer="yolo-track",
+            reason=f"the {len(observed)} decoded PTS differ from the clock's first {end}",
+        )
+
+
+def run(args: argparse.Namespace, model: ModelLike, sink: Sink | None = None) -> dict[str, object]:
     width, height, rate = probe_video(args.source, args.ffprobe)
     clock = presentation_clock(args.source, args.ffprobe)
     started = time.monotonic()
+    # A sink needs every frame: decode them all and keep the sampled ones as rows.
+    decoded = args.step if sink is None else 1
+    # A clock taken from packets is checked against the PTS this pass decodes from frame 0.
+    checked = sink is not None and args.start == 0 and packet_clock.is_packet(args.frame_clock)
+    decode_log = args.output.with_name(args.output.name + ".decode.log") if checked else None
     rows, inference = track(
         prefetched(video_frames(
             args.source, width=width, height=height, start=args.start, end=args.end,
-            step=args.step, rate=rate, ffmpeg=args.ffmpeg, decoder=args.decoder,
+            step=decoded, rate=rate, ffmpeg=args.ffmpeg, decoder=args.decoder,
+            decode_log=decode_log,
         )),
         model, scale=width / TRAIN_WIDTH, batch=args.batch, device=args.device, imgsz=args.imgsz,
+        sink=sink, keep=lambda number: (number - args.start) % args.step == 0,
+        breaks=None if sink is None else args.chunk_frames,
     )  # fmt: skip
+    if decode_log is not None:
+        decoded_clock(decode_log, args.frame_clock, end=args.end)
     wall = time.monotonic() - started
     timing = {
         "wallSeconds": wall,
@@ -430,8 +499,19 @@ def main(argv: list[str] | None = None) -> int:
     from ultralytics.engine.results import Results
     from ultralytics.models.yolo.model import YOLO
 
+    sink = None
+    if args.boxes is not None:
+        # Deferred: yolo_boxes builds on subtitle_yolo_regions, which imports this module.
+        from replay import yolo_boxes
+
+        sink = yolo_boxes.Writer(
+            args.boxes, clock_path=args.frame_clock, source=args.source,
+            weights_sha256=args.weights_sha256, imgsz=args.imgsz, ffprobe=args.ffprobe,
+        )  # fmt: skip
     with released_mps_graphs():
-        result = run(args, Adapter(YOLO(str(args.weights)), Results))
+        result = run(args, Adapter(YOLO(str(args.weights)), Results), sink)
+    if sink is not None:
+        sink.close()
     args.output.write_text(json.dumps(result, indent=1), encoding="utf-8")
     print(json.dumps(result["timing"]))
     return 0

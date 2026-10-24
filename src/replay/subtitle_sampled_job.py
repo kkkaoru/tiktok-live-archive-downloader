@@ -25,7 +25,7 @@ from replay import subtitle_colour_support as colour
 from replay import subtitle_detector_mps as mps
 from replay import subtitle_sampled_chunk as chunk
 from replay import subtitle_sampled_run as runner
-from replay import subtitle_sttn
+from replay import subtitle_sttn, yolo_boxes
 from replay import subtitle_yolo_admission as yolo_plan
 from replay import subtitle_yolo_regions as yolo
 from replay.caption_io import FrameObservation, native_ocr_frames
@@ -46,6 +46,7 @@ from replay.subtitle_video_fast import (
     render_refilled_video,
     render_repaired_video_fast,
 )
+from replay.yolo_track import prefetched
 
 MAX_CONFIG_BYTES = 8 * 1024 * 1024
 RENDER_BATCH = 16
@@ -189,6 +190,7 @@ def real_collaborators(
     caption_masks: bool = False,
     yolo_admission: bool = False,
     sttn: subtitle_sttn.Inpainter | None = None,
+    stored_boxes: Sequence[Sequence[yolo.Corners]] | None = None,
 ) -> tuple[runner.Collaborators, dict[str, str]]:
     """Build the planning, rendering and auditing collaborators from one chunk description."""
     source, native = Path(str(config["source"])), Path(str(config["native"]))
@@ -203,7 +205,7 @@ def real_collaborators(
     radius = int(str(config.get("radius", 6)))
     workers = int(str(config.get("workers", 2)))
 
-    if (caption_masks or yolo_admission) and caption_detector is None:
+    if (caption_masks or yolo_admission) and caption_detector is None and stored_boxes is None:
         raise ValueError("YOLO repair masks and admission need the YOLO caption detector")
     planned_boxes: list[list[yolo.Corners]] = []
     extra: dict[int, list[colour.Box]] = {}
@@ -219,12 +221,21 @@ def real_collaborators(
                 extra.setdefault(index, []).append(box)
 
     def regions() -> list[Region | None]:
+        if stored_boxes is not None:
+            # yolo-track's pass already detected these frames (the same boxes as below).
+            planned_boxes[:] = [list(frame) for frame in stored_boxes]
+            return yolo.yolo_regions(planned_boxes, canvas=canvas, envelope=envelope)
         if caption_detector is None:
             return chunk.detector_regions(
                 source, clock, canvas=canvas, envelope=envelope, network=network
             )
-        frames = yolo.chunk_frames(
-            source, clock, canvas=canvas, ffmpeg=str(config.get("ffmpeg", "ffmpeg"))
+        # Decoding runs one batch ahead in a thread so it overlaps detection (900 frames: 2.7 s
+        # -> 2.0 s); a deeper buffer only holds more 2 MiB frames since decoding is the faster.
+        frames = prefetched(
+            yolo.chunk_frames(
+                source, clock, canvas=canvas, ffmpeg=str(config.get("ffmpeg", "ffmpeg"))
+            ),
+            depth=yolo.BATCH,
         )
         planned_boxes[:] = yolo.chunk_boxes(
             frames, caption_detector, count=len(clock.pts), scale=yolo.canvas_scale(canvas)
@@ -434,6 +445,20 @@ def real_collaborators(
     return runner.Collaborators(plan, render_attempt, audit, gate, coloured, residual), pins
 
 
+def stored_boxes(
+    config: Mapping[str, object], settings: yolo.YoloSettings
+) -> yolo_boxes.Boxes | None:
+    """yolo-track's boxes of this chunk when the configuration names them and all are present."""
+    if "yoloBoxes" not in config:
+        return None
+    clock = _clock(config["clock"])
+    return yolo_boxes.load(
+        Path(str(config["yoloBoxes"])), clock.pts, time_base=clock.time_base,
+        source_sha256=str(config["sourceSHA256"]), weights_sha256=settings.sha256,
+        imgsz=settings.imgsz,
+    )  # fmt: skip
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
@@ -447,10 +472,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     region_pins: dict[str, str] = {}
     caption_detector: yolo.Detector | None = None
     caption_masks = yolo_admission = False
+    stored: yolo_boxes.Boxes | None = None
     if "regionDetector" in config:
         settings = yolo.settings_from(config["regionDetector"])
-        caption_detector = yolo.load_detector(settings)
+        stored = stored_boxes(config, settings)
+        # Stored boxes need no detector: its model load is skipped too.
+        caption_detector = None if stored is not None else yolo.load_detector(settings)
         caption_masks, yolo_admission = settings.masks, settings.admission
+        print(f"YOLO_BOXES {'stored' if stored is not None else 'detected'}", flush=True)
         masks = (":masks" if settings.masks else "") + (":admission" if settings.admission else "")
         region_pins = {"regionDetector": f"yolo:{settings.sha256}:{settings.imgsz}{masks}"}
     sttn_pins: dict[str, str] = {}
@@ -475,6 +504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         caption_masks=caption_masks,
         yolo_admission=yolo_admission,
         sttn=painter,
+        stored_boxes=stored,
     )
     receipt = runner.run(
         Path(str(config["output"])),
