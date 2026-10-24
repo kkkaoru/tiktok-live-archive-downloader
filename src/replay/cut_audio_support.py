@@ -36,8 +36,17 @@ class SupportIntersection:
 
 
 def _protect_labels(
-    removed: tuple[tuple[int, int], ...], labels: tuple[ClockLabel, ...], fps: int
+    removed: tuple[tuple[int, int], ...],
+    labels: tuple[ClockLabel, ...],
+    fps: int,
+    support: tuple[Fraction, Fraction],
 ) -> None:
+    """Reject every label in a removed frame, except speech wholly inside decoded audio.
+
+    Trimming to whole frames removes the partial frame at each end of the decoded audio. An
+    interval label inside the audio may start (or end) in that frame; the shared token
+    projection keeps it and clamps it to the retained cut. Points are never exempt.
+    """
     ends = tuple(Fraction(end, fps) for _, end in removed)
     for label in labels:
         start, end = Fraction(str(label.start)), Fraction(str(label.end))
@@ -46,7 +55,8 @@ def _protect_labels(
             continue
         low, high = (Fraction(value, fps) for value in removed[index])
         point_removed = start == end and low <= start < high
-        if point_removed or (start < high and end > low):
+        supported = start < end and support[0] <= start and end <= support[1]
+        if point_removed or (start < high and end > low and not supported):
             raise ReplayError("Audio-support trimming intersects recognized speech or a point")
 
 
@@ -67,10 +77,11 @@ def intersect(
         raise ReplayError("Invalid integral video frame rate")
     if not 1 <= len(cuts) <= MAX_CUTS or len(labels) > MAX_LABELS:
         raise ReplayError("Audio-support intersection exceeds its input budget")
-    first = ceil(clock.pts[0] * clock.time_base * fps)
-    end = floor(
-        (clock.pts[-1] * clock.time_base + Fraction(clock.samples[-1], clock.sample_rate)) * fps
+    audio = (
+        clock.pts[0] * clock.time_base,
+        clock.pts[-1] * clock.time_base + Fraction(clock.samples[-1], clock.sample_rate),
     )
+    first, end = ceil(audio[0] * fps), floor(audio[1] * fps)
     if first >= end:
         raise ReplayError("No complete video frame lies inside decoded audio support")
     result: list[CutSpan] = []
@@ -95,7 +106,7 @@ def intersect(
             removed.append((high, cut.source_end_frame))
         result.append(CutSpan(low, high, new_offset))
         new_offset += high - low
-    _protect_labels(tuple(removed), labels, fps)
+    _protect_labels(tuple(removed), labels, fps, audio)
     if not result:
         raise ReplayError("Audio-support intersection removes every retained cut")
     return SupportIntersection(tuple(result), tuple(removed), first, end)

@@ -253,3 +253,15 @@ def test_paths_and_external_json_are_not_trusted(config: Path, tmp_path: Path) -
 def test_malformed_cuts(rows: object) -> None:
     with pytest.raises(ReplayError):
         _cuts({"cuts": rows})
+
+
+def test_speech_inside_decoded_audio_may_start_in_the_trimmed_partial_frame() -> None:
+    # 10/6 (2026-10-22): audio from 0.901 s, first whole frame 28 (0.9333 s), speech at 0.931 s.
+    clock = AudioFrameClock((7208,), (65536,), 8000, Fraction(1, 8000))
+    result = intersect(
+        (CutSpan(0, 300, 0),), (ClockLabel("開始", 0.931, 1.354, "a"),), clock, fps=30
+    )
+    assert result.removed == ((0, 28), (272, 300))
+    assert result.cuts == (CutSpan(28, 272, 0),)
+    with pytest.raises(ReplayError, match="recognized"):
+        intersect((CutSpan(0, 300, 0),), (ClockLabel("点", 0.931, 0.931, "b"),), clock, fps=30)

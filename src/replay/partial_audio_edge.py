@@ -97,7 +97,7 @@ def plan(
     start = clock.pts[0] * clock.time_base
     end = clock.pts[-1] * clock.time_base + Fraction(clock.samples[-1], clock.sample_rate)
     retained, removed = _retained(cuts, first=floor(start * fps), end=ceil(end * fps))
-    _protect_labels(removed, labels, fps)
+    _protect_labels(removed, labels, fps, (start, end))
     ends = tuple(Fraction(c.source_end_frame, fps) for c in retained)
     for label in labels:
         label_start, label_end = Fraction(str(label.start)), Fraction(str(label.end))
