@@ -19,6 +19,9 @@ let package = Package(
     ),
     .executableTarget(name: "font-identity-probe", path: "Sources/FontIdentityProbe"),
     .testTarget(name: "FontIdentityProbeTests", dependencies: ["font-identity-probe"]),
+    .executableTarget(
+      name: "caption-alpha-render", dependencies: ["ProAppsCore"],
+      path: "Sources/CaptionAlphaRender"),
     .executableTarget(name: "audio-clock-probe", path: "Sources/AudioClockProbe"),
     .testTarget(name: "AudioClockProbeTests", dependencies: ["audio-clock-probe"]),
     .executableTarget(

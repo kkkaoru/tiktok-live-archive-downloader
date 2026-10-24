@@ -63,3 +63,12 @@ fixture use. This does not certify editor integration or any private recording.
 An earlier periodic checkerboard did not sustain native tracking and failed the
 unchanged tracking-method assertion. It was retained as private failure evidence,
 not adopted as this fixture. No confidence or frame assertions were relaxed.
+
+## Motion caption part
+
+`motion-caption-part.moti` is a finished two-title caption part built from synthetic text
+("テスト\nです" revealed by synthetic speech tokens, then "はい") with the repository's
+caption tools exactly as `replay.caption_parts` runs them: `replay.motion_reveal_stages`
+on the production caption template, then `replay.motion_finish` with the production style-20
+arguments. It holds no user media or transcript. `MotionCaptionDocumentTests` read it and
+mutate copies in memory to check every refusal of the native document reader.
