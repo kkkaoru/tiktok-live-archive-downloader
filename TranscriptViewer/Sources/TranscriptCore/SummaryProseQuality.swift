@@ -2,16 +2,38 @@ import Foundation
 
 /// Conservative surface checks, not a semantic entailment or factuality proof.
 public enum SummaryProseQuality {
-    /// Drops a sentence (with its terminator) whose exact text already appeared. Nothing is
-    /// reworded or added; the repetition check below still applies to what remains.
+    /// Drops a sentence (with its terminator) whose exact text already appeared, and then a
+    /// 、-clause that exactly repeats an earlier one, as in on-device generation loops.
+    /// Nothing is reworded or added; the repetition check below still applies to what remains.
     public static func removingRepeatedSentences(_ text: String) -> String {
+        let separators = CharacterSet(charactersIn: "。！？、\n").union(.whitespacesAndNewlines)
         var seen: Set<String> = []
+        var clauses: Set<String> = []
         var result = ""
         var sentence = ""
         func flush() {
-            let core = sentence.trimmingCharacters(
-                in: CharacterSet(charactersIn: "。！？\n").union(.whitespacesAndNewlines))
-            if core.count < 12 || seen.insert(core).inserted { result += sentence }
+            let core = sentence.trimmingCharacters(in: separators)
+            if core.count >= 12, !seen.insert(core).inserted {
+                sentence = ""
+                return
+            }
+            var clause = ""
+            func keep() {
+                let key = clause.trimmingCharacters(in: separators)
+                if key.count < 12 || clauses.insert(key).inserted {
+                    result += clause
+                } else if let end = clause.last, "。！？\n".contains(end) {
+                    // Keep the sentence boundary of a dropped final clause.
+                    if result.hasSuffix("、") { result.removeLast() }
+                    result.append(end)
+                }
+                clause = ""
+            }
+            for character in sentence {
+                clause.append(character)
+                if character == "、" { keep() }
+            }
+            keep()
             sentence = ""
         }
         for character in text {

@@ -50,7 +50,8 @@ public actor AppleSummaryService {
             for waiter in waiters.values { waiter.finish() }
             waiters.removeAll()
         }
-        if !force, starts.isEmpty, let store, let result = try await store.load(video: video) {
+        if !force, starts.isEmpty, let store, let result = try await store.loadIfClean(video: video)
+        {
             cache[video.id] = Cached(transcript: video.summary, result: result)
             return result
         }
@@ -82,7 +83,9 @@ public actor AppleSummaryService {
         progress: @Sendable (Int, Int) async -> Void
     ) async throws -> NarrativeSummary {
         // Another process may have completed between the initial read and lock acquisition.
-        if !force, starts.isEmpty, let store, let result = try await store.load(video: video) {
+        if !force, starts.isEmpty, let store,
+            let result = try await store.loadCleaning(video: video)
+        {
             return result
         }
         let previous: NarrativeSummary?

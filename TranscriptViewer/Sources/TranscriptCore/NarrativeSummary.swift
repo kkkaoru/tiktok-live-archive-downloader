@@ -206,8 +206,9 @@ public struct NarrativeSummaryGenerator: Sendable {
             await progress(sections.count, transcript.sections.count)
             if let previous, !starts.contains(section.startSeconds) {
                 let retained = previous.sections[sections.count]
-                _ = try Self.validateResponse(retained.text)
-                sections.append(retained)
+                // Validation also drops repeated sentences that an older record still holds.
+                sections.append(
+                    .init(source: retained.source, text: try Self.validateResponse(retained.text)))
                 continue
             }
             let source = try await condense(section.text, sectionStartSeconds: section.startSeconds)

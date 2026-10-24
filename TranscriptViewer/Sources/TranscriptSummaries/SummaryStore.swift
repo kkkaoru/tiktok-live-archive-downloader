@@ -53,6 +53,29 @@ public struct SummaryStore: Sendable {
     public func load(video: VideoTranscript, repairing starts: Set<Double> = []) async throws
         -> NarrativeSummary?
     {
+        try await loadRecord(video: video, repairing: starts)?.summary
+    }
+
+    /// A reusable saved result; when validation removed text from it (sentence loops kept by an
+    /// older pipeline), the cleaned result is saved through `save` so readers of the file
+    /// (the web viewer's catalog build) get it too. Removal only: nothing is regenerated.
+    public func loadCleaning(video: VideoTranscript) async throws -> NarrativeSummary? {
+        guard let loaded = try await loadRecord(video: video, repairing: []) else { return nil }
+        if loaded.changed { try await save(loaded.summary, video: video) }
+        return loaded.summary
+    }
+
+    /// A saved result that needs no cleaning; nil also when `loadCleaning` would rewrite it,
+    /// so callers clean it only under the generation lease.
+    public func loadIfClean(video: VideoTranscript) async throws -> NarrativeSummary? {
+        guard let loaded = try await loadRecord(video: video, repairing: []), !loaded.changed
+        else { return nil }
+        return loaded.summary
+    }
+
+    private func loadRecord(video: VideoTranscript, repairing starts: Set<Double>) async throws
+        -> (summary: NarrativeSummary, changed: Bool)?
+    {
         try await Self.io {
             let directory = directory(for: video)
             guard FileManager.default.fileExists(atPath: directory.path) else { return nil }
@@ -82,11 +105,15 @@ public struct SummaryStore: Sendable {
                         ? saved.text : try NarrativeSummaryGenerator.validateResponse(saved.text)
                 )
             }
-            return NarrativeSummary(
+            let summary = NarrativeSummary(
                 overview: starts.isEmpty
                     ? try NarrativeSummaryGenerator.validateResponse(record.overview)
                     : record.overview,
                 sections: sections)
+            let changed =
+                summary.overview != record.overview
+                || zip(summary.sections, record.sections).contains { $0.text != $1.text }
+            return (summary, changed)
         }
     }
 
