@@ -217,3 +217,18 @@ def test_cli_reports_a_refused_input(tmp_path: Path, capsys: pytest.CaptureFixtu
     candidate.write_text("[]", encoding="utf-8")
     code = hallucination.main([str(candidate), str(wav), str(tmp_path / "out.json")])
     assert (code, "ASR_HALLUCINATION_ERROR" in capsys.readouterr().err) == (1, True)
+
+
+def test_a_stock_phrase_whose_last_word_carries_punctuation_is_removed(tmp_path: Path) -> None:
+    wav = _write_wav(tmp_path / "a.wav", _voiced(200.0))
+    labels = [
+        _label("これ音", 9.0, 9.9),
+        _label("ご", 10.0, 10.2),
+        _label("視", 10.2, 10.3),
+        _label("聴", 10.3, 10.6),
+        _label("ありがとうございました。", 10.6, 11.4),
+        _label("もうちょっと", 14.0, 14.6),
+    ]
+    kept, removals = hallucination.filter_labels(labels, hallucination.measure(wav))
+    assert [item.text for item in kept] == ["これ音", "もうちょっと"]
+    assert (removals[0].text, removals[0].indices) == ("ご視聴ありがとうございました", (1, 2, 3, 4))

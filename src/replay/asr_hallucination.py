@@ -45,6 +45,9 @@ SILENT_ACTIVITY = 0.0
 ALIGNMENT_TOLERANCE_SECONDS = 1.0
 CLOSING_WINDOW_SECONDS = 90.0
 CLOSING_MIN_ACTIVITY = 0.5
+# Whisper attaches punctuation to the last word (ありがとうございました。); a label is matched by
+# its text without it, so the closing mark does not shield a stock phrase.
+PUNCTUATION = "。、，,．.！!？?…・ 　"
 STOCK_PHRASES: tuple[str, ...] = (
     "ご視聴ありがとうございました",
     "ご視聴ありがとうございます",
@@ -105,13 +108,15 @@ def measure(wav: Path) -> Envelope:
 
 
 def _stock_runs(labels: Sequence[Label]) -> list[tuple[str, tuple[int, ...]]]:
-    """Runs of labels that spell a stock phrase exactly; boundary-straddling labels are kept."""
-    text = "".join(label.text for label in labels)
+    """Runs of labels that spell a stock phrase exactly, punctuation aside; boundary-straddling
+    labels are kept."""
+    spelled = [label.text.strip(PUNCTUATION) for label in labels]
+    text = "".join(spelled)
     offsets: list[int] = []
     position = 0
-    for label in labels:
+    for word in spelled:
         offsets.append(position)
-        position += len(label.text)
+        position += len(word)
     runs: list[tuple[str, tuple[int, ...]]] = []
     taken: set[int] = set()
     for phrase in sorted(STOCK_PHRASES, key=len, reverse=True):
@@ -119,12 +124,12 @@ def _stock_runs(labels: Sequence[Label]) -> list[tuple[str, tuple[int, ...]]]:
         while found != -1:
             inside = tuple(
                 index
-                for index, label in enumerate(labels)
-                if label.text
+                for index, word in enumerate(spelled)
+                if word
                 and offsets[index] >= found
-                and offsets[index] + len(label.text) <= found + len(phrase)
+                and offsets[index] + len(word) <= found + len(phrase)
             )
-            covered = sum(len(labels[index].text) for index in inside)
+            covered = sum(len(spelled[index]) for index in inside)
             if covered == len(phrase) and taken.isdisjoint(inside):
                 runs.append((phrase, inside))
                 taken.update(inside)
