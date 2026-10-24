@@ -1,6 +1,7 @@
 """Machine-wide GPU leases: flock slots served to one recording at a time, live settings."""
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -49,7 +50,7 @@ def test_invalid_settings_are_rejected(tmp_path: Path) -> None:
 
 def test_unknown_settings_keys_are_rejected(tmp_path: Path) -> None:
     (tmp_path / "settings.json").write_text('{"slots": 2}', "utf-8")
-    with pytest.raises(ValueError, match="only capacity and priority"):
+    with pytest.raises(ValueError, match="only capacity, priority and manual"):
         gpu_lease.settings(tmp_path)
 
 
@@ -180,3 +181,71 @@ def test_the_root_is_the_checkouts_whatever_the_working_directory(
     checkout = Path(gpu_lease.__file__).resolve().parents[2]
     monkeypatch.chdir(tmp_path)
     assert gpu_lease.root() == checkout / "edits/work/gpu-leases"
+
+
+def test_newest_first_mirrors_broadcast_times() -> None:
+    assert gpu_lease.newest_first(1792575000000000000) == 1207425000000000000
+    with pytest.raises(ValueError, match="before 2065"):
+        gpu_lease.newest_first(0)
+
+
+def test_a_later_recording_takes_a_lease_beyond_the_earlier_ones_waiters(tmp_path: Path) -> None:
+    (tmp_path / "settings.json").write_text('{"capacity": 3}', "utf-8")
+    busy = gpu_lease.Waiter(tmp_path, "1", start=1).try_acquire()
+    assert busy is not None
+    early = holder(tmp_path, "1", 1)  # holds the second lease
+    full = holder(tmp_path, "1", 1)  # holds the third lease
+    waiting = holder(tmp_path, "1", 1)  # the earlier recording now waits
+    gpu_lease.release(busy)
+    owed = gpu_lease.Waiter(tmp_path, "2", start=2)
+    assert owed.try_acquire() is None  # the one free lease is the earlier waiter's
+    owed.close()
+    full.kill()
+    full.wait()
+    later = gpu_lease.Waiter(tmp_path, "2", start=2).try_acquire()
+    assert later is not None  # two free, one waiter ahead: one is left idle otherwise
+    waiting.kill()
+    waiting.wait()
+    early.kill()
+    early.wait()
+    gpu_lease.release(later)
+
+
+def test_holders_log_every_acquire_and_release_with_the_step(tmp_path: Path) -> None:
+    with gpu_lease.lease(tmp_path, "7", step="compose"):
+        pass
+    rows = [json.loads(line) for line in (tmp_path / "holders.jsonl").read_text().splitlines()]
+    assert [(row["event"], row["recording"], row["step"]) for row in rows] == [
+        ("acquire", "7", "compose"),
+        ("release", "7", "compose"),
+    ]
+    assert rows[0]["waitedSeconds"] >= 0
+    assert rows[1]["heldSeconds"] >= 0
+    assert rows[0]["pid"] == rows[1]["pid"]
+
+
+def test_releasing_an_unlogged_descriptor_writes_no_holder_line(tmp_path: Path) -> None:
+    descriptor = os.open(tmp_path / "other.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    gpu_lease.release(descriptor)
+    assert not (tmp_path / "holders.jsonl").exists()
+
+
+def test_an_unwritable_holder_log_neither_blocks_nor_leaks_the_lease(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "settings.json").write_text('{"capacity": 1}', "utf-8")
+    (tmp_path / "holders.jsonl").mkdir()
+    with gpu_lease.lease(tmp_path, "7", step="compose"):
+        pass
+    again = gpu_lease.Waiter(tmp_path, "7", start=1).try_acquire()
+    assert again is not None
+    gpu_lease.release(again)
+    assert capsys.readouterr().err.count("GPU lease holder log not written") == 4
+
+
+def test_a_manual_flag_is_accepted_and_must_be_a_boolean(tmp_path: Path) -> None:
+    (tmp_path / "settings.json").write_text('{"priority": ["9"], "manual": true}', "utf-8")
+    assert gpu_lease.settings(tmp_path) == (4, ("9",))
+    (tmp_path / "settings.json").write_text('{"manual": "yes"}', "utf-8")
+    with pytest.raises(ValueError, match="manual must be true or false"):
+        gpu_lease.settings(tmp_path)
