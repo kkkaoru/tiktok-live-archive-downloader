@@ -79,6 +79,18 @@ bun run debug /api/me       # 管理者の読み取り専用セッションで�
 
 設定は `sync.config.json`（Git管理外。`sync.config.example.json` が雛形）で、配信者名・
 ライブラリのルート・バケット名を指定します。同期ではWorker本体を再デプロイしません。
+YouTube動画の配信者ラベルはCloudflare上（R2 `config/youtube-channels.json`、Worker の
+`/api/channels.json`）の「チャンネルID → ラベル」で決まり、Web版とMac版TranscriptViewerが同じものを
+読みます。カタログには元動画の隣の `channel.json` から各動画の `channelId` だけを載せます（ダウンロード時に
+作成。既存の元動画は `uv run python -m replay.youtube_delivery channel <元動画ディレクトリ> [BROWSER]`
+で補完）。ラベルの変更はリポジトリ直下で
+`uv run python -m replay.youtube_channels list | set <チャンネルID> <ラベル> | remove <チャンネルID>`
+（CLIPS_API_TOKEN のBearer。書き込みはBearerのみ、読み取りはログイン中の閲覧者と共有リンクの当該動画分）。
+読み取りは許可リストと同じ多段キャッシュ: Workerのメモリ（30秒）→ Cache API（60秒・データセンター単位）→
+KV（`ALLOW_KV`、キー `youtube-channels`、cacheTtl 30秒）→ R2（正本）。書き込みは R2 → KV → Cache API上書き →
+そのisolateのメモリの順で、同じデータセンターの他isolateは30秒以内、他のデータセンターは最長約3分で反映されます。
+記録の `revision`（ETag `"r<n>"`）は書き込みごとに増えます。
+対応がない・`channel.json` がない動画は `streamer` になり、後者はカタログの `issues` に記録されます。
 
 ## 盛り上がり
 

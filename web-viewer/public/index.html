@@ -17,6 +17,8 @@ window.__api = (location.pathname.match(/^\/s\/[A-Za-z0-9_-]+/) || [""])[0];
 // Set before first paint so list-page text never flashes on a share link.
 if (window.__api) document.documentElement.dataset.share = "";
 window.__catalog = fetch(window.__api + "/api/catalog", { cache: "no-cache" }).then(r => r.json());  // always revalidate: syncs replace it
+// YouTube channel → streamer label (shared with the Mac viewer); unreadable means default labels.
+window.__channels = fetch(window.__api + "/api/channels.json", { cache: "no-cache" }).then(r => r.ok ? r.json() : {}).then(c => c.channels || {}, () => ({}));
 </script>
 <style>
   :root { color-scheme: dark; --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --line:#2a2f3a; --text:#e8eaed; --muted:#9aa3b2; --accent:#6ea8ff; --accent-bg:#1f3a63; --on-accent:#fff; --bar:#4a5468; --playhead:#fff; --radius:10px;
@@ -298,7 +300,7 @@ async function getData(id) {
   if (!state.data.has(id)) state.data.set(id, fetch(`${API}/api/videos/${id}.json`, { cache: "no-cache" }).then(r => r.json()));
   return state.data.get(id);
 }
-const streamerOf = v => v.streamer;
+const streamerOf = v => state.channels[v.channelId]?.label ?? v.streamer;
 const videosOf = name => state.videos.filter(v => streamerOf(v) === name);
 const dateOf = v => (v.broadcastStartJST ?? "").slice(0, 10);
 const inDate = v => !state.date || dateOf(v) === state.date;
@@ -773,7 +775,7 @@ function route() {
   if (SHARE) {
     const v = state.videos[0];
     document.body.dataset.page = "videos"; document.body.dataset.view = "player";
-    document.title = `${v.broadcastStartJST ?? ""} ${v.streamer}`;
+    document.title = `${v.broadcastStartJST ?? ""} ${streamerOf(v)}`;
     $("#q").placeholder = "文字起こし・要約を検索（この動画）";
     select(v); return;
   }
@@ -914,7 +916,7 @@ $("#shareForm").onsubmit = async e => {
     $("#shareMsg").textContent = `発行しました: ${shareUrl(share)}`; loadShares();
   } catch (err) { $("#shareMsg").textContent = err.message; }
 };
-window.__catalog.then(c => { state.videos = c.videos; route(); });
+Promise.all([window.__catalog, window.__channels]).then(([c, channels]) => { state.videos = c.videos; state.channels = channels; route(); });
 </script>
 </body>
 </html>
