@@ -66,12 +66,15 @@ def _video_id(entry: dict[str, object]) -> str:
     return value
 
 
-def merge_summaries(web_dir: Path, *, include_unchanged: bool = False) -> list[str]:
+def merge_summaries(
+    web_dir: Path, *, include_unchanged: bool = False, write: bool = True
+) -> list[str]:
     """Copy saved summaries into the viewer data; return the ids to publish.
 
     Only changed videos are returned unless ``include_unchanged`` is set, which also
     returns videos whose local data already carries the saved summary (for example after
-    the catalog was rebuilt locally but never uploaded).
+    the catalog was rebuilt locally but never uploaded). Without ``write`` nothing is changed
+    (a dry run), so a later real run still finds and uploads the same videos.
     """
     catalog_path = web_dir / "data" / CATALOG_KEY
     catalog = record(json.loads(catalog_path.read_text(encoding="utf-8")))
@@ -92,11 +95,13 @@ def merge_summaries(web_dir: Path, *, include_unchanged: bool = False) -> list[s
             if include_unchanged:
                 changed.append(video_id)
             continue
+        changed.append(video_id)
+        if not write:
+            continue
         data["summary"] = summary
         entry["hasSummary"] = True
         write_private_text(data_path, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
-        changed.append(video_id)
-    if changed:
+    if changed and write:
         write_private_text(catalog_path, json.dumps(catalog, ensure_ascii=False, indent=1))
     return changed
 
@@ -125,7 +130,7 @@ def main(argv: Sequence[str] | None = None, runner: Runner = _run) -> int:
         "--all", action="store_true", help="also publish videos whose local data is current"
     )
     args = parser.parse_args(argv)
-    changed = merge_summaries(args.web_dir, include_unchanged=args.all)
+    changed = merge_summaries(args.web_dir, include_unchanged=args.all, write=not args.dry_run)
     print(f"summaries merged: {len(changed)}")
     if args.dry_run or not changed:
         return 0

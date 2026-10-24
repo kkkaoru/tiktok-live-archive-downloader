@@ -200,8 +200,13 @@ def test_main_dry_run_merges_without_uploading(tmp_path: Path) -> None:
         calls.append(argv)
         return 0
 
+    before = {path.name: path.read_bytes() for path in (web / "data").iterdir()}
     assert main(["--web-dir", str(web), "--bucket", "b", "--dry-run"], runner) == 0
     assert calls == []
+    # A dry run changes nothing, so the real run still uploads the same video.
+    assert {path.name: path.read_bytes() for path in (web / "data").iterdir()} == before
+    assert main(["--web-dir", str(web), "--bucket", "b"], runner) == 0
+    assert len(calls) == 2
 
 
 def test_main_uploads_changed_objects(tmp_path: Path) -> None:
