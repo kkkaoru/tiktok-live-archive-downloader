@@ -4,7 +4,8 @@ The generic form of the per-recording ``prepare_parts.py``:
 
 - the cues are split into windows of at most ``MAX_SECONDS`` at whole frames inside gaps of at
   least ``MIN_GAP`` seconds; no cue crosses a window boundary;
-- per window ``replay.motion_measured`` exports the part plans, then per part
+- per window ``replay.motion_measured`` exports the part plans (one part per window unless it
+  holds more than ``MAX_PART_SENTENCES`` stages), then per part
   ``replay.motion_reveal_stages`` (template) and ``replay.motion_finish`` (style settings) write the
   finished ``.moti``;
 - ``jobs.json`` lists one Compressor job per part, rendering into ``<render root>/<part>/``.
@@ -22,11 +23,14 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
+from replay.caption_palette import Palette, restamp, validated
 from replay.core import ReplayError
+from replay.motion_caption import MAX_PART_SENTENCES
 from replay.recordings import record
 
 RATE = 30
@@ -37,6 +41,8 @@ EXPECTED_TEXT = "Title"
 RENDER_NAME = "compressor-batch-v1/motion-alpha.mov"
 
 Run = Callable[[Sequence[str]], None]
+# Windows are independent and each runs its producers one after another, so several run at once.
+WINDOW_WORKERS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +148,8 @@ def export_plans(window: Window, path: Path, plans: Path, run: Run) -> list[dict
         run(
             module("motion_measured", str(path), str(plans), "--sha256", sha256(path),
                    "--width", str(WIDTH), "--height", str(HEIGHT), "--rate", str(RATE),
-                   "--frames", str(window.end - window.start), "--expected-text", EXPECTED_TEXT)
+                   "--frames", str(window.end - window.start), "--expected-text", EXPECTED_TEXT,
+                   "--max-stages", str(MAX_PART_SENTENCES))
         )  # fmt: skip
     listed = record(json.loads(manifest.read_text("utf-8"))).get("parts")
     if not isinstance(listed, list):
@@ -151,14 +158,43 @@ def export_plans(window: Window, path: Path, plans: Path, run: Run) -> list[dict
 
 
 def finished_part(
-    two: Path, final: Path, plan: Path, *, template: Path, finish: Sequence[str], run: Run
+    two: Path,
+    final: Path,
+    plan: Path,
+    *,
+    template: Path,
+    finish: Sequence[str],
+    run: Run,
+    palette: Palette | None = None,
+    tokens: Path | None = None,
+    offset: int = 0,
 ) -> None:
-    """Write the staged and the finished ``.moti`` unless the finished one exists."""
+    """Write the staged and the finished ``.moti`` unless the finished one exists.
+
+    With speech `tokens` the reveal follows the spoken onsets, `offset` being the part's first
+    frame on their clock, and the part's grapheme onset frames are recorded beside it.
+    With a recording `palette` the finished part is written beside, restamped with the colour
+    intent it renders, and only then given its final name.
+    """
     if final.exists():
         return
     two.unlink(missing_ok=True)
-    run(module("motion_reveal_stages", str(template), str(plan), str(two)))
-    run(module("motion_finish", str(two), str(final), *finish))
+    timing: list[str] = []
+    if tokens is not None:
+        reveal = final.with_name(f"{final.stem}.reveal.json")
+        reveal.unlink(missing_ok=True)
+        timing = ["--tokens", str(tokens), "--offset-frame", str(offset), "--record", str(reveal)]
+    run(module("motion_reveal_stages", str(template), str(plan), str(two), *timing))
+    if palette is None:
+        run(module("motion_finish", str(two), str(final), *finish))
+    else:
+        unstamped = final.with_name(f"{final.stem}.unstamped.moti")
+        unstamped.unlink(missing_ok=True)
+        run(module("motion_finish", str(two), str(unstamped), *finish))
+        text = restamp(unstamped.read_text(encoding="utf-8"), palette)
+        write_once(final, text)
+        unstamped.unlink()
+    two.unlink()  # the staged part; nothing reads it once the finished one exists
 
 
 def prepare(
@@ -170,6 +206,8 @@ def prepare(
     finish: Sequence[str],
     preset: Path,
     run: Run = run_checked,
+    palette: Palette | None = None,
+    tokens: Path | None = None,
 ) -> Path:
     """Write every window, plan, finished part, ``parts.json`` and ``jobs.json``."""
     document = record(json.loads(candidate.read_text(encoding="utf-8")))
@@ -179,30 +217,38 @@ def prepare(
     cues = [record(cue) for cue in listed]
     for directory in (output / "windows", output / "moti", render_root):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    parts: list[dict[str, object]] = []
-    for window in windows(cues):
+
+    def window_parts(window: Window) -> list[dict[str, object]]:
         path = output / "windows" / f"candidate-w{window.index:03d}.json"
         write_once(path, json.dumps(shifted(document, window), ensure_ascii=False))
         plans = output / f"plans-w{window.index:03d}"
+        found: list[dict[str, object]] = []
         for index, item in enumerate(export_plans(window, path, plans, run)):
             name = f"w{window.index:03d}-part-{index:04d}"
             final = output / "moti" / f"{name}.moti"
+            offset = window.start + int(str(item["offsetFrame"]))
             finished_part(
                 output / "moti" / f"{name}.two-layer.moti", final,
                 plans / f"part-{index:04d}.json", template=template, finish=finish, run=run,
+                palette=palette, tokens=tokens, offset=offset,
             )  # fmt: skip
             (render_root / name).mkdir(mode=0o700, exist_ok=True)
-            parts.append(
+            found.append(
                 {
                     "name": name,
                     "window": window.index,
-                    "offsetFrame": window.start + int(str(item["offsetFrame"])),
+                    "offsetFrame": offset,
                     "frames": int(str(item["frames"])),
                     "stages": item["stages"],
                     "moti": str(final),
                     "renderDir": str(render_root / name),
                 }
             )
+        return found
+
+    # map keeps window order, so parts.json and jobs.json match a serial run.
+    with ThreadPoolExecutor(max_workers=WINDOW_WORKERS) as pool:
+        parts = [part for found in pool.map(window_parts, windows(cues)) for part in found]
     write_once(output / "parts.json", json.dumps(parts, indent=1) + "\n")
     jobs = [
         {
@@ -224,6 +270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("render_root", type=Path)
     parser.add_argument("--template", type=Path, required=True)
     parser.add_argument("--preset", type=Path, required=True)
+    parser.add_argument("--palette", nargs=2, metavar=("TOP", "BOTTOM"))
+    parser.add_argument("--tokens", type=Path, help="speech tokens timing the caption reveal")
     arguments = list(sys.argv[1:] if argv is None else argv)
     split = arguments.index("--") if "--" in arguments else len(arguments)
     args = parser.parse_args(arguments[:split])
@@ -231,7 +279,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         prepare(
             args.candidate, args.output, args.render_root,
-            template=args.template, finish=finish, preset=args.preset,
+            template=args.template, finish=finish, preset=args.preset, tokens=args.tokens,
+            palette=None if args.palette is None else validated(
+                {"gradientTop": args.palette[0], "gradientBottom": args.palette[1]}
+            ),
         )
     )  # fmt: skip
     return 0

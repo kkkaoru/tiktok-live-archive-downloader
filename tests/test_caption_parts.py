@@ -2,6 +2,8 @@
 
 import json
 import subprocess
+import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -128,6 +130,62 @@ def test_prepare_writes_parts_and_jobs_and_reuses_them(tmp_path: Path) -> None:
     assert again.modules == []
 
 
+def test_speech_tokens_time_each_parts_reveal_from_its_first_frame(tmp_path: Path) -> None:
+    commands: list[list[str]] = []
+
+    class Recording(Producers):
+        def __call__(self, command: Sequence[str]) -> None:
+            commands.append(list(command))
+            super().__call__(command)
+
+    tokens = tmp_path / "tokens.json"
+    parts.prepare(
+        candidate(tmp_path), tmp_path / "out", tmp_path / "render", template=Path("/t.moti"),
+        finish=[], preset=Path("/p"), run=Recording(), tokens=tokens,
+    )  # fmt: skip
+    reveal = next(command for command in commands if "replay.motion_reveal_stages" in command)
+    record = tmp_path / "out/moti/w000-part-0000.reveal.json"
+    # The window starts on frame 0 and the part 5 frames into it.
+    assert reveal[-6:] == ["--tokens", str(tokens), "--offset-frame", "5", "--record", str(record)]
+
+
+def test_a_palette_restamps_each_finished_part_before_naming_it(tmp_path: Path) -> None:
+    stamped = (
+        '<x><!--replay-caption-colour-v1 {"intent": {"space": "sRGB", "top": [1, 1, 1], '
+        '"bottom": [0, 0, 0]}}--></x>'
+    )
+
+    class Stamping(Producers):
+        def __call__(self, command: Sequence[str]) -> None:
+            super().__call__(command)
+            if command[command.index("-m") + 1] == "replay.motion_finish":
+                Path(command[command.index("-m") + 3]).write_text(stamped, encoding="utf-8")
+
+    green = {"gradientTop": "#B6DF9E", "gradientBottom": "#6DBE3C"}
+    parts.prepare(
+        candidate(tmp_path), tmp_path / "out", tmp_path / "render",
+        template=Path("/t"), finish=[], preset=Path("/p"), run=Stamping(), palette=green,
+    )  # fmt: skip
+    final = (tmp_path / "out/moti/w000-part-0000.moti").read_text(encoding="utf-8")
+    assert '"intentPolicy": "recording-palette"' in final
+    assert sorted(path.name for path in (tmp_path / "out/moti").iterdir()) == [
+        "w000-part-0000.moti"
+    ]
+
+
+def test_a_window_is_exported_with_the_part_stage_limit(tmp_path: Path) -> None:
+    commands: list[Sequence[str]] = []
+    run = Producers()
+
+    def recorded(command: Sequence[str]) -> None:
+        commands.append(command)
+        run(command)
+
+    arguments = (candidate(tmp_path), tmp_path / "out", tmp_path / "render")
+    parts.prepare(*arguments, template=Path("/t"), finish=[], preset=Path("/p"), run=recorded)
+    assert list(commands[0][-2:]) == ["--max-stages", "512"]
+
+
 def test_an_export_cut_short_is_exported_again(tmp_path: Path) -> None:
     (tmp_path / "out/plans-w000").mkdir(parents=True)
     (tmp_path / "out/plans-w000/part-0000.json").write_text("{}", encoding="utf-8")
@@ -175,8 +233,70 @@ def test_the_cli_passes_finish_arguments_after_the_separator(
     assert code == 0
     assert seen["finish"] == ["--font-size", "82"]
     assert capsys.readouterr().out.strip() == str(tmp_path / "parts.json")
+    assert seen["palette"] is None
+    parts.main(
+        ["c.json", "out", "render", "--template", "t.moti", "--preset", "p",
+         "--palette", "#B6DF9E", "#6DBE3C", "--"]
+    )  # fmt: skip
+    assert seen["palette"] == {"gradientTop": "#B6DF9E", "gradientBottom": "#6DBE3C"}
 
 
 def test_the_checked_runner_raises_on_failure() -> None:
     with pytest.raises(subprocess.CalledProcessError):
         parts.run_checked(["false"])
+
+
+def test_windows_run_concurrently_and_keep_their_order(tmp_path: Path) -> None:
+    class Overlapping(Producers):
+        """Earlier windows finish last; counts the exports running at once."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock = threading.Lock()
+            self.running = 0
+            self.peak = 0
+
+        def __call__(self, command: Sequence[str]) -> None:
+            if "replay.motion_measured" in command:
+                with self.lock:
+                    self.running += 1
+                    self.peak = max(self.peak, self.running)
+                window = int(Path(command[command.index("-m") + 2]).stem[-3:])
+                time.sleep(0.05 * (3 - window))
+                with self.lock:
+                    self.running -= 1
+            with self.lock:
+                super().__call__(command)
+
+    path = tmp_path / "candidate.json"
+    cues = [cue(0, 1), cue(120, 121), cue(240, 241), cue(360, 361)]
+    path.write_text(json.dumps({"version": 1, "candidates": cues}), "utf-8")
+    run = Overlapping()
+    result = parts.prepare(
+        path, tmp_path / "out", tmp_path / "render",
+        template=Path("/t.moti"), finish=[], preset=Path("/p"), run=run,
+    )  # fmt: skip
+    listed = json.loads(result.read_text(encoding="utf-8"))
+    assert [part["name"] for part in listed] == [
+        "w000-part-0000",
+        "w001-part-0000",
+        "w002-part-0000",
+        "w003-part-0000",
+    ]
+    assert run.peak > 1
+
+
+def test_a_finished_part_drops_its_staged_file_and_a_resumed_one_is_untouched(
+    tmp_path: Path,
+) -> None:
+    arguments = (candidate(tmp_path), tmp_path / "out", tmp_path / "render")
+    parts.prepare(*arguments, template=Path("/t"), finish=[], preset=Path("/p"), run=Producers())
+    moti = tmp_path / "out/moti"
+    assert sorted(path.name for path in moti.iterdir()) == ["w000-part-0000.moti"]
+    final = moti / "w000-part-0000.moti"
+    before = (final.read_bytes(), final.stat().st_mtime_ns)
+    again = Producers()
+    parts.prepare(*arguments, template=Path("/t"), finish=[], preset=Path("/p"), run=again)
+    assert again.modules == []
+    assert (final.read_bytes(), final.stat().st_mtime_ns) == before
+    assert sorted(path.name for path in moti.iterdir()) == ["w000-part-0000.moti"]
