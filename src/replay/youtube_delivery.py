@@ -13,6 +13,8 @@ from replay.core import ReplayError
 from replay.recordings import record
 
 JST = timezone(timedelta(hours=9))
+# Browsers whose signed-in session yt-dlp may read (members-only videos); never a cookie file.
+BROWSERS = frozenset({"brave", "chrome", "chromium", "edge", "firefox", "safari"})
 
 
 def source_stem(video_id: str, metadata: object) -> str:
@@ -49,8 +51,73 @@ def new_edit_directory(root: Path, *, video_id: str, metadata: object) -> Path:
     return Path(tempfile.mkdtemp(prefix=f"{stem}-edit-", dir=root))
 
 
-def download_original(*, url: str, root: Path, ffmpeg_directory: Path) -> Path:
-    """Lock by stable ID before metadata lookup; never reacquire a legacy original."""
+def _yt_dlp(cookies_from_browser: str | None) -> list[str]:
+    if cookies_from_browser is not None and cookies_from_browser not in BROWSERS:
+        raise ReplayError("Unsupported browser for signed-in YouTube access")
+    common = ["yt-dlp", "--ignore-config", "--js-runtimes", "node", "--no-playlist"]
+    if cookies_from_browser is not None:
+        common += ["--cookies-from-browser", cookies_from_browser]
+    return common
+
+
+def _metadata(common: list[str], url: str) -> object:
+    result = subprocess.run(
+        [*common, "--skip-download", "--dump-single-json", url],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    try:
+        metadata: object = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ReplayError("Invalid YouTube metadata JSON") from error
+    return metadata
+
+
+def channel_record(metadata: object) -> dict[str, object]:
+    data = record(metadata)
+    channel = {key: data.get(key) for key in ("channel_id", "channel", "uploader_id")}
+    if not isinstance(channel["channel_id"], str) or not channel["channel_id"]:
+        raise ReplayError("YouTube metadata has no channel ID")
+    return channel
+
+
+def write_channel(directory: Path, channel: dict[str, object]) -> None:
+    """Record the uploading channel beside the original; never replace a different record."""
+    path = directory / "channel.json"
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8")) != channel:
+            raise ReplayError("channel.json already records a different channel")
+        return
+    with path.open("x", encoding="utf-8") as evidence:
+        json.dump(channel, evidence, ensure_ascii=False)
+
+
+def backfill_channel(directory: Path, *, cookies_from_browser: str | None = None) -> None:
+    """Fetch metadata only for an existing original directory and add its channel.json."""
+    video_id = directory.name.rsplit("_JST_youtube-", 1)[-1]
+    source_stem(video_id, {"id": video_id, "timestamp": 1})
+    if not (directory / "publication.json").is_file():
+        raise ReplayError("Not a YouTube original directory")
+    common = _yt_dlp(cookies_from_browser)
+    with (directory.parent / f".youtube-{video_id}.lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        metadata = _metadata(common, f"https://www.youtube.com/watch?v={video_id}")
+        if source_stem(video_id, metadata) != directory.name:
+            raise ReplayError("YouTube metadata does not match the original directory")
+        write_channel(directory, channel_record(metadata))
+
+
+def download_original(
+    *, url: str, root: Path, ffmpeg_directory: Path, cookies_from_browser: str | None = None
+) -> Path:
+    """Lock by stable ID before metadata lookup; never reacquire a legacy original.
+
+    ``cookies_from_browser`` (an authorized, signed-in browser) lets yt-dlp read that session for
+    a members-only video; the cookies never pass through this process or its arguments.
+    """
+    common = _yt_dlp(cookies_from_browser)
     video_id = url.rsplit("=", 1)[-1]
     if url not in (
         f"https://www.youtube.com/watch?v={video_id}",
@@ -67,19 +134,9 @@ def download_original(*, url: str, root: Path, ffmpeg_directory: Path) -> Path:
             raise ReplayError(
                 "Original already exists; verify or migrate it, do not download again"
             )
-        common = ["yt-dlp", "--ignore-config", "--js-runtimes", "node", "--no-playlist"]
-        result = subprocess.run(
-            [*common, "--skip-download", "--dump-single-json", url],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=120,
-        )
-        try:
-            metadata: object = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise ReplayError("Invalid YouTube metadata JSON") from error
+        metadata = _metadata(common, url)
         stem = source_stem(video_id, metadata)
+        channel = channel_record(metadata)
         directory = root / stem
         directory.mkdir(mode=0o700)
         with (directory / "publication.json").open("x", encoding="utf-8") as evidence:
@@ -87,6 +144,7 @@ def download_original(*, url: str, root: Path, ffmpeg_directory: Path) -> Path:
             json.dump(
                 {key: data.get(key) for key in ("id", "release_timestamp", "timestamp")}, evidence
             )
+        write_channel(directory, channel)
         subprocess.run(
             [
                 *common,
@@ -111,11 +169,25 @@ def download_original(*, url: str, root: Path, ffmpeg_directory: Path) -> Path:
 
 
 def main() -> None:
-    if len(sys.argv) != 4:
-        raise SystemExit("Usage: python -m replay.youtube_delivery URL ROOT FFMPEG_DIRECTORY")
+    if sys.argv[1:2] == ["channel"] and len(sys.argv) in (3, 4):
+        try:
+            backfill_channel(
+                Path(sys.argv[2]), cookies_from_browser=sys.argv[3] if len(sys.argv) == 4 else None
+            )
+        except (ReplayError, OSError, ValueError, subprocess.SubprocessError) as error:
+            raise SystemExit(str(error)) from error
+        return
+    if len(sys.argv) not in (4, 5):
+        raise SystemExit(
+            "Usage: python -m replay.youtube_delivery URL ROOT FFMPEG_DIRECTORY [BROWSER]"
+            " | channel ORIGINAL_DIRECTORY [BROWSER]"
+        )
     try:
         download_original(
-            url=sys.argv[1], root=Path(sys.argv[2]), ffmpeg_directory=Path(sys.argv[3])
+            url=sys.argv[1],
+            root=Path(sys.argv[2]),
+            ffmpeg_directory=Path(sys.argv[3]),
+            cookies_from_browser=sys.argv[4] if len(sys.argv) == 5 else None,
         )
     except (ReplayError, OSError, subprocess.SubprocessError) as error:
         raise SystemExit(str(error)) from error

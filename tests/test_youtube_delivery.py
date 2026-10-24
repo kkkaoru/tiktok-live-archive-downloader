@@ -6,7 +6,25 @@ from pathlib import Path
 import pytest
 
 from replay.core import ReplayError
-from replay.youtube_delivery import download_original, main, new_edit_directory, source_stem
+from replay.youtube_delivery import (
+    backfill_channel,
+    download_original,
+    main,
+    new_edit_directory,
+    source_stem,
+)
+
+METADATA = json.dumps(
+    {
+        "id": "abcdefghijk",
+        "timestamp": 1704067200,
+        "channel_id": "UCxxxxxxxxxxxxxxxxxxxxxx",
+        "channel": "かしすみるく",
+        "uploader_id": "@c",
+    }
+)
+CHANNEL = {"channel_id": "UCxxxxxxxxxxxxxxxxxxxxxx", "channel": "かしすみるく", "uploader_id": "@c"}
+STEM = "2024-01-01_09-00-00_JST_youtube-abcdefghijk"
 
 
 @pytest.mark.parametrize(
@@ -49,7 +67,7 @@ def test_download_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
 
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(args)
-        return subprocess.CompletedProcess(args, 0, '{"id":"abcdefghijk","timestamp":1704067200}')
+        return subprocess.CompletedProcess(args, 0, METADATA)
 
     monkeypatch.setattr(subprocess, "run", run)
     directory = download_original(
@@ -71,6 +89,7 @@ def test_download_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     ]
     assert calls[1][-2] == str(directory / "2024-01-01_09-00-00_JST_youtube-abcdefghijk.%(ext)s")
     assert "--no-overwrites" in calls[1]
+    assert json.loads((directory / "channel.json").read_text(encoding="utf-8")) == CHANNEL
     assert calls[1][calls[1].index("--merge-output-format") + 1] == "mp4"
     assert calls[1][calls[1].index("--remux-video") + 1] == "mp4"
     assert calls[1][calls[1].index("-f") + 1] == ("bv*+ba/b")
@@ -137,9 +156,146 @@ def test_main_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 def test_main_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def download(*, url: str, root: Path, ffmpeg_directory: Path) -> Path:
+    def download(
+        *, url: str, root: Path, ffmpeg_directory: Path, cookies_from_browser: str | None
+    ) -> Path:
+        assert cookies_from_browser is None
         return root
 
     monkeypatch.setattr("replay.youtube_delivery.download_original", download)
     monkeypatch.setattr(sys, "argv", ["youtube_delivery", "url", str(tmp_path), "/ffmpeg"])
     main()
+
+
+def test_signed_in_browser_session_reaches_both_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, METADATA)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    download_original(
+        url="https://www.youtube.com/watch?v=abcdefghijk",
+        root=tmp_path,
+        ffmpeg_directory=Path("/ffmpeg"),
+        cookies_from_browser="chrome",
+    )
+    assert calls[0][5:7] == ["--cookies-from-browser", "chrome"]
+    assert calls[1][5:7] == ["--cookies-from-browser", "chrome"]
+    with pytest.raises(ReplayError, match="browser"):
+        download_original(
+            url="https://www.youtube.com/watch?v=abcdefghijk",
+            root=tmp_path,
+            ffmpeg_directory=Path("/ffmpeg"),
+            cookies_from_browser="cookies.txt",
+        )
+
+
+def test_main_passes_the_browser(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: list[str | None] = []
+
+    def download(
+        *, url: str, root: Path, ffmpeg_directory: Path, cookies_from_browser: str | None
+    ) -> Path:
+        seen.append(cookies_from_browser)
+        return root
+
+    monkeypatch.setattr("replay.youtube_delivery.download_original", download)
+    monkeypatch.setattr(
+        sys, "argv", ["youtube_delivery", "url", str(tmp_path), "/ffmpeg", "chrome"]
+    )
+    main()
+    assert seen == ["chrome"]
+
+
+def _original(tmp_path: Path) -> Path:
+    directory = tmp_path / STEM
+    directory.mkdir()
+    (directory / "publication.json").write_text("{}", encoding="utf-8")
+    return directory
+
+
+def _metadata_only(monkeypatch: pytest.MonkeyPatch, stdout: str = METADATA) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def test_download_without_channel_stops_before_creating_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _metadata_only(monkeypatch, '{"id":"abcdefghijk","timestamp":1704067200}')
+    with pytest.raises(ReplayError, match="channel ID"):
+        download_original(
+            url="https://www.youtube.com/watch?v=abcdefghijk",
+            root=tmp_path,
+            ffmpeg_directory=Path("/ffmpeg"),
+        )
+    assert not (tmp_path / STEM).exists()
+
+
+def test_backfill_fetches_metadata_only_and_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _original(tmp_path)
+    calls = _metadata_only(monkeypatch)
+    backfill_channel(directory, cookies_from_browser="chrome")
+    backfill_channel(directory)
+    assert calls[0] == [
+        "yt-dlp",
+        "--ignore-config",
+        "--js-runtimes",
+        "node",
+        "--no-playlist",
+        "--cookies-from-browser",
+        "chrome",
+        "--skip-download",
+        "--dump-single-json",
+        "https://www.youtube.com/watch?v=abcdefghijk",
+    ]
+    assert len(calls) == 2
+    assert json.loads((directory / "channel.json").read_text(encoding="utf-8")) == CHANNEL
+
+
+def test_backfill_never_replaces_a_different_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _original(tmp_path)
+    (directory / "channel.json").write_text('{"channel_id":"UCother"}', encoding="utf-8")
+    _metadata_only(monkeypatch)
+    with pytest.raises(ReplayError, match="different channel"):
+        backfill_channel(directory)
+    assert (directory / "channel.json").read_text(encoding="utf-8") == '{"channel_id":"UCother"}'
+
+
+def test_backfill_rejects_a_mismatched_or_foreign_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _metadata_only(monkeypatch)
+    with pytest.raises(ReplayError, match="Not a YouTube original"):
+        backfill_channel(tmp_path / STEM)
+    other = tmp_path / "2024-01-02_09-00-00_JST_youtube-abcdefghijk"
+    other.mkdir()
+    (other / "publication.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ReplayError, match="does not match"):
+        backfill_channel(other)
+    assert not (other / "channel.json").exists()
+
+
+def test_main_backfills_a_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    directory = _original(tmp_path)
+    _metadata_only(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["youtube_delivery", "channel", str(directory), "chrome"])
+    main()
+    assert (directory / "channel.json").is_file()
+    monkeypatch.setattr(sys, "argv", ["youtube_delivery", "channel", str(tmp_path / "missing")])
+    with pytest.raises(SystemExit, match="Invalid YouTube video ID"):
+        main()
