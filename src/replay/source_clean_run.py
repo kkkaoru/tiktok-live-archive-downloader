@@ -5,7 +5,8 @@ presentation clock, caption profile observations, native tool, pinned detector, 
 budgets). Three steps reuse the shared stages: ``configs`` derives one chunk job per clock
 chunk, ``run`` executes them with bounded concurrent streams and a free-space guard, and
 ``assemble`` adapts the validated chunks, prepares the assembly manifest, joins the media with
-parallel probes and writes the pinned cleanup configuration. Nothing here is specific to a
+parallel probes (each chunk's probe already ran when ``run`` accepted it) and writes the pinned
+cleanup configuration. Nothing here is specific to a
 recording; every outcome stays a candidate (quality and delivery flags are false).
 """
 
@@ -21,15 +22,17 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 from replay import delivery_source_assembly_parallel as assembly_runner
-from replay import gpu_lease
+from replay import failure_notify, gpu_lease, memory_admission, yolo_boxes
+from replay import recording_priority as priority
 from replay import subtitle_cleanup_assembly as preparation
 from replay import subtitle_sampled_consumer as consumer
 from replay import subtitle_yolo_regions as yolo
+from replay.core import ReplayError
 from replay.recordings import record
 from replay.subtitle_cleanup_plan import clock_chunks
 from replay.workflow_parallel import MEMORY_FREE_MIN, Load, headroom, read_load
@@ -62,11 +65,18 @@ KEYS = frozenset(
         "radius",
     }
 )
-OPTIONAL_KEYS = frozenset({"regionDetector", "auditTile", "sttn"})
+OPTIONAL_KEYS = frozenset({"regionDetector", "auditTile", "sttn", "yoloBoxes"})
 # Run-only budgets: they shape the queue, not any chunk's result, so chunk jobs never see them.
 RUN_KEYS = frozenset({"maxStreams"})
 GIB = 2**30
 MAX_STREAMS = 8
+CHUNK_JOB = "cleanup-chunk"  # its memory_admission job name
+YOLO_BOXES = "yolo-boxes-v1"
+# yolo-track writes this evidence after its boxes are complete (recording_steps.yolo_track).
+YOLO_TRACK_OUTPUT = "yolo-track-v2.json"
+# A boxes directory publishing nothing new this long is given up: chunks detect for themselves.
+BOXES_STALL_SECONDS = 300.0
+PROBES = "probes"  # accepted chunks' probes, kept until the assembly copies them
 POLL_SECONDS = 15.0
 # Polls to wait after a chunk starts before the next admission: a job reaches its STTN buffers
 # (its peak) about 25 s in (YOLO ~6 s, repair pass ~19 s, measured 2026-10-20); longer waits
@@ -74,12 +84,16 @@ POLL_SECONDS = 15.0
 # The waiter wakes exactly when the settle ends instead of at the next poll (a fixed 15 s poll
 # stretched 30 s settles to ~36 s between starts).
 SETTLE_SECONDS = 20.0
-# A chunk job's peak footprint (measured 9.5-10 GB on 2026-10-20); a further job is admitted only
-# while the free memory still covers it above the floor.
+# A chunk job's peak footprint (measured 9.5-10 GB on 2026-10-20; a 7 GiB gate with 6 leases lost
+# throughput on 2026-10-24); a further job is admitted only while free memory covers it.
 JOB_PEAK_BYTES = 10 * 1024**3
 JOB_PERCENT = math.ceil(
     100 * JOB_PEAK_BYTES / (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
 )
+# The settle waits for a started chunk to reach its peak; with free memory for two more peaks
+# above the floor that wait protects nothing and is skipped (bottleneck survey REPORT7 #4).
+SETTLE_FREE_PERCENT = MEMORY_FREE_MIN + 2 * JOB_PERCENT
+LEASE_POLL_SECONDS = 2.0  # an admitted chunk waiting only for a GPU lease (REPORT7 #5)
 
 Runner = Callable[[Sequence[str], Path], int]
 FreeBytes = Callable[[], int]
@@ -144,6 +158,8 @@ def validate(data: dict[str, object], *, root: Path) -> Recording:
     ):
         if not Path(result.text(key)).is_absolute():
             raise ValueError(f"{key} must be an absolute path")
+    if "yoloBoxes" in data and not Path(result.text("yoloBoxes")).is_absolute():
+        raise ValueError("yoloBoxes must be an absolute path")
     if not result.work.resolve().is_relative_to(result.root / "edits/work"):
         raise ValueError("The work directory must live under the checkout's edits/work")
     if not 1 <= result.number("streams") <= MAX_STREAMS:
@@ -223,8 +239,17 @@ def run(
     poll_seconds: float = POLL_SECONDS,
     settle_seconds: float = SETTLE_SECONDS,
     leases: Path | None = None,
+    boxes_stall_seconds: float = BOXES_STALL_SECONDS,
+    reservations: Path | None = None,
+    pressure: memory_admission.Pressure | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
     """Run chunk jobs ``first..last``; skip finished, stop below the floor.
+
+    Each started chunk also holds a machine-wide memory reservation of its measured peak
+    (``memory_admission``), so chunks of every recording and the pipelines' ML steps together
+    stay within physical memory; a measured peak also caps the job's torch MPS allocations.
 
     The first chunk always runs; every further one waits until free memory covers one more job
     above ``MEMORY_FREE_MIN`` (chunk jobs reach ~10 GB, and two recordings' streams together
@@ -235,6 +260,11 @@ def run(
     """
     floor = recording.number("freeFloorGiB") * GIB
     leases = gpu_lease.root() if leases is None else leases
+    reservations = memory_admission.root() if reservations is None else reservations
+    pressure = memory_admission.pressure if pressure is None else pressure
+    total = memory_admission.physical()
+    budgets = memory_admission.settings(reservations, total)
+    caps = memory_admission.cap_environment(CHUNK_JOB, budgets, total)
     # "replay-<id>-p1" or "youtube-<id>-p1" (a YouTube ID may itself hold hyphens): the
     # pipeline leases under "<id>" or "youtube-<id>".
     replay_id = re.sub(r"-p[0-9]+$", "", recording.text("recording")).removeprefix("replay-")
@@ -248,9 +278,50 @@ def run(
             active[0] < base or headroom(load)
         )
 
+    boxes_directory = Path(recording.text("yoloBoxes")) if "yoloBoxes" in recording.data else None
+    stalled = threading.Event()
+
+    def await_boxes(config: Path) -> str | None:
+        """Wait (unadmitted, holding nothing) until yolo-track has streamed this chunk's boxes.
+
+        "stored" once they are all there; "fallback" at once when yolo-track has finished
+        without them (its evidence file exists but the boxes are not complete: a run before the
+        boxes existed), or when an unfinished pass publishes nothing new for
+        ``boxes_stall_seconds``; no later chunk waits then either, and the chunk job detects its
+        boxes itself, as before. None without a boxes directory.
+        """
+        if boxes_directory is None:
+            return None
+        pts = record(record(json.loads(config.read_text(encoding="utf-8")))["clock"])["pts"]
+        if not isinstance(pts, list) or not pts:
+            raise ValueError(f"{config.name} has no clock")
+        first, last = int(str(pts[0])), int(str(pts[-1]))
+        seen, progressed = -1, clock()
+        while True:
+            if yolo_boxes.covered(boxes_directory, first, last):
+                return "stored"
+            if stalled.is_set():
+                break
+            if yolo_boxes.complete(boxes_directory) or (
+                (boxes_directory.parent / YOLO_TRACK_OUTPUT).exists()
+            ):
+                stalled.set()  # yolo-track has ended: no more boxes will come
+                break
+            published = (
+                len(list(boxes_directory.glob("range-*.json"))) if boxes_directory.is_dir() else 0
+            )
+            if published != seen:
+                seen, progressed = published, clock()
+            elif clock() - progressed > boxes_stall_seconds:
+                stalled.set()
+                break
+            sleep(min(poll_seconds, boxes_stall_seconds))
+        return "fallback"
+
     (recording.work / "logs").mkdir(mode=0o700, parents=True, exist_ok=True)
     stop = threading.Event()
     results: dict[int, dict[str, object]] = {}
+    probed: list[Future[None]] = []
     started = time.time()
 
     def one(index: int) -> None:
@@ -263,16 +334,44 @@ def run(
             stop.set()
             results[index] = {"notStarted": True}
             return
+        reason = priority.drained(leases.parent, replay_id)
+        if reason is not None:
+            # Drained at a chunk boundary: running chunks finish, no new one starts.
+            results[index] = {"notStarted": True, "drained": reason}
+            return
+        boxes = await_boxes(config)
+        if boxes is not None:
+            decisions.write(
+                json.dumps({"t": round(time.time(), 1), "chunk": index, "boxes": boxes}) + "\n"
+            )
+            decisions.flush()
         held: int | None = None
-        waiter = gpu_lease.Waiter(leases, replay_id)
+        waiter = gpu_lease.Waiter(leases, replay_id, step=f"cleanup {name}", job=CHUNK_JOB)
+        size = budgets.peaks[CHUNK_JOB]
+        reservation = memory_admission.Reservation(reservations, CHUNK_JOB, replay_id, size)
         with admission:
             # Memory admits a job first; then it also needs one of the machine-wide GPU leases.
             try:
                 while held is None:
-                    remaining = settle_seconds - (time.monotonic() - last_start[0])
-                    load = measure() if active[0] >= 1 and remaining <= 0 else None
-                    if active[0] < 1 or (load is not None and admitted(load)):
+                    remaining = settle_seconds - (clock() - last_start[0])
+                    load = measure() if active[0] >= 1 else None
+                    if load is not None and load.memory_free_percent >= SETTLE_FREE_PERCENT:
+                        remaining = 0.0  # room for two more peaks: no need to wait for this one
+                    if remaining > 0:
+                        load = None
+                    leased = False
+                    if (active[0] < 1 or (load is not None and admitted(load))) and (
+                        reservation.try_reserve(budgets, pressure)
+                    ):
+                        leased = True
                         held = waiter.try_acquire()
+                        if held is None:
+                            reservation.release()  # never hold memory while waiting for a lease
+                    elif load is not None:
+                        # Refused on memory or headroom: leave the queue so that other recordings
+                        # use the free leases meanwhile. A settling job keeps its place, since a
+                        # lease taken by a lower rank is not returned until that job ends.
+                        waiter.close()
                     decisions.write(
                         json.dumps(
                             {"t": round(time.time(), 1), "chunk": index, "active": active[0],
@@ -284,12 +383,12 @@ def run(
                     decisions.flush()
                     if held is None:
                         admission.wait(
-                            poll_seconds if remaining <= 0 else min(poll_seconds, remaining)
+                            poll_wait(poll_seconds, leased=leased, settle_left=remaining)
                         )
             finally:
                 waiter.close()
             active[0] += 1
-            last_start[0] = time.monotonic()
+            last_start[0] = clock()
         state = recording.work / "state" / name
         if state.exists():
             # A stopped job left no receipt and its attempt cannot resume: keep its state as
@@ -299,10 +398,16 @@ def run(
             state.rename(retired)
             shutil.rmtree(recording.media / "sampled" / name, ignore_errors=True)
         began = time.time()
-        command = [sys.executable, "-B", "-m", "replay.subtitle_sampled_job", str(config)]
+        job = [sys.executable, "-B", "-m", "replay.subtitle_sampled_job", str(config)]
+        command = ["/usr/bin/env", *(f"{k}={v}" for k, v in caps.items()), *job] if caps else job
+        text = " ".join(job)
         try:
-            code = runner(command, recording.work / "logs" / f"{name}.log")
+            with memory_admission.measuring(
+                reservations, CHUNK_JOB, lambda arguments: arguments == text
+            ):
+                code = runner(command, recording.work / "logs" / f"{name}.log")
         finally:
+            reservation.release()
             gpu_lease.release(held)
             with admission:
                 active[0] -= 1
@@ -312,13 +417,25 @@ def run(
             "startedAt": round(began, 1),
             "wallSeconds": round(time.time() - began, 1),
         }
+        if code == 0:
+            probed.append(prober.submit(probe_ahead, recording, name))
+        else:
+            # A bulkhead: the other chunks go on, and a rerun redoes only the failed ones.
+            failure_notify.notify(
+                replay_id, f"cleanup {name}", cls="chunk", cause=f"chunk job exited {code}",
+                action="the other chunks continue; a rerun redoes only failed chunks",
+            )  # fmt: skip
 
     # One line per admission decision: the evidence for why streams did or did not overlap.
+    # Accepted chunks are probed one at a time beside the queue (the assembly's input probes).
     with (
         (recording.work / "logs" / "admission.jsonl").open("a", encoding="utf-8") as decisions,
+        ThreadPoolExecutor(max_workers=1) as prober,
         ThreadPoolExecutor(max_workers=recording.max_streams) as pool,
     ):
         list(pool.map(one, range(first, last + 1)))
+    for future in probed:
+        future.result()  # an unexpected probe-ahead error is a bug: surface it
     summary: dict[str, object] = {
         "chunks": [first, last],
         "wallSeconds": round(time.time() - started, 1),
@@ -332,6 +449,44 @@ def run(
         name = f"queue-summary-{first}-{last}-attempt-{attempt}"
     _write_new(recording.work / f"{name}.json", summary)
     return summary
+
+
+def poll_wait(poll_seconds: float, *, leased: bool, settle_left: float) -> float:
+    """How long an unadmitted chunk waits before it asks again.
+
+    Admitted but no lease free: poll leases fast, a slot frees any moment. A settling chunk wakes
+    when its settle ends.
+    """
+    wait = min(poll_seconds, LEASE_POLL_SECONDS) if leased else poll_seconds
+    return wait if settle_left <= 0 else min(wait, settle_left)
+
+
+def accepted_media(recording: Recording, name: str) -> Path | None:
+    """The media of a chunk's accepted attempt, or None while it has none."""
+    receipt = recording.work / "state" / name / "chunk-receipt.json"
+    if not receipt.exists():
+        return None
+    accepted = record(json.loads(receipt.read_text(encoding="utf-8"))).get("accepted")
+    if not isinstance(accepted, str) or not accepted:
+        return None  # failed its audit after escalation
+    config = recording.work / "configs" / f"{name}.json"
+    output = record(json.loads(config.read_text(encoding="utf-8"))).get("mediaOutput")
+    if not isinstance(output, str):
+        raise ReplayError(f"{config.name} names no media output")
+    return Path(output) / accepted / consumer.MEDIA_NAME
+
+
+def probe_ahead(recording: Recording, name: str) -> None:
+    """Probe an accepted chunk for the assembly; a failure only leaves the probe to it."""
+    try:
+        media = accepted_media(recording, name)
+        if media is None or not media.is_file():
+            return
+        assembly_runner.prefetch(
+            media, probes=recording.work / PROBES, ffprobe=Path(recording.text("ffprobe"))
+        )
+    except (ReplayError, OSError, ValueError) as error:
+        print(f"{name}: probe ahead failed, the assembly probes it: {error}", file=sys.stderr)
 
 
 def _pin(path: Path) -> dict[str, str]:
@@ -364,7 +519,9 @@ def assemble(recording: Recording) -> Path:
         evidence=output / "assembly-evidence",
         ffmpeg=Path(recording.text("ffmpeg")),
         ffprobe=Path(recording.text("ffprobe")),
+        probes=recording.work / PROBES,
     )
+    shutil.rmtree(recording.work / PROBES, ignore_errors=True)  # copied into the evidence
     cleanup = output / "source-cleanup.json"
     _write_new(
         cleanup,
@@ -442,6 +599,9 @@ def describe(bootstrap: Path, defaults: Path, *, root: Path, revision: str = "v1
         "profileDirectory": str(prepared / "profile"),
         "settings": str(prepared / "settings.json"),
         "work": str(root.resolve() / "edits/work" / f"clean-{bootstrap.name}-{revision}"),
+        # Where yolo-track streams the caption boxes its own pass detected (yolo_boxes); with
+        # chunk-aligned batches they equal each chunk's own detection (parity 5/5, 2026-10-24).
+        "yoloBoxes": str(bootstrap / YOLO_BOXES),
     }
     destination = (
         root.resolve() / "edits/work" / f"clean-{bootstrap.name}-{revision}.description.json"

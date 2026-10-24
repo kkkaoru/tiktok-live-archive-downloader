@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from replay import delivery_source_assembly_parallel as assembly_runner
-from replay import gpu_lease
+from replay import failure_notify, gpu_lease, memory_admission
+from replay import recording_priority as priority
 from replay import source_clean_run as runner
 from replay import subtitle_cleanup_assembly as preparation
 from replay import subtitle_sampled_consumer as consumer
@@ -22,6 +23,9 @@ from replay.workflow_parallel import MEMORY_FREE_MIN, Load
 def private_gpu_leases(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Chunk jobs lease from a test directory, never the checkout's shared one."""
     monkeypatch.setattr(gpu_lease, "root", lambda: tmp_path / "gpu-leases")
+    monkeypatch.setattr(memory_admission, "root", lambda: tmp_path / "memory-reservations")
+    monkeypatch.setattr(memory_admission, "pressure", lambda: (95, 1))
+    monkeypatch.setattr(failure_notify, "notify", lambda *_args, **_kwargs: None)
 
 
 def description(root: Path, **changes: object) -> dict[str, object]:
@@ -261,6 +265,7 @@ def test_assemble_adapts_prepares_joins_and_pins_the_cleanup(
 
     def join(manifest: Path, **keywords: object) -> Path:
         calls.append("join")
+        assert keywords["probes"] == recording.work / "probes"
         evidence = Path(str(keywords["evidence"]))
         evidence.mkdir()
         (evidence / "receipt.json").write_text('{"r": 1}', encoding="utf-8")
@@ -270,7 +275,9 @@ def test_assemble_adapts_prepares_joins_and_pins_the_cleanup(
     monkeypatch.setattr(consumer, "adapt", adapt)
     monkeypatch.setattr(preparation, "prepare", prepare)
     monkeypatch.setattr(assembly_runner, "assemble_parallel", join)
+    (recording.work / "probes/cached").mkdir(parents=True)
     cleanup = runner.assemble(recording)
+    assert not (recording.work / "probes").exists()
     pins = json.loads(cleanup.read_text(encoding="utf-8"))
     manifest = recording.work / "consumer/assembly-preparation/manifest.json"
     assert calls == ["adapt", "prepare", "join"]
@@ -346,6 +353,7 @@ def test_describe_derives_a_valid_description_from_bootstrap_and_defaults(
     assert (loaded.number("width"), loaded.number("height")) == (1080, 1920)
     assert loaded.text("clock").endswith("replay-9/cleanup-bootstrap-v1/physical-clock.json")
     assert loaded.work == tmp_path / "edits/work/clean-replay-9-v1"
+    assert loaded.text("yoloBoxes").endswith("replay-9/yolo-boxes-v1")
 
 
 def test_describe_carries_a_yolo_region_detector_from_the_defaults(
@@ -413,36 +421,421 @@ def test_chunks_lease_under_the_pipeline_recording_key(
 ) -> None:
     recording = make(tmp_path, recording="youtube-Eg9-gl3Z954-p1")
     runner.configs(recording)
-    keys: list[str] = []
+    keys: list[tuple[str, str, str]] = []
     real = gpu_lease.Waiter
 
-    def waiter(directory: Path, replay_id: str) -> gpu_lease.Waiter:
-        keys.append(replay_id)
-        return real(directory, replay_id)
+    def waiter(directory: Path, replay_id: str, *, step: str, job: str) -> gpu_lease.Waiter:
+        keys.append((replay_id, step, job))
+        return real(directory, replay_id, step=step, job=job)
 
     monkeypatch.setattr(gpu_lease, "Waiter", waiter)
     runner.run(recording, first=0, last=0, runner=lambda *_a: 0, free=lambda: 100 * runner.GIB)
-    assert keys == ["youtube-Eg9-gl3Z954"]
+    assert keys == [("youtube-Eg9-gl3Z954", "cleanup chunk-00000", "cleanup-chunk")]
 
 
 def test_a_settle_longer_than_the_poll_wakes_when_it_ends_and_is_logged(tmp_path: Path) -> None:
     recording = make(tmp_path, streams=2, maxStreams=2)
     runner.configs(recording)
-    starts: list[float] = []
+    both = threading.Barrier(2, timeout=5)
+    ticks = [0.0]
 
-    def slow(_command: Sequence[str], _log: Path) -> int:
-        starts.append(time.monotonic())
-        time.sleep(0.6)
+    def clock() -> float:
+        ticks[0] += 1.0  # one settle second per poll
+        return ticks[0]
+
+    def job(_command: Sequence[str], _log: Path) -> int:
+        both.wait()  # the first chunk runs until the second one is admitted
         return 0
 
     runner.run(
-        recording, first=0, last=1, runner=slow, free=lambda: 100 * runner.GIB,
-        measure=lambda: IDLE, poll_seconds=5.0, settle_seconds=0.2,
+        recording, first=0, last=1, runner=job, free=lambda: 100 * runner.GIB,
+        measure=lambda: TIGHT, poll_seconds=0.01, settle_seconds=3.0, clock=clock,
     )  # fmt: skip
-    assert 0.15 < starts[1] - starts[0] < 0.5
-    decisions = [
-        json.loads(line)
-        for line in (recording.work / "logs" / "admission.jsonl").read_text().splitlines()
+    rows = (recording.work / "logs" / "admission.jsonl").read_text(encoding="utf-8").splitlines()
+    waits = [(row["settleLeft"], row["lease"] is None) for row in map(json.loads, rows[1:])]
+    assert waits == [(2.0, True), (1.0, True), (0.0, False)]
+
+
+def test_a_settling_wait_ends_with_the_settle_and_a_leased_one_polls_leases_fast() -> None:
+    assert runner.poll_wait(5.0, leased=False, settle_left=0.0) == 5.0
+    assert runner.poll_wait(5.0, leased=True, settle_left=0.0) == 2.0
+    assert runner.poll_wait(5.0, leased=False, settle_left=0.5) == 0.5
+    assert runner.poll_wait(0.01, leased=False, settle_left=0.5) == 0.01
+
+
+STARVED = Load(cpus=10, load=1.0, memory_free_percent=0, gpu_percent=10)
+
+
+TIGHT = Load(cpus=10, load=1.0, memory_free_percent=45, gpu_percent=10)  # one more peak fits
+
+
+def test_the_settle_is_skipped_while_free_memory_covers_two_more_peaks(tmp_path: Path) -> None:
+    recording = make(tmp_path, streams=2, maxStreams=2)
+    runner.configs(recording)
+    both = threading.Barrier(2, timeout=5)
+
+    def job(_command: Sequence[str], _log: Path) -> int:
+        both.wait()  # the first chunk runs until the second one is admitted
+        return 0
+
+    runner.run(
+        recording, first=0, last=1, runner=job, free=lambda: 100 * runner.GIB,
+        measure=lambda: IDLE, poll_seconds=0.01, settle_seconds=0.4, clock=lambda: 0.0,
+    )  # fmt: skip
+    # The clock never moves, so only the skip can admit the second chunk while the first runs.
+    rows = (recording.work / "logs" / "admission.jsonl").read_text(encoding="utf-8").splitlines()
+    waits = [(row["settleLeft"], row["lease"] is None) for row in map(json.loads, rows[1:])]
+    assert waits == [(0.0, False)]
+    assert runner.SETTLE_FREE_PERCENT == MEMORY_FREE_MIN + 2 * runner.JOB_PERCENT
+
+
+def test_a_waiting_chunk_holds_free_leases_only_while_it_could_start(tmp_path: Path) -> None:
+    leases = tmp_path / "gpu-leases"
+    leases.mkdir()
+    (leases / "settings.json").write_text('{"capacity": 2, "priority": ["1"]}', "utf-8")
+    blocker = gpu_lease.Waiter(leases, "9", start=9).try_acquire()
+    assert blocker is not None
+    recording = make(tmp_path, streams=2, maxStreams=2)
+    runner.configs(recording)
+    reached = {2: threading.Event(), 3: threading.Event()}
+    proceed = {2: threading.Event(), 3: threading.Event()}
+    calls = [0]
+    seen: dict[str, bool] = {}
+
+    def measure() -> Load:
+        calls[0] += 1
+        if calls[0] in reached:
+            reached[calls[0]].set()
+            assert proceed[calls[0]].wait(5)
+        return STARVED if calls[0] == 2 else IDLE
+
+    def job(_command: Sequence[str], _log: Path) -> int:
+        if seen:
+            return 0
+        assert reached[2].wait(5)  # the second chunk tried for a lease while it could start
+        gpu_lease.release(blocker)
+        fair = gpu_lease.Waiter(leases, "9", start=9)
+        seen["yieldsWhileAdmissible"] = fair.try_acquire() is None
+        fair.close()
+        proceed[2].set()
+        assert reached[3].wait(5)  # it was refused on memory and now waits again
+        lease = gpu_lease.Waiter(leases, "9", start=9).try_acquire()
+        seen["takesWhileNotAdmitted"] = lease is not None
+        if lease is not None:
+            gpu_lease.release(lease)
+        proceed[3].set()
+        return 0
+
+    summary = runner.run(
+        recording, first=0, last=1, runner=job, free=lambda: 100 * runner.GIB,
+        measure=measure, poll_seconds=0.01, settle_seconds=0.0, leases=leases,
+    )  # fmt: skip
+    assert seen == {"yieldsWhileAdmissible": True, "takesWhileNotAdmitted": True}
+    results = summary["results"]
+    assert isinstance(results, dict)
+    assert results["0"]["exit"] == 0
+    assert results["1"]["exit"] == 0
+
+
+def accepting(recording: runner.Recording, accepted: dict[str, object]) -> runner.Runner:
+    """A chunk job that leaves a receipt naming ``accepted[chunk]`` and that attempt's media."""
+
+    def job(command: Sequence[str], _log: Path) -> int:
+        name = Path(command[-1]).stem
+        if name not in accepted:
+            return 3
+        state = recording.work / "state" / name
+        state.mkdir(parents=True)
+        (state / "chunk-receipt.json").write_text(
+            json.dumps({"accepted": accepted[name]}), encoding="utf-8"
+        )
+        media = recording.media / "sampled" / name / "attempt-a" / consumer.MEDIA_NAME
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"media")
+        return 0
+
+    return job
+
+
+def test_accepted_chunks_are_probed_for_the_assembly_during_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recording = make(tmp_path)
+    runner.configs(recording)
+    probed: list[tuple[Path, Path, Path]] = []
+
+    def prefetch(media: Path, *, probes: Path, ffprobe: Path) -> Path:
+        probed.append((media, probes, ffprobe))
+        return probes
+
+    monkeypatch.setattr(assembly_runner, "prefetch", prefetch)
+    job = accepting(recording, {"chunk-00000": "attempt-a", "chunk-00001": None})
+    runner.run(recording, first=0, last=2, runner=job, free=lambda: 100 * runner.GIB)
+    assert probed == [
+        (
+            tmp_path / "media/replay-1/sampled/chunk-00000/attempt-a/candidate.mp4",
+            recording.work / "probes",
+            Path("/bin/ffprobe"),
+        )
     ]
-    assert {row["chunk"] for row in decisions} == {0, 1}
-    assert any(row["lease"] is None and row["settleLeft"] > 0 for row in decisions)
+
+
+def test_a_failed_probe_ahead_leaves_the_probe_to_the_assembly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    recording = make(tmp_path)
+    runner.configs(recording)
+
+    def prefetch(_media: Path, **_keywords: object) -> Path:
+        raise ReplayError("ffprobe failed")
+
+    monkeypatch.setattr(assembly_runner, "prefetch", prefetch)
+    job = accepting(recording, {"chunk-00000": "attempt-a"})
+    summary = runner.run(recording, first=0, last=0, runner=job, free=lambda: 100 * runner.GIB)
+    results = summary["results"]
+    assert isinstance(results, dict)
+    assert results["0"]["exit"] == 0
+    assert capsys.readouterr().err == (
+        "chunk-00000: probe ahead failed, the assembly probes it: ffprobe failed\n"
+    )
+
+
+def test_a_chunk_config_without_media_output_is_reported(tmp_path: Path) -> None:
+    recording = make(tmp_path)
+    runner.configs(recording)
+    state = recording.work / "state/chunk-00000"
+    state.mkdir(parents=True)
+    (state / "chunk-receipt.json").write_text('{"accepted": "attempt-a"}', encoding="utf-8")
+    (recording.work / "configs/chunk-00000.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ReplayError, match="names no media output"):
+        runner.accepted_media(recording, "chunk-00000")
+
+
+def test_a_settling_chunk_keeps_its_place_ahead_of_lower_ranks(tmp_path: Path) -> None:
+    leases = tmp_path / "gpu-leases"
+    leases.mkdir()
+    (leases / "settings.json").write_text('{"capacity": 3, "priority": ["1"]}', "utf-8")
+    first = gpu_lease.Waiter(leases, "9", start=9).try_acquire()
+    second = gpu_lease.Waiter(leases, "9", start=9).try_acquire()
+    assert first is not None and second is not None
+    recording = make(tmp_path, streams=3, maxStreams=3)
+    runner.configs(recording)
+    tried = threading.Event()
+    started = threading.Event()
+    checked = threading.Event()
+    settling = threading.Event()
+    calls = [0]
+    seen: dict[str, bool] = {}
+    lock = threading.Lock()
+    now = [0.0]
+
+    def measure() -> Load:
+        if len(list((leases / "waiting").glob("1.*"))) == 2:
+            tried.set()  # both later chunks asked for a lease and hold their place
+        if not tried.is_set():
+            now[0] += 0.5  # the first settles pass; the clock then stops until the check
+        if started.is_set():
+            settling.set()
+        return TIGHT
+
+    def job(_command: Sequence[str], _log: Path) -> int:
+        with lock:
+            calls[0] += 1
+            order = calls[0]
+        if order == 2:
+            started.set()
+            assert checked.wait(5)  # keeps its lease while the lower rank asks
+        if order != 1:
+            return 0
+        assert tried.wait(5)
+        gpu_lease.release(first)
+        assert started.wait(5)  # one later chunk took it; the last one now settles
+        assert settling.wait(5)  # the clock is stopped, so the last chunk is still settling
+        gpu_lease.release(second)
+        lower = gpu_lease.Waiter(leases, "9", start=9)
+        seen["yieldsDuringSettle"] = lower.try_acquire() is None
+        lower.close()
+        checked.set()
+        now[0] += 10.0  # the settle ends
+        return 0
+
+    summary = runner.run(
+        recording, first=0, last=2, runner=job, free=lambda: 100 * runner.GIB,
+        measure=measure, poll_seconds=0.01, settle_seconds=1.0, leases=leases,
+        clock=lambda: now[0],
+    )  # fmt: skip
+    assert seen == {"yieldsDuringSettle": True}
+    results = summary["results"]
+    assert isinstance(results, dict)
+    assert results["2"]["exit"] == 0
+
+
+def test_chunks_share_the_machine_memory_budget_and_get_a_measured_cap(tmp_path: Path) -> None:
+    reservations = tmp_path / "memory-reservations"
+    (reservations).mkdir()
+    (reservations / "settings.json").write_text('{"budgetGiB": 25}', "utf-8")
+    # Two measured runs of 8 GiB: 10 GiB reserved, capped at 16.
+    memory_admission.record_peak(reservations, "cleanup-chunk", 8 * runner.GIB)
+    memory_admission.record_peak(reservations, "cleanup-chunk", 8 * runner.GIB)
+    recording = make(tmp_path, streams=3, maxStreams=3)
+    runner.configs(recording)
+    active: list[int] = []
+    peak: list[int] = []
+    commands: list[list[str]] = []
+    lock = threading.Lock()
+    pair = threading.Barrier(2, timeout=5)
+
+    def job(command: Sequence[str], _log: Path) -> int:
+        with lock:
+            commands.append(list(command[:3]))
+            active.append(1)
+            peak.append(len(active))
+            order = len(commands)
+        if order <= 2:
+            pair.wait()  # the two that fit the budget run together
+        time.sleep(0.3)  # gives a third, over-budget chunk the chance to start too
+        with lock:
+            active.pop()
+        return 0
+
+    runner.run(
+        recording, first=0, last=2, runner=job, free=lambda: 100 * runner.GIB,
+        measure=lambda: IDLE, poll_seconds=0.01, settle_seconds=0.0,
+    )  # fmt: skip
+    assert max(peak) == 2  # 3 x 10 GiB would exceed the 25 GiB budget
+    assert commands[0] == [
+        "/usr/bin/env",
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.4274",
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO=0.4274",
+    ]
+    assert memory_admission.reserved(reservations) == 0
+
+
+def box_decisions(recording: runner.Recording) -> list[tuple[int, str]]:
+    rows = (recording.work / "logs" / "admission.jsonl").read_text(encoding="utf-8").splitlines()
+    return [
+        (int(row["chunk"]), str(row["boxes"])) for row in map(json.loads, rows) if "boxes" in row
+    ]
+
+
+def test_chunks_start_once_yolo_track_streamed_their_boxes(tmp_path: Path) -> None:
+    boxes = tmp_path / "boxes"
+    boxes.mkdir()
+    (boxes / "range-000000000000-000000009000.json").write_text("{}", "utf-8")
+    recording = make(tmp_path, yoloBoxes=str(boxes))
+    runner.configs(recording)
+    job = json.loads((recording.work / "configs/chunk-00000.json").read_text("utf-8"))
+    assert job["yoloBoxes"] == str(boxes)
+
+    def finish_the_pass(_command: Sequence[str], _log: Path) -> int:
+        (boxes / "complete.json").write_text("{}", "utf-8")  # chunk 2's frames never came
+        return 0
+
+    runner.run(
+        recording, first=0, last=2, runner=finish_the_pass, free=lambda: 100 * runner.GIB,
+        measure=lambda: IDLE, poll_seconds=0.01, settle_seconds=0.0,
+    )  # fmt: skip
+    assert sorted(box_decisions(recording)) == [(0, "stored"), (1, "stored"), (2, "fallback")]
+
+
+def test_a_stalled_box_stream_stops_every_chunk_from_waiting(tmp_path: Path) -> None:
+    recording = make(tmp_path, yoloBoxes=str(tmp_path / "never-written"))
+    runner.configs(recording)
+    ticks = [0.0]
+    sleeps: list[float] = []
+
+    def clock() -> float:
+        ticks[0] += 1.0
+        return ticks[0]
+
+    runner.run(
+        recording, first=0, last=2, runner=lambda *_a: 0, free=lambda: 100 * runner.GIB,
+        measure=lambda: IDLE, poll_seconds=0.01, settle_seconds=0.0, boxes_stall_seconds=0.5,
+        clock=clock, sleep=sleeps.append,
+    )  # fmt: skip
+    assert set(sleeps) == {0.01}  # one poll without progress, then the stall stops every chunk
+    assert sorted(box_decisions(recording)) == [(0, "fallback"), (1, "fallback"), (2, "fallback")]
+
+
+def test_a_relative_boxes_directory_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(description(tmp_path, yoloBoxes="boxes")), encoding="utf-8")
+    with pytest.raises(ValueError, match="yoloBoxes must be an absolute path"):
+        runner.load(path, root=tmp_path)
+
+
+def test_a_finished_yolo_track_without_boxes_never_makes_chunks_wait(tmp_path: Path) -> None:
+    (tmp_path / "replay-9").mkdir()
+    (tmp_path / "replay-9" / "yolo-track-v2.json").write_text("{}", "utf-8")  # an older pass
+    recording = make(tmp_path, yoloBoxes=str(tmp_path / "replay-9" / "yolo-boxes-v1"))
+    runner.configs(recording)
+    sleeps: list[float] = []
+    runner.run(
+        recording, first=0, last=2, runner=lambda *_a: 0, free=lambda: 100 * runner.GIB,
+        measure=lambda: IDLE, poll_seconds=0.01, settle_seconds=0.0, boxes_stall_seconds=60.0,
+        sleep=sleeps.append,
+    )  # fmt: skip
+    assert sleeps == []
+    assert sorted(box_decisions(recording)) == [(0, "fallback"), (1, "fallback"), (2, "fallback")]
+
+
+def test_a_failing_chunk_is_notified_while_the_others_go_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        failure_notify, "notify", lambda *args, **kw: sent.append((*args, kw["cls"]))
+    )
+    recording = make(tmp_path)
+    runner.configs(recording)
+
+    def job(command: Sequence[str], _log: Path) -> int:
+        return 4 if command[-1].endswith("chunk-00001.json") else 0
+
+    summary = runner.run(recording, first=0, last=2, runner=job, free=lambda: 100 * runner.GIB)
+    results = summary["results"]
+    assert isinstance(results, dict)
+    assert [results[key]["exit"] for key in ("0", "1", "2")] == [0, 4, 0]
+    assert sent == [("1", "cleanup chunk-00001", "chunk")]
+
+
+def test_a_drained_recording_starts_no_new_chunk(tmp_path: Path) -> None:
+    recording = make(tmp_path)
+    runner.configs(recording)
+    priority.drain(tmp_path, "1", "drain")  # gpu_lease.root() is tmp_path / "gpu-leases"
+    summary = runner.run(
+        recording, first=0, last=1, runner=lambda *_a: 0, free=lambda: 100 * runner.GIB
+    )
+    assert summary["results"] == {
+        "0": {"notStarted": True, "drained": "drain"},
+        "1": {"notStarted": True, "drained": "drain"},
+    }
+
+
+def test_an_admitted_chunk_polls_fast_for_a_freed_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    leases = tmp_path / "gpu-leases"
+    leases.mkdir()
+    (leases / "settings.json").write_text('{"capacity": 1}', "utf-8")
+    blocker = gpu_lease.Waiter(leases, "9", start=9).try_acquire()
+    assert blocker is not None
+    monkeypatch.setattr(runner, "LEASE_POLL_SECONDS", 0.01)
+    recording = make(tmp_path, streams=1, maxStreams=1)
+    runner.configs(recording)
+    polls = [0]
+
+    def clock() -> float:
+        polls[0] += 1
+        if polls[0] == 2:
+            gpu_lease.release(blocker)  # freed between the first and second lease poll
+        return 0.0
+
+    runner.run(
+        recording, first=0, last=0, runner=lambda *_a: 0, free=lambda: 100 * runner.GIB,
+        measure=lambda: IDLE, poll_seconds=600.0, settle_seconds=0.0, leases=leases,
+        clock=clock,
+    )  # fmt: skip
+    rows = (recording.work / "logs" / "admission.jsonl").read_text(encoding="utf-8").splitlines()
+    held = [row["lease"] is not None for row in map(json.loads, rows)]
+    assert held == [False, True]  # the second lease poll, not the 600 s one
