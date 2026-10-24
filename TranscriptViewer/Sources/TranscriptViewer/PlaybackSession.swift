@@ -49,6 +49,7 @@ final class PlaybackSession {
     let narrativeSummary: NarrativeSummaryModel
     let videoBGM: VideoBGMModel
     let clips: ClipsModel
+    let channels: ChannelsModel
     var playbackSpeed = PlaybackSpeed.normal {
         didSet {
             player.defaultRate = playbackSpeed.rawValue
@@ -98,6 +99,7 @@ final class PlaybackSession {
         narrativeSummary: NarrativeSummaryModel = NarrativeSummaryModel(),
         videoBGM: VideoBGMModel? = nil,
         clips: ClipsModel = ClipsModel(api: nil),
+        channels: ChannelsModel = ChannelsModel(api: nil, originals: nil),
         launchArguments: [String] = []
     ) {
         self.readLibraryRoot = readLibraryRoot
@@ -117,6 +119,7 @@ final class PlaybackSession {
             ?? VideoBGMModel(
                 library: BGMLibraryModel(root: nil, volume: 1, defaultID: nil), settings: [:])
         self.clips = clips
+        self.channels = channels
         self.launchArguments = launchArguments
         self.videoBGM.follow(player)
     }

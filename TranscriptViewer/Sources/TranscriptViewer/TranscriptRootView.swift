@@ -74,6 +74,11 @@ struct TranscriptRootView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(video.broadcastStartJST ?? "配信日時不明")
                             .font(.callout.monospacedDigit())
+                        if let streamer = session.channels.label(for: video) {
+                            Text(streamer)
+                                .font(.caption)
+                                .foregroundStyle(.tint)
+                        }
                         Text(video.title)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -84,9 +89,14 @@ struct TranscriptRootView: View {
                     .tag(video.id)
                     .contextMenu { fileMenu(for: video) }
                     .accessibilityLabel(
-                        "動画 \(video.broadcastStartJST ?? "配信日時不明") \(video.title)")
+                        (["動画", video.broadcastStartJST ?? "配信日時不明"]
+                            + [session.channels.label(for: video), video.title].compactMap { $0 })
+                            .joined(separator: " "))
                 }
                 .accessibilityLabel("動画一覧")
+                .task(id: session.videos.map(\.title)) {
+                    await session.channels.load(titles: session.videos.map(\.title))
+                }
                 .navigationTitle("動画")
                 Text("ライブラリ: \(session.libraryName)")
                     .font(.caption)

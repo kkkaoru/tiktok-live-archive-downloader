@@ -17,6 +17,8 @@ struct TranscriptViewerApp: App {
             initialValue: PlaybackSession(
                 videoBGM: VideoBGMModel(library: bgm),
                 clips: ClipsModel(api: ClipsModel.configured),
+                channels: ChannelsModel(
+                    api: ClipsModel.configured, originals: ChannelsModel.configuredOriginals),
                 launchArguments: arguments))
     }
 
