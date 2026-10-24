@@ -17,7 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from replay import edit_config
+from replay import delivery_offload, edit_config
 from replay.core import ReplayError
 from replay.edit_config import CONFIG_KEYS as CONFIG_KEYS
 from replay.edit_config import CONFIG_NAME as CONFIG_NAME
@@ -590,14 +590,22 @@ def is_superseded(root: Path, delivery: Path) -> bool:
     return False
 
 
-def supersede_incomplete(root: Path) -> list[Path]:
+def supersede_incomplete(
+    root: Path, assessed: dict[str, dict[str, str]] | None = None
+) -> list[Path]:
     """Record incomplete dated deliveries so a complete revision can be published.
 
-    Nothing is deleted or renamed; a complete delivery is never superseded.
+    Nothing is deleted or renamed; a complete delivery is never superseded. ``assessed`` maps
+    delivery labels to the missing stages a ``completion_report`` of the same state found, so a
+    caller that just gated does not decode every movie a second time.
     """
     recorded: list[Path] = []
     for delivery in _deliveries(root):
-        failures = assess_delivery(delivery, root=root)
+        label = delivery_label(root, delivery)
+        if assessed is not None and label in assessed:
+            failures = assessed[label]
+        else:
+            failures = assess_delivery(delivery, root=root)
         if not failures or is_superseded(root, delivery):
             continue
         digest = _digest(delivery)
@@ -614,7 +622,46 @@ def supersede_incomplete(root: Path) -> list[Path]:
             json.dump(entry, stream, indent=2, ensure_ascii=False)
             stream.write("\n")
         recorded.append(delivery)
+    for alias in storage_aliases(root):
+        if is_superseded(root, alias):
+            continue
+        digest = _digest(alias)
+        directory, label = _record_home(root, alias)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        entry = {
+            "delivery": label,
+            "sha256": digest,
+            "size": alias.stat().st_size,
+            "missingStages": {"all": "an older flow's delivery link, never a gated delivery"},
+            "status": "superseded-incomplete-required-stages",
+        }
+        # Several links may name one movie: the record is per link.
+        name = f"{digest[:16]}-{hashlib.sha256(label.encode()).hexdigest()[:8]}.json"
+        with (directory / name).open("x", encoding="utf-8") as stream:
+            json.dump(entry, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+        recorded.append(alias)
     return recorded
+
+
+def storage_aliases(root: Path) -> list[Path]:
+    """Older flows' delivery links in the storage root whose movie still exists.
+
+    The gate never counts such a link as a delivery, but TranscriptViewer lists it beside the
+    pipeline's delivery (and then shows neither), so superseding has to record it too.
+    """
+    storage = load_config(root).storage_root
+    if storage is None:
+        return []
+    suffix = f"_JST_{root.name}-review"
+    return sorted(
+        path
+        for path in (storage / "revisions").glob("**/delivery/*")
+        if path.is_symlink()
+        and path.suffix.lower() in MEDIA_SUFFIXES
+        and path.stem.endswith(suffix)
+        and path.is_file()
+    )
 
 
 def supersede_for_regeneration(root: Path, reason: str) -> list[Path]:
@@ -667,11 +714,41 @@ def completion_report(root: Path) -> dict[str, object]:
                 **({"nativeAssessment": native} if native is not None else {}),
             }
         )
+    rows.extend(offloaded_rows(root))
+    complete = any(row["complete"] for row in rows)
+    offloaded = any(row.get("state") == "offloaded" for row in rows)
     return {
         "replay": root.name,
-        "complete": any(row["complete"] for row in rows),
+        "complete": complete,
+        "state": "complete" if complete else "offloaded" if offloaded else "incomplete",
         "deliveries": rows,
     }
+
+
+def offloaded_rows(root: Path) -> list[dict[str, object]]:
+    """Deliveries kept only in R2: a distinct state, never a pass of the local-bytes stages.
+
+    The record proves the R2 copy matched the local file when it was deleted; any stage that
+    needs the bytes (re-hashing, the decode gate) must fetch them back first.
+    """
+    rows: list[dict[str, object]] = []
+    for entry in delivery_offload.load(root):
+        path = Path(entry.local_path)
+        if entry.role != "delivery" or os.path.lexists(path):
+            continue
+        fetch = f"python -m replay.r2_fetch {root.name.removeprefix('replay-')} --role delivery"
+        rows.append(
+            {
+                "delivery": delivery_label(root, path),
+                "complete": False,
+                "superseded": False,
+                "state": "offloaded",
+                "message": f"offloaded (R2, sha256 verified at {entry.verified_at})",
+                "offload": {"key": entry.key, "bytes": entry.bytes, "sha256": entry.sha256},
+                "missingStages": {"local-bytes": f"fetch required: {fetch}"},
+            }
+        )
+    return rows
 
 
 def main(argv: list[str] | None = None) -> int:

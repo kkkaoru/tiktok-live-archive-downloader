@@ -42,6 +42,7 @@ def test_youtube_config_binds_original_without_approving_empty_library(
     assert completion_report(root) == {
         "replay": "youtube-abcdefghijk",
         "complete": False,
+        "state": "incomplete",
         "deliveries": [],
     }
     assert main(["check", str(root)]) == 2

@@ -282,6 +282,7 @@ def test_dated_native_media_keeps_required_stage_gate(tmp_path: Path) -> None:
     assert completion_report(root) == {
         "replay": "replay-7",
         "complete": False,
+        "state": "incomplete",
         "deliveries": [
             {
                 "delivery": "revisions/native/delivery/2024-01-01_09-00-00_JST_replay-7-review.mov",
@@ -322,7 +323,12 @@ def test_delivery_discovery_excludes_nonmedia_directories_links_and_other_record
     (directory / f"{STEM}-review.srt").write_text("not a movie")
     (directory / "2024-01-01_09-00-00_JST_replay-8-review.mov").write_bytes(b"other")
     assert dated_deliveries(root) == []
-    assert completion_report(root) == {"replay": "replay-7", "complete": False, "deliveries": []}
+    assert completion_report(root) == {
+        "replay": "replay-7",
+        "complete": False,
+        "state": "incomplete",
+        "deliveries": [],
+    }
 
 
 def test_complete_delivery_passes_every_stage(tmp_path: Path) -> None:
@@ -332,6 +338,7 @@ def test_complete_delivery_passes_every_stage(tmp_path: Path) -> None:
     assert completion_report(root) == {
         "replay": "replay-7",
         "complete": True,
+        "state": "complete",
         "deliveries": [
             {
                 "delivery": f"revisions/audio-final/delivery/{STEM}-review.mp4",
@@ -547,6 +554,34 @@ def test_supersede_records_incomplete_delivery_and_allows_new_revision(tmp_path:
     assert is_superseded(root, delivery) is False
     with pytest.raises(ReplayError, match="already has a dated delivery"):
         require_new_delivery(root)
+
+
+def test_supersede_uses_the_gate_assessments_without_assessing_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = recording(tmp_path)
+    failed = root / f"revisions/a/delivery/{STEM}-review.mp4"
+    passed = root / f"revisions/b/delivery/{STEM}-review.mp4"
+    unknown = root / f"revisions/c/delivery/{STEM}-review.mp4"
+    for path, body in ((failed, b"a"), (passed, b"b"), (unknown, b"c")):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(body)
+    assessed: list[Path] = []
+
+    def assess(delivery: Path, *, root: Path) -> dict[str, str]:
+        assessed.append(delivery)
+        return {"bgm_removal": "missing"}
+
+    monkeypatch.setattr(edit_completion, "assess_delivery", assess)
+    known = {
+        f"revisions/a/delivery/{STEM}-review.mp4": {"silence_cut": "missing"},
+        f"revisions/b/delivery/{STEM}-review.mp4": {},
+    }
+    assert supersede_incomplete(root, known) == [failed, unknown]
+    assert assessed == [unknown]
+    digest = hashlib.sha256(b"a").hexdigest()
+    entry = json.loads((root / f"evidence/superseded/{digest[:16]}.json").read_text())
+    assert entry["missingStages"] == {"silence_cut": "missing"}
 
 
 def test_requested_regeneration_supersedes_a_complete_delivery(
@@ -790,6 +825,34 @@ def test_bind_storage_preserves_old_config_and_discovers_external_delivery(
     )
 
 
+def test_an_older_flows_delivery_link_in_storage_is_superseded_for_the_viewer(
+    tmp_path: Path,
+) -> None:
+    root = recording(tmp_path)
+    external = storage(tmp_path, root)
+    edit_completion.bind_storage(root, external)
+    movie = external / "revisions/old-render" / f"{STEM}-review.mp4"
+    movie.parent.mkdir(parents=True)
+    movie.write_bytes(b"older")
+    links = [external / f"revisions/{name}/delivery" / f"{STEM}-review.mp4" for name in "ab"]
+    links[0].parent.mkdir(parents=True)
+    links[1].parent.mkdir(parents=True)
+    links[0].symlink_to(f"../../old-render/{STEM}-review.mp4")
+    links[1].symlink_to(f"../../old-render/{STEM}-review.mp4")
+    broken = external / "revisions/c/delivery" / f"{STEM}-review.mp4"
+    broken.parent.mkdir(parents=True)
+    broken.symlink_to("../../missing.mp4")
+    assert dated_deliveries(root, external) == []
+    assert supersede_incomplete(root) == links
+    records = sorted((external / "evidence/superseded").glob("*.json"))
+    entries = sorted((json.loads(path.read_text()) for path in records), key=str)
+    assert [(entry["delivery"], entry["size"]) for entry in entries] == [
+        (f"revisions/a/delivery/{STEM}-review.mp4", 5),
+        (f"revisions/b/delivery/{STEM}-review.mp4", 5),
+    ]
+    assert supersede_incomplete(root) == []
+
+
 def test_a_stored_delivery_is_superseded_in_its_store_for_the_viewer(tmp_path: Path) -> None:
     root = recording(tmp_path)
     external = storage(tmp_path, root)
@@ -956,3 +1019,63 @@ def test_cli_bind_storage(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     external = storage(tmp_path, root)
     assert main(["bind-storage", str(root), str(external)]) == 0
     assert capsys.readouterr().out.strip() == str(root / "edit-config.json")
+
+
+def test_offloaded_delivery_is_a_distinct_state_not_a_pass(tmp_path: Path) -> None:
+    from replay import delivery_offload
+
+    root = recording(tmp_path)
+    movie = root / "revisions/audio-final/delivery" / f"{STEM}-review.mp4"
+    delivery_offload.save(
+        root,
+        [
+            delivery_offload.Entry(
+                "delivery", str(movie), "media/m.mp4", 5, "a" * 64, "2026-10-24T09:00:00+00:00"
+            )
+        ],
+    )
+    assert completion_report(root) == {
+        "replay": "replay-7",
+        "complete": False,
+        "state": "offloaded",
+        "deliveries": [
+            {
+                "delivery": f"revisions/audio-final/delivery/{STEM}-review.mp4",
+                "complete": False,
+                "superseded": False,
+                "state": "offloaded",
+                "message": "offloaded (R2, sha256 verified at 2026-10-24T09:00:00+00:00)",
+                "offload": {"key": "media/m.mp4", "bytes": 5, "sha256": "a" * 64},
+                "missingStages": {
+                    "local-bytes": "fetch required: python -m replay.r2_fetch 7 --role delivery"
+                },
+            }
+        ],
+    }
+    assert main(["check", str(root)]) == 2
+
+
+def test_present_or_non_delivery_offloads_add_no_rows(tmp_path: Path) -> None:
+    from replay import delivery_offload
+
+    root = recording(tmp_path)
+    delivery = music_removed(root, render(root, "render-a"))
+    delivery_offload.save(
+        root,
+        [
+            delivery_offload.Entry("delivery", str(delivery), "media/m.mp4", 5, "a" * 64, "t"),
+            delivery_offload.Entry(
+                "original", str(tmp_path / "gone.mp4"), "media-original/m.mp4", 5, "b" * 64, "t"
+            ),
+        ],
+    )
+    report = completion_report(root)
+    assert report["state"] == "complete"
+    assert report["deliveries"] == [
+        {
+            "delivery": f"revisions/audio-final/delivery/{STEM}-review.mp4",
+            "complete": True,
+            "superseded": False,
+            "missingStages": {},
+        }
+    ]

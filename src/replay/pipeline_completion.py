@@ -12,7 +12,8 @@ from those receipts and a few fast technical checks of the published movie, in m
   is verified again (``caption_absence.verify``) to carry no caption band;
 - ``transcription``: the sidecar SRT holds one cue per displayed caption, in order;
 - ``dynamic_captions``: every caption was placed, every caption part rendered successfully and
-  the whole movie decodes without errors.
+  the whole movie decodes without errors (``replay.movie_decode``: split at a keyframe and
+  counted against the probe's packets when that is safe, else one pass).
 
 Receipts are local evidence, not attestations; ``qualityApproved`` stays false.
 """
@@ -26,7 +27,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from replay import caption_absence
+from replay import caption_absence, movie_decode
 from replay.core import ReplayError
 from replay.delivery_output_names import delivery_stem
 from replay.edit_completion import REQUIRED_STAGES, load_config
@@ -147,16 +148,6 @@ def probe(movie: Path, ffprobe: str) -> dict[str, object]:
     return record(json.loads(out))
 
 
-def decodes(movie: Path, ffmpeg: str) -> bool:
-    """The whole movie decodes (video on VideoToolbox, audio) with no reported error."""
-    result = subprocess.run(
-        [ffmpeg, "-v", "error", "-nostdin", "-hwaccel", "videotoolbox", "-i", str(movie),
-         "-f", "null", "-"],
-        capture_output=True, text=True, timeout=7200,
-    )  # fmt: skip
-    return result.returncode == 0 and not result.stderr.strip()
-
-
 def outputs(receipt: dict[str, object]) -> dict[str, object]:
     return record(receipt.get("outputs"))
 
@@ -209,7 +200,10 @@ def stage_failures(index: dict[str, object], *, ffmpeg: str, ffprobe: str) -> di
         failures["dynamic_captions"] = "some captions were not placed"
     elif not rendered.get("parts"):
         failures["dynamic_captions"] = "no caption part rendered"
-    elif not decodes(movie, ffmpeg):
+    elif not movie_decode.decodes(
+        movie, ffmpeg=ffmpeg, ffprobe=ffprobe,
+        frames=int(str(video[0]["nb_read_packets"])) if video else 0,
+    ):  # fmt: skip
         failures["dynamic_captions"] = "the movie does not decode cleanly"
     return failures
 

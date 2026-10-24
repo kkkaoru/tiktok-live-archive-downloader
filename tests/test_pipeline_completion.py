@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from replay import movie_decode
 from replay import pipeline_completion as completion
 from replay.core import ReplayError
 from replay.edit_completion import REQUIRED_STAGES
@@ -66,7 +67,7 @@ def good_movie(monkeypatch: pytest.MonkeyPatch, *, frames: int = 90) -> None:
         {"codec_type": "audio", "nb_read_packets": "130", "duration": "3.0"},
     ]
     monkeypatch.setattr(completion, "probe", lambda _m, _p: {"streams": streams})
-    monkeypatch.setattr(completion, "decodes", lambda _m, _f: True)
+    monkeypatch.setattr(movie_decode, "decodes", lambda _m, **_k: True)
 
 
 def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Path], Path]:
@@ -148,7 +149,7 @@ def test_each_stage_fails_on_its_own_evidence(
 ) -> None:
     paths, index = published(tmp_path, monkeypatch)
     good_movie(monkeypatch, frames=89)
-    monkeypatch.setattr(completion, "decodes", lambda _m, _f: False)
+    monkeypatch.setattr(movie_decode, "decodes", lambda _m, **_k: False)
     (paths["work"] / "configs/chunk-00001.json").write_text("{}", encoding="utf-8")
     failures = completion.stage_failures(
         json.loads(index.read_text(encoding="utf-8")), ffmpeg="f", ffprobe="p"
@@ -242,7 +243,6 @@ def test_the_cli_publishes(
 def test_probe_and_decode_run_the_tools(tmp_path: Path) -> None:
     movie = tmp_path / "m.mp4"
     movie.write_bytes(b"not a movie")
-    assert completion.decodes(movie, "ffmpeg") is False
     with pytest.raises(subprocess.CalledProcessError):
         completion.probe(movie, "ffprobe")
 
