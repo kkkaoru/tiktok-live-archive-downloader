@@ -26,3 +26,8 @@ condition = "AND"
 paths = ['''(^|/)tests/''']
 regexTarget = "secret"
 regexes = ['''^(?:a{32}|b{32}|0{32})$''']
+
+# The synthetic movie key sha256("3abcabc")[:32] in web-viewer tests, not a credential.
+[[allowlists]]
+regexTarget = "secret"
+regexes = ['''^2e8e504c5e6b886af70f8c03cbfc31ac$''']
