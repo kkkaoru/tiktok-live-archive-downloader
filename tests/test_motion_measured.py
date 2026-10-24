@@ -87,6 +87,47 @@ def test_partition_preserves_all_33_stages(candidate: Path, tmp_path: Path) -> N
     ] == [{"text": "字幕", "startFrame": 0, "endFrame": 1, "x": 0, "y": 460}]
 
 
+def test_a_larger_stage_limit_keeps_33_stages_in_one_part(candidate: Path, tmp_path: Path) -> None:
+    raw = record(json.loads(candidate.read_text(encoding="utf-8")))
+    raw["candidates"] = [
+        {"cue": {"text": "字幕", "start": i / 30, "end": (i + 1) / 30}, "x": 540, "y": 500}
+        for i in range(33)
+    ]
+    candidate.write_text(json.dumps(raw), encoding="utf-8")
+    result = motion_measured.export_plans(
+        candidate,
+        tmp_path / "parts",
+        sha256=file_digest(candidate),
+        width=1080,
+        height=1920,
+        rate=30,
+        frames=33,
+        expected_text="Title",
+        max_stages=512,
+    )
+    manifest = json.loads(result.read_text(encoding="utf-8"))
+    assert [(p["offsetFrame"], p["frames"], p["stages"]) for p in manifest["parts"]] == [
+        (0, 33, 33)
+    ]
+
+
+@pytest.mark.parametrize("stages", [0, 513])
+def test_refuse_unbounded_stage_limits(candidate: Path, tmp_path: Path, stages: int) -> None:
+    with pytest.raises(ValueError, match="bounded"):
+        motion_measured.export_plans(
+            candidate,
+            tmp_path / "parts",
+            sha256=file_digest(candidate),
+            width=1080,
+            height=1920,
+            rate=30,
+            frames=30,
+            expected_text="Title",
+            max_stages=stages,
+        )
+    assert not (tmp_path / "parts").exists()
+
+
 @pytest.mark.parametrize("frames", [0, True, 3601])
 def test_refuse_invalid_bounds(candidate: Path, tmp_path: Path, frames: int) -> None:
     with pytest.raises(ValueError, match="bounded"):

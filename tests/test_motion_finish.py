@@ -170,7 +170,7 @@ def test_wrong_pair_order(sequence_template: str) -> None:
 
 
 def test_expanded_size(sequence_template: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(motion_finish, "MAX_XML_CHARACTERS", len(sequence_template) + 10)
+    monkeypatch.setattr(motion_finish, "MAX_PART_XML_CHARACTERS", len(sequence_template) + 10)
     with pytest.raises(ReplayError, match="size limit"):
         finish_sequence(
             sequence_template,

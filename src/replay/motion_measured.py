@@ -12,7 +12,7 @@ from replay.caption_timing import display_time
 from replay.fcp_measured import MAX_CANDIDATE_BYTES, MAX_PART_BINDINGS, read_measured_captions
 from replay.fcp_project import frame_span
 from replay.foreground_evidence import _bound_bytes
-from replay.motion_caption import MAX_SEQUENCE_SENTENCES
+from replay.motion_caption import MAX_PART_SENTENCES, MAX_SEQUENCE_SENTENCES
 from replay.recordings import record
 from replay.stages import file_digest
 from replay.tracking_observations import _checked_output
@@ -54,6 +54,7 @@ def export_plans(
     rate: int,
     frames: int,
     expected_text: str,
+    max_stages: int = MAX_SEQUENCE_SENTENCES,
 ) -> Path:
     """Preserve frame-visible text/origins, refusing hidden or overlapping stages.
 
@@ -66,6 +67,7 @@ def export_plans(
         or not 1 <= min(width, height) <= max(width, height) <= 8192
         or not 1 <= rate <= 60
         or not 1 <= frames <= rate * 120
+        or not 1 <= max_stages <= MAX_PART_SENTENCES
         or not expected_text.strip()
     ):
         raise ValueError("Invalid bounded Motion stage canvas or template text")
@@ -108,8 +110,8 @@ def export_plans(
         raise ValueError("Measured candidate changed during planning")
     output.mkdir(mode=0o700)
     parts: list[dict[str, object]] = []
-    for index in range(0, len(placements), MAX_SEQUENCE_SENTENCES):
-        group = placements[index : index + MAX_SEQUENCE_SENTENCES]
+    for index in range(0, len(placements), max_stages):
+        group = placements[index : index + max_stages]
         offset = group[0]["startFrame"]
         last = group[-1]["endFrame"]
         local: list[Placement] = [
@@ -169,6 +171,7 @@ def main() -> None:
     parser.add_argument("--rate", type=int, required=True)
     parser.add_argument("--frames", type=int, required=True)
     parser.add_argument("--expected-text", required=True)
+    parser.add_argument("--max-stages", type=int, default=MAX_SEQUENCE_SENTENCES)
     args = parser.parse_args()
     export_plans(
         args.candidate,
@@ -179,6 +182,7 @@ def main() -> None:
         rate=args.rate,
         frames=args.frames,
         expected_text=args.expected_text,
+        max_stages=args.max_stages,
     )
 
 

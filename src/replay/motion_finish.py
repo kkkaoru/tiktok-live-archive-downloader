@@ -18,8 +18,8 @@ from replay.caption_font_identity import require_selected_name
 from replay.core import ReplayError
 from replay.motion_caption import (
     GENERATED_ID_MAX,
-    MAX_SEQUENCE_SENTENCES,
-    MAX_XML_CHARACTERS,
+    MAX_PART_SENTENCES,
+    MAX_PART_XML_CHARACTERS,
     CaptionAppearance,
     ColourIntentPolicy,
     _attribute,
@@ -172,7 +172,7 @@ def _pairs(root: ET.Element) -> list[tuple[ET.Element, ET.Element]]:
     if root.get("version") != "5.13":
         raise ReplayError("Only the observed Motion 5.13 stages are supported")
     nodes = _one(root, "scene/layer").findall("scenenode[@factoryID='16']")
-    if not nodes or len(nodes) % 2 or len(nodes) > 2 * MAX_SEQUENCE_SENTENCES:
+    if not nodes or len(nodes) % 2 or len(nodes) > 2 * MAX_PART_SENTENCES:
         raise ReplayError("Expected bounded pairs of generated caption objects")
     pairs = list(zip(nodes[::2], nodes[1::2], strict=True))
     for face, rim in pairs:
@@ -191,7 +191,7 @@ def finish_sequence(document: str, *, style: FinishStyle) -> str:
     Finishing is deliberately last: the historical two-object sequence generator
     must not consume this three-object result. No FCP publication is performed.
     """
-    root = _parse(document)
+    root = _parse(document, limit=MAX_PART_XML_CHARACTERS)
     pairs = _pairs(root)
     layer = _one(root, "scene/layer")
     identifiers = set().union(*(_generated_ids(node) for node in root.iter()))
@@ -228,7 +228,7 @@ def finish_sequence(document: str, *, style: FinishStyle) -> str:
         layer.insert(list(layer).index(face), foreground)
     _stamp_colour_intent(root, style.appearance())
     result = ET.tostring(root, encoding="unicode")
-    if len(result) > MAX_XML_CHARACTERS:
+    if len(result) > MAX_PART_XML_CHARACTERS:
         raise ReplayError("Finished Motion stages exceed the XML size limit")
     return result
 
@@ -266,7 +266,7 @@ def main() -> None:
     if (
         args.source.is_symlink()
         or not args.source.is_file()
-        or args.source.stat().st_size > MAX_XML_CHARACTERS
+        or args.source.stat().st_size > MAX_PART_XML_CHARACTERS
     ):
         raise ReplayError("Motion source must be a bounded regular file")
     style = FinishStyle(

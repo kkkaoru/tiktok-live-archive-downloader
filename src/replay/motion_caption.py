@@ -29,6 +29,11 @@ MAX_CAPTION_TEXT_UNITS = 120
 MAX_POSITION_UNITS = 10_000
 MAX_SEQUENCE_SECONDS = 120
 MAX_SEQUENCE_SENTENCES = 32
+# A Compressor caption part is one whole caption window (``caption_parts.MAX_SECONDS``): each
+# Compressor job costs ~4.5 s fixed, which was 64% of caption-render with 32-sentence parts.
+# Windows held at most 252 stages over 22 recordings (~38 KB of finished XML per stage).
+MAX_PART_SENTENCES = 512
+MAX_PART_XML_CHARACTERS = 32 * 1024 * 1024
 MAX_SEQUENCE_PIXELS = 4096 * 2160
 GENERATED_ID_MIN = 999_000_000
 GENERATED_ID_MAX = 1_000_000_000
@@ -174,8 +179,8 @@ class CaptionPlacement:
     y: float
 
 
-def _parse(text: str) -> ET.Element:
-    if len(text) > MAX_XML_CHARACTERS:
+def _parse(text: str, *, limit: int = MAX_XML_CHARACTERS) -> ET.Element:
+    if len(text) > limit:
         raise ReplayError("Motion template exceeds the XML size limit")
     # Only Motion's observed empty declaration is allowed; never load a DTD/entity.
     text = text.replace("<!DOCTYPE ozxmlscene>", "")
@@ -703,6 +708,8 @@ def build_caption_sequence(
     match_fcp_scale: bool = False,
     style_height: int | None = None,
     smooth: bool = True,
+    max_sentences: int = MAX_SEQUENCE_SENTENCES,
+    max_characters: int = MAX_XML_CHARACTERS,
 ) -> str:
     """Assemble a bounded caption-only Motion candidate from the verified flat layout.
 
@@ -736,7 +743,7 @@ def build_caption_sequence(
         or type(height) is not int
         or min(width, height) <= 0
         or width * height > MAX_SEQUENCE_PIXELS
-        or not 1 <= len(placements) <= MAX_SEQUENCE_SENTENCES
+        or not 1 <= len(placements) <= max_sentences
     ):
         raise ReplayError("Invalid bounded Motion sequence dimensions or clock")
     root = _parse(template_xml)
@@ -815,7 +822,7 @@ def build_caption_sequence(
         insertion += len(placed)
         previous_end = placement.end_frame
     result = ET.tostring(root, encoding="unicode")
-    if len(result) > MAX_XML_CHARACTERS:
+    if len(result) > max_characters:
         raise ReplayError("Motion caption sequence exceeds the XML size limit")
     return result
 
