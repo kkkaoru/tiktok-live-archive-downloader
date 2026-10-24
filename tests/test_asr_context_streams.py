@@ -8,8 +8,10 @@ import numpy as np
 import pytest
 
 from replay import asr_context_streams as streams
+from replay import asr_decode_patches
 from replay.asr_context_streams import Chunk
 from replay.core import ReplayError
+from replay.stages import file_digest
 
 RATE = 16000
 
@@ -246,6 +248,7 @@ def test_publish_binds_labels_to_a_projection_manifest(
         "input-pcm-not-projected", 16000 * 40, 16000,
     )  # fmt: skip
     assert str(audio) in written["inputs"] and str(model / "config.json") in written["inputs"]
+    assert str(Path(asr_decode_patches.__file__)) in written["inputs"]
     document = json.loads(labels.read_text(encoding="utf-8"))
     assert list(document["parentSHA256"]) == [str(manifest)]
     assert [row["text"] for row in document["labels"]] == ["y", "x"]
@@ -272,9 +275,19 @@ def test_the_worker_decodes_each_request_with_the_pinned_options(
 
     monkeypatch.setitem(sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=transcribe))
     cleared: list[int] = []
-    monkeypatch.setitem(
-        sys.modules, "mlx.core", types.SimpleNamespace(clear_cache=lambda: cleared.append(1))
-    )
+    mx = types.SimpleNamespace(clear_cache=lambda: cleared.append(1))
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    decoding, timing = types.ModuleType("decoding"), types.ModuleType("timing")
+    whisper = types.ModuleType("whisper")
+    monkeypatch.setitem(sys.modules, "mlx_whisper.decoding", decoding)
+    monkeypatch.setitem(sys.modules, "mlx_whisper.timing", timing)
+    monkeypatch.setitem(sys.modules, "mlx_whisper.whisper", whisper)
+    installed: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        asr_decode_patches, "install",
+        lambda *modules, version: installed.append((*modules, version)),
+    )  # fmt: skip
+    monkeypatch.setattr("importlib.metadata.version", lambda name: f"{name} 0.4.3")
     requests = [{"start": 0, "end": 1600, "prompt": "前"}, {"start": 0, "end": 800, "prompt": ""}]
     monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(r) + "\n" for r in requests)))
     assert streams.main(["worker", str(audio), str(tmp_path / "model")]) == 0
@@ -285,6 +298,7 @@ def test_the_worker_decodes_each_request_with_the_pinned_options(
         (1600, "前", "ja"), (800, None, "ja"),
     ]  # fmt: skip
     assert len(cleared) == 2
+    assert installed == [(mx, decoding, timing, whisper, "mlx-whisper 0.4.3")]
 
 
 def test_trimming_keeps_long_or_spoken_last_segments() -> None:
@@ -422,3 +436,253 @@ def test_a_short_gap_after_a_long_fragment_extends_it_instead_of_moving_it() -> 
     assert (count, result[1]["start"], result[1]["end"], "wordJoin" in result[1]) == (
         0, 0.4, 2.0, False,
     )  # fmt: skip
+
+
+LOOP = "来た" * 60  # compresses far beyond Whisper's 2.4
+
+
+def seg(start: float, end: float, text: str, ratio: float) -> dict[str, object]:
+    return {"start": start, "end": end, "text": text, "compression_ratio": ratio,
+            "avg_logprob": -0.2, "no_speech_prob": 0.1,
+            "words": [{"word": text, "start": start, "end": end, "probability": 0.9}]}  # fmt: skip
+
+
+def flagged() -> dict[str, object]:
+    return {"text": "はいどうも" + LOOP, "guard": {"trusted": False, "retry": "repetition"},
+            "segments": [seg(0.0, 2.0, "はいどうも", 9.0), seg(2.0, 9.0, LOOP, 9.0)]}  # fmt: skip
+
+
+def test_repetition_is_measured_like_whisper_and_located_in_the_text() -> None:
+    assert streams.compression_ratio("") == 0.0
+    assert streams.compression_ratio(LOOP) > 2.4
+    assert streams.looping(flagged()) is True
+    assert streams.looping({"segments": [seg(0.0, 1.0, "a", 1.0)]}) is False
+    assert streams.loop_start(streams.segments_of(flagged())) == 1
+    assert streams.loop_start([seg(0.0, 1.0, "a", 1.0)]) == 1
+
+
+def test_a_trusted_or_unlooped_or_repaired_chunk_is_left_as_it_is() -> None:
+    def never(chunk: Chunk, prompt: str, temperature: float) -> dict[str, object]:
+        raise AssertionError("no decode")
+
+    trusted = {**flagged(), "guard": {"trusted": True}}
+    improbable = {"guard": {"trusted": False}, "segments": [seg(0.0, 1.0, "a", 1.0)]}
+    done = {**flagged(), "repair": {"method": "dropped"}}
+    assert streams.repaired(trusted, Chunk(0, 160000), never) == trusted
+    assert streams.repaired(improbable, Chunk(0, 160000), never) == improbable
+    assert streams.repaired(done, Chunk(0, 160000), never) == done
+
+
+def test_a_loop_is_decoded_again_from_where_it_starts_on_the_chunk_clock() -> None:
+    calls: list[tuple[int, int, str, float]] = []
+
+    def decode(chunk: Chunk, prompt: str, temperature: float) -> dict[str, object]:
+        calls.append((chunk.start, chunk.end, prompt, temperature))
+        return {"text": "来た来た", "segments": [seg(0.5, 1.5, "来た来た", 1.1)]}
+
+    result = streams.repaired(flagged(), Chunk(16000, 176000), decode)
+    assert calls == [(48000, 176000, "", 0.0)]
+    assert result["text"] == "はいどうも来た来た"
+    assert result["segments"] == [
+        {**seg(0.0, 2.0, "はいどうも", 9.0), "compression_ratio": pytest.approx(0.5, abs=0.5)},
+        seg(2.5, 3.5, "来た来た", 1.1),
+    ]
+    assert result["repair"] == {"method": "subwindow", "fromSeconds": 2.0, "temperature": 0.0,
+                                "replaced": LOOP, "droppedTail": None, "seed": 0}  # fmt: skip
+    assert result["guard"] == {"trusted": False, "retry": "repetition"}  # still resets context
+    assert streams.looping(result) is False
+
+
+def test_a_still_looping_window_is_sampled_at_rising_temperatures() -> None:
+    temperatures: list[float] = []
+
+    def decode(chunk: Chunk, prompt: str, temperature: float) -> dict[str, object]:
+        temperatures.append(temperature)
+        ratio = 9.0 if temperature < 0.4 else 1.0
+        return {"text": "x", "segments": [seg(0.0, 1.0, "x", ratio)]}
+
+    result = streams.repaired(flagged(), Chunk(0, 160000), decode)
+    assert temperatures == [0.0, 0.2, 0.4]
+    assert result["repair"] == {"method": "temperature", "fromSeconds": 2.0, "temperature": 0.4,
+                                "replaced": LOOP, "droppedTail": None, "seed": 0}  # fmt: skip
+
+
+def test_a_loop_nothing_recovers_loses_its_text_as_unrecognized() -> None:
+    temperatures: list[float] = []
+
+    def decode(chunk: Chunk, prompt: str, temperature: float) -> dict[str, object]:
+        temperatures.append(temperature)
+        return {"text": LOOP, "segments": [seg(0.0, 1.0, LOOP, 9.0)]}
+
+    result = streams.repaired(flagged(), Chunk(0, 160000), decode)
+    assert temperatures == [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    assert result["text"] == "はいどうも"
+    assert result["repair"] == {"method": "dropped", "fromSeconds": 2.0, "temperature": None,
+                                "replaced": LOOP, "droppedTail": None, "seed": 0}  # fmt: skip
+
+
+def test_a_loop_from_the_first_segment_skips_the_retry_it_already_had() -> None:
+    temperatures: list[float] = []
+
+    def decode(chunk: Chunk, prompt: str, temperature: float) -> dict[str, object]:
+        temperatures.append(temperature)
+        return {"text": "y", "segments": [seg(0.0, 1.0, "y", 1.0)]}
+
+    looped = {"guard": {"trusted": False}, "segments": [seg(0.0, 9.0, LOOP, 9.0)]}
+    result = streams.repaired(looped, Chunk(0, 160000), decode)
+    assert temperatures == [0.2]
+    assert result["text"] == "y"
+
+
+def test_a_loop_too_short_to_hold_a_word_is_dropped_without_decoding() -> None:
+    def never(chunk: Chunk, prompt: str, temperature: float) -> dict[str, object]:
+        raise AssertionError("no decode")
+
+    result = streams.repaired(flagged(), Chunk(0, 32000 + 800), never)
+    assert result["text"] == "はいどうも"
+    assert result["segments"] == [
+        {**seg(0.0, 2.0, "はいどうも", 9.0), "compression_ratio": pytest.approx(0.5, abs=0.5)}
+    ]
+
+
+def looping_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """A fake worker: windows over 20 s loop at temperature 0; requests are logged."""
+    script, log = tmp_path / "looping_worker.py", tmp_path / "requests.log"
+    script.write_text(
+        "import json, sys\n"
+        "loop = '来た' * 60\n"
+        f"log = open({str(log)!r}, 'a')\n"
+        "for line in sys.stdin:\n"
+        "    r = json.loads(line)\n"
+        "    log.write(line); log.flush()\n"
+        "    long = r['end'] - r['start'] > 20 * 16000 and not r['temperature']\n"
+        "    w = lambda t, a, b: {'word': t, 'start': a, 'end': b, 'probability': 0.9}\n"
+        "    s = lambda t, a, b, c: {'start': a, 'end': b, 'text': t, 'compression_ratio': c,"
+        " 'avg_logprob': -0.2, 'no_speech_prob': 0.1, 'words': [w(t, a, b)]}\n"
+        "    segs = [s('はい', 0.0, 1.0, 9.0), s(loop, 1.0, 9.0, 9.0)] if long else"
+        " [s('z', 0.0, 1.0, 1.0)]\n"
+        "    text = ''.join(x['text'] for x in segs)\n"
+        "    print(json.dumps({'language': 'ja', 'text': text, 'segments': segs}), flush=True)\n",
+        encoding="utf-8",
+    )
+
+    class Launcher(streams.Worker):
+        def __init__(self, audio: Path, model: Path) -> None:
+            import subprocess
+            import sys
+
+            self.process = subprocess.Popen(
+                [sys.executable, str(script)], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, text=True, encoding="utf-8",
+            )  # fmt: skip
+
+    monkeypatch.setattr(streams, "Worker", Launcher)
+    return [str(log)]
+
+
+def recognition_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    audio, model = tmp_path / "mono.wav", tmp_path / "model"
+    write_audio(audio)
+    model.mkdir()
+    (model / "weights.npz").write_bytes(b"w")
+    return audio, model
+
+
+def test_a_fresh_run_and_a_repair_of_an_old_store_write_the_same_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = Path(looping_worker(tmp_path, monkeypatch)[0])
+    audio, model = recognition_inputs(tmp_path)
+    fresh = streams.run(audio, model, tmp_path / "fresh", streams=1, context=True)
+    assert fresh["repairs"] == {"subwindow": 0, "temperature": 1, "dropped": 0}
+    # The same chunks as an old store: no repair yet, bound only by a published manifest.
+    real = streams.repaired
+    monkeypatch.setattr(streams, "repaired", lambda result, chunk, decode: dict(result))
+    streams.run(audio, model, tmp_path / "old", streams=1, context=True)
+    monkeypatch.setattr(streams, "repaired", real)
+    (tmp_path / "old/chunks/inputs.key").unlink()
+    manifest = {
+        "inputs": {
+            str(audio): file_digest(audio),
+            str(model / "weights.npz"): file_digest(model / "weights.npz"),
+        }
+    }
+    (tmp_path / "old/chunks/previous-inputs.manifest").write_text(json.dumps(manifest), "utf-8")
+    log.write_text("", encoding="utf-8")
+    again = streams.run(audio, model, tmp_path / "old", streams=1, context=True)
+    assert again["repairs"] == {"subwindow": 0, "temperature": 1, "dropped": 0}
+    name = "000000125280.json"
+    assert (tmp_path / "old/chunks" / name).read_bytes() == (
+        tmp_path / "fresh/chunks" / name
+    ).read_bytes()
+    assert [json.loads(line)["temperature"] for line in log.read_text("utf-8").splitlines()] == [
+        0.0,
+        0.2,
+    ]
+
+
+def test_a_keyed_store_is_reused_without_decoding_and_other_inputs_discard_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = Path(looping_worker(tmp_path, monkeypatch)[0])
+    audio, model = recognition_inputs(tmp_path)
+    streams.run(audio, model, tmp_path / "out", streams=1, context=True)
+    log.write_text("", encoding="utf-8")
+    streams.run(audio, model, tmp_path / "out", streams=1, context=True)
+    assert log.read_text(encoding="utf-8") == ""
+    (model / "weights.npz").write_bytes(b"other weights")
+    streams.run(audio, model, tmp_path / "out", streams=1, context=True)
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 5
+
+
+def test_an_unbound_or_mismatched_legacy_store_is_decoded_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = Path(looping_worker(tmp_path, monkeypatch)[0])
+    audio, model = recognition_inputs(tmp_path)
+    streams.run(audio, model, tmp_path / "out", streams=1, context=True)
+    (tmp_path / "out/chunks/inputs.key").unlink()
+    (tmp_path / "out/chunks/000000000000.json").write_text("{}", encoding="utf-8")
+    log.write_text("", encoding="utf-8")
+    streams.run(audio, model, tmp_path / "out", streams=1, context=True)
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 5
+    assert (tmp_path / "out/chunks/000000000000.json").exists() is False
+    (tmp_path / "out/chunks/inputs.key").unlink()
+    manifest = {"inputs": {str(audio): "0" * 64}}
+    (tmp_path / "out/chunks/previous-inputs.manifest").write_text(json.dumps(manifest), "utf-8")
+    log.write_text("", encoding="utf-8")
+    streams.run(audio, model, tmp_path / "out", streams=1, context=True)
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 5
+
+
+def test_the_worker_seeds_every_sampled_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+    import sys
+    import types
+
+    audio = tmp_path / "mono.wav"
+    write_audio(audio)
+    seen: list[object] = []
+
+    def transcribe(samples: np.ndarray, **options: object) -> dict[str, object]:
+        seen.append(options["temperature"])
+        return {"text": "t"}
+
+    monkeypatch.setitem(sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=transcribe))
+    seeds: list[int] = []
+    random = types.SimpleNamespace(seed=seeds.append)
+    mx = types.SimpleNamespace(clear_cache=lambda: None, random=random)
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    monkeypatch.setitem(sys.modules, "mlx_whisper.decoding", types.ModuleType("decoding"))
+    monkeypatch.setitem(sys.modules, "mlx_whisper.timing", types.ModuleType("timing"))
+    monkeypatch.setitem(sys.modules, "mlx_whisper.whisper", types.ModuleType("whisper"))
+    monkeypatch.setattr(asr_decode_patches, "install", lambda *modules, version: None)
+    monkeypatch.setattr("importlib.metadata.version", lambda name: "0.4.3")
+    requests = [{"start": 0, "end": 800, "prompt": "", "temperature": 0.4},
+                {"start": 0, "end": 800, "prompt": "", "temperature": 0.0}]  # fmt: skip
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(json.dumps(r) + "\n" for r in requests)))
+    streams.worker(audio, tmp_path / "model")
+    assert seen == [0.4, 0.0]
+    assert seeds == [0]

@@ -35,18 +35,21 @@ import itertools
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
 import wave
+import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
 
-from replay import caption_io, caption_linguistics
+from replay import asr_decode_patches, caption_io, caption_linguistics
 from replay.core import ReplayError
 from replay.recordings import record
 from replay.replay_transcription_plan import mono_command
@@ -78,6 +81,7 @@ ONSET_ABOVE_FLOOR_DB = 10.0
 # precede the same voice onset never collapse onto one frame (captions show at 30 fps).
 ONSET_SPACING_SECONDS = 1 / 30
 TAIL_NO_SPEECH = 0.5
+PATCHED_MODULES = ("decoding", "timing", "whisper")  # output-identical decode speedups
 # Whisper token clocks may leave a pause inside one morphological word (ス | マホ, ゆ | っくり):
 # the earlier fragment sits at an earlier, unrelated voice. Captions reset at any pause longer
 # than their hold, so such a word would split across pages. Fragments before the last pause in a
@@ -89,6 +93,15 @@ FRAGMENT_SECONDS_PER_CHARACTER = 0.15  # a moved fragment keeps at most this spo
 # whatever the analysis of the unpunctuated chunk text joins (おいしょ, 12 s, おとぎ → しょお).
 WORD_PAUSE_VOICED = 0.5
 WORD_PAUSE_LIMIT_SECONDS = 8.0
+# A chunk still looping after the unprompted retry is decoded again from the segment where its
+# text turns repetitive, then sampled at rising temperatures (seeded before every call, so a
+# re-run repeats it), and otherwise loses that text as unrecognized. It keeps resetting the
+# stream context, so the chunks after it are decoded exactly as before the repair.
+REPAIR_TEMPERATURES = (0.2, 0.4, 0.6, 0.8, 1.0)
+REPAIR_SEED = 0
+MIN_REPAIR_SAMPLES = RATE // 10  # a window shorter than this holds no word to recover
+STORE_KEY = "inputs.key"  # what the stored chunks were decoded from (not a chunk: no .json)
+PREVIOUS_MANIFEST = "previous-inputs.manifest"  # a published manifest kept for legacy stores
 DECODE_OPTIONS: dict[str, object] = {
     "language": "ja", "verbose": False, "condition_on_previous_text": False,
     "word_timestamps": True, "temperature": 0.0, "fp16": True,
@@ -228,6 +241,7 @@ def trimmed(result: Mapping[str, object]) -> tuple[dict[str, object], str | None
 
 
 Decode = Callable[[Chunk, str], dict[str, object]]
+Redecode = Callable[[Chunk, str, float], dict[str, object]]
 
 
 def guarded(
@@ -241,6 +255,108 @@ def guarded(
              "trusted": failing(result, "") is None}  # fmt: skip
     return {**result, "guard": guard, "prompt": prompt,
             "chunk": {"start": chunk.start, "end": chunk.end}}  # fmt: skip
+
+
+def compression_ratio(text: str) -> float:
+    """Whisper's repetition measure: UTF-8 length over its zlib length."""
+    data = text.encode("utf-8")
+    return len(data) / len(zlib.compress(data)) if data else 0.0
+
+
+def segments_of(result: Mapping[str, object]) -> list[dict[str, object]]:
+    segments = result.get("segments")
+    return [record(segment) for segment in segments] if isinstance(segments, list) else []
+
+
+def looping(result: Mapping[str, object]) -> bool:
+    """Whether any decoded segment is repetitive (an improbable-only chunk is not)."""
+    ratios = (segment.get("compression_ratio") for segment in segments_of(result))
+    return any(isinstance(r, (int, float)) and r > COMPRESSION_LIMIT for r in ratios)
+
+
+def loop_start(segments: Sequence[Mapping[str, object]]) -> int:
+    """The first segment whose text makes the chunk's text so far repetitive."""
+    text = ""
+    for index, segment in enumerate(segments):
+        text += str(segment.get("text", ""))
+        if compression_ratio(text) > COMPRESSION_LIMIT:
+            return index
+    return len(segments)
+
+
+def shifted(segment: Mapping[str, object], seconds: float) -> dict[str, object]:
+    """A segment of a later window on the chunk clock."""
+    moved = {**segment, "start": float(str(segment["start"])) + seconds,
+             "end": float(str(segment["end"])) + seconds}  # fmt: skip
+    words = segment.get("words")
+    if isinstance(words, list):
+        moved["words"] = [
+            {
+                **record(word),
+                "start": float(str(record(word)["start"])) + seconds,
+                "end": float(str(record(word)["end"])) + seconds,
+            }  # fmt: skip
+            for word in words
+        ]
+    return moved
+
+
+def repaired(result: Mapping[str, object], chunk: Chunk, decode: Redecode) -> dict[str, object]:
+    """``result`` with a still-repetitive tail re-decoded or dropped; others unchanged."""
+    guard = record(result.get("guard"))
+    if guard.get("trusted") or "repair" in result or not looping(result):
+        return dict(result)
+    segments = segments_of(result)
+    index = loop_start(segments) % len(segments)  # no repetitive prefix: the whole chunk
+    since = float(str(segments[index]["start"]))
+    window = Chunk(min(chunk.end, chunk.start + round(since * RATE)), chunk.end)
+    # The whole chunk at temperature 0 without a prompt is the guard's own retry.
+    attempts = ((0.0,) if index else ()) + REPAIR_TEMPERATURES
+    method, temperature, tail, added = "dropped", None, None, []
+    for value in attempts if window.end - window.start >= MIN_REPAIR_SAMPLES else ():
+        candidate, cut = trimmed(decode(window, "", value))
+        if not looping(candidate):
+            method = "subwindow" if value == 0.0 else "temperature"
+            temperature, tail = value, cut
+            offset = (window.start - chunk.start) / RATE
+            added = [shifted(segment, offset) for segment in segments_of(candidate)]
+            break
+    kept = segments[:index]
+    # The kept segments' decode measured its whole text; re-measure the text that stays.
+    ratio = compression_ratio("".join(str(segment.get("text", "")) for segment in kept))
+    kept = [{**segment, "compression_ratio": ratio} for segment in kept]
+    final = kept + added
+    repair = {"method": method, "fromSeconds": since, "temperature": temperature,
+              "replaced": "".join(str(segment.get("text", "")) for segment in segments[index:]),
+              "droppedTail": tail, "seed": REPAIR_SEED}  # fmt: skip
+    text = "".join(str(segment.get("text", "")) for segment in final)
+    return {**result, "segments": final, "text": text, "repair": repair}
+
+
+def store_key(audio: Path, model: Path) -> dict[str, object]:
+    """What a stored chunk result depends on: input PCM, weights, options and the provider."""
+    weights = sorted(path for path in model.iterdir() if path.is_file()) if model.is_dir() else []
+    provider = {name: metadata.version(name) for name in ("mlx", "mlx-whisper")}
+    return {"audio": file_digest(audio), "model": {p.name: file_digest(p) for p in weights},
+            "options": DECODE_OPTIONS, "provider": provider,
+            "patches": file_digest(Path(asr_decode_patches.__file__))}  # fmt: skip
+
+
+def adopted(store: Path, key: Mapping[str, object], audio: Path, model: Path) -> bool:
+    """Whether ``store`` holds results of ``key``'s inputs: keyed, or a legacy store whose
+    published manifest bound the same PCM and weights. An unbound store is never reused."""
+    keyed, previous = store / STORE_KEY, store / PREVIOUS_MANIFEST
+    if keyed.exists():
+        return bool(json.loads(keyed.read_text(encoding="utf-8")) == key)
+    if not previous.exists():
+        return False
+    inputs = record(record(json.loads(previous.read_text(encoding="utf-8"))).get("inputs"))
+    weights = record(key["model"])
+    return (
+        inputs.get(str(audio)) == key["audio"]
+        and bool(weights)
+        and all(inputs.get(str(model / name)) == digest for name, digest in weights.items())
+    )
 
 
 def carried(context: str, result: Mapping[str, object], *, enabled: bool) -> str:
@@ -294,15 +410,20 @@ class Worker:
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8"
         )
 
-    def send(self, chunk: Chunk, prompt: str) -> None:
+    def send(self, chunk: Chunk, prompt: str, temperature: float = 0.0) -> None:
         if self.process.stdin is None:
             raise ReplayError("The recognition worker has no input pipe")
-        line = {"start": chunk.start, "end": chunk.end, "prompt": prompt}
+        line = {
+            "start": chunk.start,
+            "end": chunk.end,
+            "prompt": prompt,
+            "temperature": temperature,
+        }
         self.process.stdin.write(json.dumps(line, ensure_ascii=False) + "\n")
         self.process.stdin.flush()
 
-    def decode(self, chunk: Chunk, prompt: str) -> dict[str, object]:
-        self.send(chunk, prompt)
+    def decode(self, chunk: Chunk, prompt: str, temperature: float = 0.0) -> dict[str, object]:
+        self.send(chunk, prompt, temperature)
         return self.receive()
 
     def receive(self) -> dict[str, object]:
@@ -324,13 +445,19 @@ def worker(audio: Path, model: Path) -> None:
     """Decode chunks from stdin (JSON lines) with the pinned options; one result line each."""
     provider = importlib.import_module("mlx_whisper")  # deferred: orchestrator and tests skip MLX
     mlx = importlib.import_module("mlx.core")
+    stock = [importlib.import_module(f"mlx_whisper.{name}") for name in PATCHED_MODULES]
+    asr_decode_patches.install(mlx, *stock, version=metadata.version("mlx-whisper"))
     samples = read_pcm(audio)
     for line in sys.stdin:
         request = record(json.loads(line))
         start, end = int(str(request["start"])), int(str(request["end"]))
         prompt = str(request.get("prompt") or "")
+        temperature = float(str(request.get("temperature") or 0.0))
         audio_chunk = samples[start:end].astype(np.float32) / 32768.0
         options = {**DECODE_OPTIONS, "initial_prompt": prompt or None}
+        if temperature:  # seeded per call: the sample does not depend on earlier requests
+            mlx.random.seed(REPAIR_SEED)
+            options["temperature"] = temperature
         result = provider.transcribe(audio_chunk, path_or_hf_repo=str(model), **options)
         # MLX keeps freed buffers cached per chunk shape: measured +0.35 GiB per chunk, 32 GB
         # after a long recording. Releasing them each chunk keeps the worker at its model size.
@@ -480,13 +607,28 @@ def run(
     chunks = speech_chunks(samples, levels)
     planned = streams_of(chunks, streams)
     store = output / "chunks"
+    key = store_key(audio, model)
+    if store.exists() and not adopted(store, key, audio, model):
+        shutil.rmtree(store)  # results of other inputs (or unbound ones) are never reused
     store.mkdir(parents=True, exist_ok=True)
+    (store / STORE_KEY).write_text(json.dumps(key, indent=1) + "\n", encoding="utf-8")
+    workers = [Worker(audio, model) for _ in planned]
+
+    def kept(chunk: Chunk, result: dict[str, object]) -> dict[str, object]:
+        path = store / f"{chunk.name}.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+        return result
 
     def done(chunk: Chunk) -> dict[str, object] | None:
         path = store / f"{chunk.name}.json"
-        return record(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
+        if not path.exists():
+            return None
+        stored = record(json.loads(path.read_text(encoding="utf-8")))
+        fixed = repaired(stored, chunk, workers[0].decode)  # stored before the repair existed
+        return kept(chunk, fixed) if fixed != stored else stored
 
-    workers = [Worker(audio, model) for _ in planned]
     started = time.monotonic()
 
     def decode_round(todo: list[tuple[int, Chunk, str]]) -> list[dict[str, object]]:
@@ -496,11 +638,7 @@ def run(
         results = []
         for (index, chunk, prompt), result in zip(todo, first, strict=True):
             final = guarded(chunk, prompt, result, workers[index].decode)
-            path = store / f"{chunk.name}.json"
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(final, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, path)
-            results.append(final)
+            results.append(kept(chunk, repaired(final, chunk, workers[index].decode)))
         return results
 
     try:
@@ -512,6 +650,7 @@ def run(
     rows, snapped = onset_snapped(rows, speech_frames(levels, ONSET_ABOVE_FLOOR_DB))
     rows, joined = words_joined(rows, speech_frames(levels, ONSET_ABOVE_FLOOR_DB))
     guards = [record(result.get("guard")) for result in results.values()]
+    repairs = [record(r["repair"]) for r in results.values() if "repair" in r]
     summary: dict[str, object] = {
         "version": 1,
         "method": "context-aware-interleaved-streams (arXiv 2608.31170)",
@@ -524,6 +663,10 @@ def run(
         "retries": sum(1 for guard in guards if guard.get("retry")),
         "untrusted": sum(1 for guard in guards if not guard.get("trusted")),
         "droppedTails": sum(1 for guard in guards if guard.get("droppedTail")),
+        "repairs": {
+            method: sum(1 for repair in repairs if repair.get("method") == method)
+            for method in ("subwindow", "temperature", "dropped")
+        },
         "voicedClamps": clamped,
         "onsetSnaps": snapped,
         "wordJoins": joined,
@@ -567,7 +710,8 @@ def publish(
         raise ReplayError("Refusing to overwrite recognition labels or their manifest")
     summary = run(audio, model, work, streams=1, context=True)
     recognized = record(json.loads((work / "labels.json").read_text(encoding="utf-8")))
-    code = [Path(__file__), Path(caption_io.__file__), Path(caption_linguistics.__file__)]
+    code = [Path(__file__), Path(caption_io.__file__), Path(caption_linguistics.__file__),
+            Path(asr_decode_patches.__file__)]  # fmt: skip
     weights = sorted(path for path in model.iterdir() if path.is_file())
     with wave.open(str(audio), "rb") as stream:
         samples = stream.getnframes()
