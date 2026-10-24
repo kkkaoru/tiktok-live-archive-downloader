@@ -527,13 +527,14 @@ public enum TranscriptCatalog {
         var invalidRecords: [String] = []
 
         /// A movie is superseded only while its recorded path and size still match.
+        /// A delivery alias is sized by the movie it names, as it is when found eligible.
         func matches(_ movie: URL, in folder: URL, fileManager: FileManager) -> Bool {
             let relative = movie.pathComponents.dropFirst(folder.pathComponents.count)
                 .joined(separator: "/")
             guard let recordedSize = sizesByRelativePath[relative] else { return false }
             do {
                 let attributes = try fileManager.attributesOfItem(
-                    atPath: movie.path(percentEncoded: false))
+                    atPath: movie.resolvingSymlinksInPath().path(percentEncoded: false))
                 // An unreadable or changed file is not the recorded one, so it stays eligible.
                 return (attributes[.size] as? Int) == recordedSize
             } catch {

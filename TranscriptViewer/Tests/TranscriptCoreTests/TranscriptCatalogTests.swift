@@ -501,6 +501,20 @@ struct TranscriptCatalogTests {
         try FileManager.default.removeItem(at: root)
     }
 
+    @Test func supersededAliasMatchesByTheMovieItNames() throws {
+        let root = try Self.makeRoot("lib-superseded-alias")
+        let delivery = root.appending(path: "revisions/x/delivery", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: delivery, withIntermediateDirectories: true)
+        try Data(count: 7).write(to: root.appending(path: "revisions/x/movie.mp4"))
+        let alias = delivery.appending(path: "a.mp4")
+        try FileManager.default.createSymbolicLink(
+            atPath: alias.path, withDestinationPath: "../movie.mp4")
+        let result = TranscriptCatalog.SupersededSet(
+            sizesByRelativePath: ["revisions/x/delivery/a.mp4": 7], invalidRecords: [])
+        #expect(result.matches(alias, in: root, fileManager: .default))
+        try FileManager.default.removeItem(at: root)
+    }
+
     @Test func youtubeEditsCarryTheirPublicationDateAndPreferTheReview() throws {
         let root = try Self.makeRoot("lib-youtube-date")
         let delivery = root.appending(
