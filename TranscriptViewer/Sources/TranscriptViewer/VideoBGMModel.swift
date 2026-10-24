@@ -26,6 +26,10 @@ final class VideoBGMModel {
             refresh()
         }
     }
+    /// Silences the BGM for every video without changing any video's setting, until resumed.
+    var stopped = false {
+        didSet { refresh() }
+    }
     private(set) var key: String?
     private(set) var playingID: BGMTrack.ID?
     private(set) var videoPlaying = false
@@ -129,7 +133,8 @@ final class VideoBGMModel {
         }
         if setting.mode == .automatic, let movie { levels(movie) }
         player.volume = volume
-        guard videoPlaying else {
+        // Paused, not unloaded: resuming continues the track where it stopped.
+        guard videoPlaying, !stopped else {
             player.pause()
             return
         }

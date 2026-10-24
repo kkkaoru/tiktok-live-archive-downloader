@@ -412,7 +412,9 @@ offloaded copies match) and the BGM's level is `track.json` `loudness` (written 
 backfill with `python -m replay.bgm_library loudness`). Missing data shows 音量データなし and
 assumes −20 dBFS talk and a −10 dBFS BGM. Both modes follow the video's own volume and mute. The
 choice and volume are saved per recording ID (else movie file name) in the app's preferences, not
-in `edits/`.
+in `edits/`. **BGMを止める** pauses the BGM for every video without changing any video's choice or
+volume; **BGMを再開** continues the track where it stopped. The stop lasts until resumed or the app
+quits (it is not saved).
 
 ### Looping BGM from a talk stream
 

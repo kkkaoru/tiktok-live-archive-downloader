@@ -163,6 +163,37 @@ struct VideoBGMTests {
         library.player.replaceCurrentItem(with: nil)
     }
 
+    @Test func stoppingTheBGMKeepsEveryVideosSettingAndResumesWhereItWas() throws {
+        let fixture = try BGMFixture()
+        defer { #expect(throws: Never.self) { try fixture.remove() } }
+        try fixture.add()
+        let library = BGMLibraryModel(root: fixture.root, volume: 1, defaultID: "CYzeUrG3p9o")
+        var saved: [[String: VideoBGMSetting]] = []
+        let model = VideoBGMModel(library: library, settings: [:])
+        model.store = { saved.append($0) }
+        model.loadLevels = { _ in nil }
+        model.open(Self.video("first"))
+        model.setting.mode = .manual
+        model.videoPlaybackChanged(true)
+        let item = model.player.currentItem
+        #expect(model.playingID == "CYzeUrG3p9o")
+        let controls = VideoBGMControls(model: model)
+        try controls.inspect().find(button: "BGMを止める").tap()
+        #expect(model.stopped)
+        #expect(model.player.rate == 0)
+        #expect(model.player.currentItem === item)
+        #expect(model.setting.mode == .manual)
+        #expect(saved.count == 1)
+        model.open(Self.video("second"))
+        #expect(model.player.rate == 0)
+        try controls.inspect().find(button: "BGMを再開").tap()
+        #expect(!model.stopped)
+        #expect(model.player.currentItem === item)
+        #expect(model.player.rate > 0)
+        model.player.pause()
+        model.player.replaceCurrentItem(with: nil)
+    }
+
     @Test func theChooserSearchesShowsArtworkAndSavesTheChoice() async throws {
         let fixture = try BGMFixture()
         defer { #expect(throws: Never.self) { try fixture.remove() } }

@@ -57,6 +57,18 @@ struct VideoBGMControls: View {
                 .accessibilityHint("検索とサムネイル付きの候補を開きます")
                 // A popover is its own window, so typing there never triggers S, ← or →.
                 .popover(isPresented: $choosing, content: picker)
+                Button {
+                    model.stopped.toggle()
+                } label: {
+                    Label(
+                        model.stopped ? "BGMを再開" : "BGMを止める",
+                        systemImage: model.stopped ? "play.circle" : "pause.circle"
+                    )
+                    .frame(minHeight: Chrome.hit)
+                    .contentShape(Rectangle())
+                }
+                .disabled(model.track == nil)
+                .help("BGMの選択と音量はそのままで、BGMだけを止めます／再開します")
             }
             HStack(spacing: 12) {
                 Picker("BGM音量の調整方法", selection: $model.setting.mode) {
