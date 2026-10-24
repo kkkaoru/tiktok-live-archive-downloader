@@ -107,6 +107,32 @@ succeed, and retain a recovery manifest. Do not offload working directories or
 all evidence via directory symlinks. Cross-volume hardlinks are not supported.
 This compatibility support is not an automatic relocation or background cleanup.
 
+## R2-only deliveries of idle recordings
+
+`python -m replay.delivery_offload RECORDING --role delivery --path MOVIE --key
+media/NAME [--link final/candidate.mp4] [--evidence pipeline-evidence.json]
+[--dry-run]` reads the R2 object back in full through a temporary authenticated
+Worker, compares its size and SHA-256 with the local file, appends the result to
+`edits/<recording>/offload.json` atomically, and only then deletes the file and the
+hardlinks it names (a file with an unnamed hardlink is refused). The web-viewer sync checks every
+part's MD5 against the ETag R2 returns and records each upload's streamed SHA-256,
+size and multipart ETag in `sync-state.json` `uploads`; once the upload Worker
+reports ETags on `/head`, an offload whose size, ETag and SHA-256 match that record
+skips the read-back (files uploaded earlier are still read back in full). `python -m
+replay.r2_fetch RECORDING --role delivery` checks the disk floor, downloads into a
+hidden partial file in the target folder, verifies the SHA-256, restores mode and
+mtime, links it into place without overwriting and restores the recorded links.
+
+`edit_completion check` reports such a delivery as `offloaded (R2, sha256 verified
+at …)` with state `offloaded` and a `fetch required` stage: it is never a pass, and
+stages that need the bytes fetch first. The pipeline's `finish`, `excitement` and
+completion-gate steps fetch an offloaded movie back; `upload` compares the sync state with the
+recorded size and mtime instead (intermediate retirement keeps waiting while the
+movie is absent). The web-viewer catalog rebuilds an
+offloaded delivery's data (transcript, summary, excitement) and lists its movie
+without a local path, so the sync publishes data changes but never drops or
+re-uploads the movie.
+
 ## Keeping disk and SSD use bounded
 
 Free space is a shared resource. The floor is the larger of 30 GiB and 5% of the volume,
@@ -205,8 +231,96 @@ redoes the recording. `publish` hardlinks the movie into the recording's bound s
 `python -m replay.edit_completion check edits/replay-<id>` assesses in minutes
 (`replay.pipeline_completion`). The last step, `upload`, runs the web viewer's `sync`
 (`web-viewer/src/bin/sync.ts`, one at a time under `web-viewer/sync.lock`), so a published
-recording reaches Cloudflare without a separate command. Keep Compressor open while it renders; it reports "job controller
-is down" when the app quits after a submission.
+recording reaches Cloudflare without a separate command. It passes `--only <delivery stem>`: only
+this recording's movie is uploaded, while every changed data file goes too. The catalog is
+published only once no listed movie is missing from the bucket, and the sync logs `catalog
+deferred` otherwise. A movie changed outside a pipeline therefore holds the catalog back until a
+full `bun run sync` (no `--only`; dry-run first) sends it. Keep Compressor open while it renders; it reports "job controller
+is down" when the app quits after a submission. `summary` first passes the completion gate and
+supersedes the recording's incomplete older revisions (one run suffices), `publish` moves an older
+flow's unverified `evidence/candidate-selection.json` to `evidence/retired/`, and `retire-renders`
+deletes the `alpha/` and `compose/` media once the gate passed. GPU leases serve the newest
+broadcast first (`gpu_lease.newest_first` of the dated original), so a rerun keeps its place.
+A waiter takes a free lease only while one stays free for every higher-ranked waiter, and
+`gpu-leases/holders.jsonl` logs each acquire and release (recording, step, wait and hold
+seconds). `python -m replay.lease_priority` prints the unfinished recordings by remaining GPU
+work; `--apply` writes that order into `gpu-leases/settings.json`, which is live configuration
+bound into no receipt. `recording_queue run --order-leases` refreshes it every tick; a settings
+file with `"manual": true` keeps a hand-set priority (restart processes started before
+2026-10-24 first: their lease code refuses the `manual` key). Caption-render reads
+`compressor-leases/in-flight.json` (`{"inFlight": 1..4}`) at each launch in place of the
+configured Compressor jobs in flight, again outside every hashed configuration. A failed step is classified from what its attempt wrote (`replay.step_retry`,
+signatures from the 10-24 failure survey) and leaves `steps/logs/<step>-<ns>.failure.json`
+(class, subclass, cause, retried or why not). Only transient failures (Compressor controller,
+submit or empty output, upload network, compose `media_edit` calls, MPS out of memory) are rerun,
+after 30/60/120 s, at most 3 times an hour per step, and after the first retry only while the
+previous attempt finished more receipts; deterministic, unknown and operator-stop failures stop. Separation, ASR, YOLO tracking, onsets, compose and every cleanup chunk also hold a
+machine-wide memory reservation (`replay.memory_admission`, `edits/work/memory-reservations/`)
+of their peak: a job starts only while all reservations fit physical memory minus 10 GiB, free
+memory is at least 20% and the kernel's memory pressure is normal (alone, a job waits only for
+critical pressure). A job reserves the larger of its estimate and its largest measured physical
+footprint × 1.25 (`footprints.json`: each process's lifetime-maximum `ri_phys_footprint`,
+which includes Metal/MPS memory, summed over the step's process group; `ps` resident sizes miss
+GPU memory and are never used). A measured footprint also caps the job's torch MPS allocations
+at no less than twice that footprint and never below the reservation, through
+`PYTORCH_MPS_HIGH_WATERMARK_RATIO` (it raises instead of swapping; MLX has only a soft limit).
+`settings.json` there may set `budgetGiB`, `headroomGiB`, `peaksGiB` and `hardCaps`. A queue
+with `"slots": "auto"` launches every ready recording, one per tick, while memory admits more.
+yolo-track detects every frame once and streams each frame's caption boxes (grown along their
+glyphs, keyed by the decoded clock) to `<recording>/yolo-boxes-v1/` (`replay.yolo_boxes`); its
+rows stay those of the sampled frames. A cleanup chunk of a new description waits, unadmitted,
+until its boxes are there and then skips its own decode and YOLO pass (`YOLO_BOXES stored` in
+the chunk log, `"boxes"` in `admission.jsonl`); when yolo-track ends without them or publishes
+nothing new for 300 s, chunks detect for themselves as before (`fallback`, `YOLO_BOXES detected`).
+With `edits/work/gpu-orchestra/settings.json` `{"enabled": true}` the machine GPU leases are
+orchestrated by `replay.gpu_orchestra`: each job holds GPU units (cleanup chunk 0.5; the other
+weights in `weights`) within a budget of 1.0, cleanup chunks first, then onsets and compose, then
+yolo-track, separation and asr, then benchmarks (`python -m replay.gpu_orchestra run --units U
+--name N -- COMMAND`); a waiter's class improves every 600 s it waits. `python -m
+replay.gpu_orchestra status` shows units, running and waiting jobs. Compressor and the compose
+encode engine keep their own lease directories.
+A failed workflow stage's last run and verify log lines are appended to the step log, and
+`steps/logs/memory.jsonl` samples free memory, swap and the largest processes every minute.
+
+`python -m replay.recording_queue run --queue edits/work/recording-pipeline/queue.json --defaults
+edits/work/recording-pipeline/DEFAULTS-v1.json` keeps up to `slots` (1-3) queued recordings
+running, newest broadcast first, each launched through `recording_pipeline` in its own tmux
+server, so restarting the runner never stops a pipeline. It derives every state from the
+recording's files (receipts, pipeline lock, launch status); a recording whose last two launches
+failed since `src/replay` last changed is held until the code changes. `"paused": true` in the
+queue stops new launches; `recording_queue add QUEUE ID` appends a recording.
+
+### Native caption rendering from the Motion parts
+
+The finished `.moti` caption parts stay the editable master (open and edit them in Motion).
+With a `nativeRender` section in a recording's `captions.json` (`binary`, `binarySha256`,
+`floor`, `sample`, `workers`; new recordings receive it from the defaults' `captions`),
+caption-render runs `replay.caption_render_native run`: the pinned `caption-alpha-render` reads
+each `.moti` directly (`MotionCaptionDocument`) and writes the same alpha movies and job states
+Compressor would, so compose and finish are unchanged. First, the `sample` busiest readable
+parts are rendered both ways and must pass `replay.caption_parity` against the pinned `floor`;
+a failed gate renders every part with Motion + Compressor. A part the reader cannot verify (its
+skeleton differs from the pinned template: another element, flag or parameter, a non-linear
+Type On key, a non-black/white outline, a sideways shadow) is rendered by Motion + Compressor
+alone. `caption-render-v1/native/receipt.json` (pinned in the step receipt) records the renderer
+(`native`, `mixed` or `compressor`), the gate and every fallback with its reason; investigate a
+fallback rather than forcing native. Without the section, caption-render is unchanged.
+
+Known gap (2026-10-24): files Motion itself re-saves have not been tested; the round trip was
+made by editing the ozml directly (text, a Type On key time, a position, one title's gradient
+colour) and verified against Compressor's render of that file. A Motion-saved file whose
+serialization differs is refused and falls back to Motion + Compressor until its round trip is
+checked with the native Motion tools and the skeleton is re-pinned.
+
+### Delivered voice level
+
+With `voiceLoudness` (`targetLufs`, `truePeakDbtp`; new recordings receive −18 LUFS and −1 dBTP
+from the defaults' `captions`), compose measures the tempo voice once (FFmpeg `ebur128`,
+integrated loudness and true peak) and encodes it with one static gain toward the target,
+lowered so the true peak stays at the ceiling; there is no compression or limiting. The
+measurement and gain are written to `final/audio/tempo.m4a.loudness.json` and pinned in the
+compose receipt. The CTC alignment keeps reading the unscaled tempo PCM; the viewers' BGM
+level and the excitement loudness are measured from the delivered movie, so they follow it.
 
 ## Resumable processing and measured phases
 

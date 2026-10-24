@@ -166,7 +166,9 @@ keeps measured text and origins, and uses the existing FCP frame-sampling rule
 (`start <= frame time < end`). A caption without a display frame or overlapping
 frame intervals fails; no caption is silently discarded or retimed.
 
-Each part has at most 32 stages and covers only its own local interval. The
+Each part has at most `--max-stages` stages (default 32; `replay.caption_parts` passes
+`MAX_PART_SENTENCES` so a caption window renders as one Compressor part, since each Compressor
+job has a ~4.5 s fixed cost) and covers only its own local interval. The
 manifest records its global `offsetFrame`; gaps remain empty, and the caller
 must retain that offset when compositing. Outputs are private and non-overwriting.
 The existing XML, rendering and resource limits remain in force. This is candidate
