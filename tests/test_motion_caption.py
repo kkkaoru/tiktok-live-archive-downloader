@@ -1557,9 +1557,109 @@ def test_reveal_keys_show_each_stage_on_its_own_frames() -> None:
     )
 
 
+def spoken(*items: tuple[str, float, float]) -> tuple[motion_reveal_stages.Token, ...]:
+    return tuple(motion_reveal_stages.Token(text, start, end, start) for text, start, end in items)
+
+
+def test_each_grapheme_appears_on_its_spoken_onset_frame() -> None:
+    chain = [reveal_stage("あ", 0, 3), reveal_stage("あいうえ", 3, 30)]
+    # One second into the recording: the part starts on frame 30 of the tokens' clock.
+    tokens = spoken(("あ", 1.0, 1.1), ("い", 1.1, 1.2), ("うえ", 1.3, 1.5))
+    assert motion_reveal_stages.onset_frames(chain, 30, tokens, 30) == [0, 3, 9, 12]
+    assert motion_reveal_stages.reveal(chain, 30, tokens, 30) == (
+        (Fraction(0), Fraction(1, 8)),
+        (Fraction(2, 30), Fraction(1, 8)),
+        (Fraction(3, 30), Fraction(3, 8)),
+        (Fraction(8, 30), Fraction(3, 8)),
+        (Fraction(9, 30), Fraction(5, 8)),
+        (Fraction(11, 30), Fraction(5, 8)),
+        (Fraction(12, 30), Fraction(7, 8)),
+    )
+
+
+def test_a_measured_onset_after_the_stage_start_shows_nothing_until_it_is_voiced() -> None:
+    chain = [reveal_stage("あい", 0, 30)]
+    # Recognized at 0.0 s (the anchor paging used), voiced at 0.2 s and 0.5 s.
+    tokens = (
+        motion_reveal_stages.Token("あ", 0.2, 0.5, 0.0),
+        motion_reveal_stages.Token("い", 0.5, 0.8, 0.0),
+    )
+    assert motion_reveal_stages.onset_frames(chain, 30, tokens) == [6, 15]
+    assert motion_reveal_stages.reveal(chain, 30, tokens) == (
+        (Fraction(0), Fraction(0)),
+        (Fraction(5, 30), Fraction(0)),
+        (Fraction(6, 30), Fraction(1, 4)),
+        (Fraction(14, 30), Fraction(1, 4)),
+        (Fraction(15, 30), Fraction(3, 4)),
+    )
+
+
+def test_a_token_anchor_outside_the_stage_is_not_its_speech() -> None:
+    chain = [reveal_stage("あ", 0, 30)]
+    tokens = (motion_reveal_stages.Token("あ", 0.2, 0.5, 1.5),)
+    assert motion_reveal_stages.onset_frames(chain, 30, tokens) == [0]
+
+
+def test_a_negative_token_anchor_is_refused() -> None:
+    document = {"tokens": [{"text": "あ", "start": 0.0, "end": 0.1, "anchor": -1.0}]}
+    with pytest.raises(ReplayError, match="anchor"):
+        motion_reveal_stages.tokens_of(document)
+
+
+def test_a_token_anchor_defaults_to_its_start() -> None:
+    document = {"tokens": [{"text": "あ", "start": 0.25, "end": 0.5}]}
+    assert motion_reveal_stages.tokens_of(document) == (
+        motion_reveal_stages.Token("あ", 0.25, 0.5, 0.25),
+    )
+
+
+def test_unspoken_graphemes_follow_and_disagreeing_text_spreads_over_its_speech() -> None:
+    punctuated = [reveal_stage("あい!", 0, 30)]
+    tokens = spoken(("あい", 0.0, 0.4))
+    assert motion_reveal_stages.onset_frames(punctuated, 30, tokens) == [0, 6, 6]
+    assert motion_reveal_stages.reveal(punctuated, 30, tokens) == (
+        (Fraction(0), Fraction(1, 6)),
+        (Fraction(5, 30), Fraction(1, 6)),
+        (Fraction(6, 30), Fraction(5, 6)),
+    )
+    disagreeing = [reveal_stage("いた", 0, 30)]
+    assert motion_reveal_stages.onset_frames(disagreeing, 30, spoken(("いだ", 0.0, 0.4))) == [0, 6]
+    # Onsets stay inside the stage, and speech outside it is not its own.
+    late = [reveal_stage("あい", 0, 3)]
+    assert motion_reveal_stages.onset_frames(late, 30, spoken(("あい", 0.0, 0.2))) == [0, 2]
+    unheard = [reveal_stage("あい", 0, 3)]
+    assert motion_reveal_stages.onset_frames(unheard, 30, spoken(("あい", 0.5, 0.6))) == [0, 0]
+    assert motion_reveal_stages.reveal(unheard, 30, ()) == (
+        (Fraction(0), Fraction(3, 4)),
+        (Fraction(3, 30), Fraction(3, 4)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ({"tokens": {}}, "not a list"),
+        ({"tokens": [{"text": "", "start": 0, "end": 1}]}, "Invalid speech token"),
+        ({"tokens": [{"text": "あ", "start": True, "end": 1}]}, "Invalid speech token"),
+        ({"tokens": [{"text": "あ", "start": 2, "end": 1}]}, "interval"),
+        ({"tokens": [{"text": "あ", "start": 0, "end": "1"}]}, "interval"),
+    ],
+)
+def test_invalid_speech_tokens_are_refused(document: dict[str, object], message: str) -> None:
+    with pytest.raises(ReplayError, match=message):
+        motion_reveal_stages.tokens_of(document)
+
+
+def test_speech_tokens_are_ordered_by_onset() -> None:
+    document = {
+        "tokens": [{"text": "い", "start": 1, "end": 2}, {"text": "あ", "start": 0, "end": 1}]
+    }
+    assert motion_reveal_stages.tokens_of(document) == spoken(("あ", 0.0, 1.0), ("い", 1.0, 2.0))
+
+
 def test_a_stage_splitting_a_composed_character_is_refused() -> None:
     with pytest.raises(ReplayError, match="composed character"):
-        motion_reveal_stages.visible("か", [2])
+        motion_reveal_stages.graphemes("か", [2])
 
 
 @pytest.mark.parametrize(
@@ -1584,13 +1684,35 @@ def test_invalid_reveal_plans_are_refused(
 def test_too_many_titles_are_refused(
     sequence_template: str, stage_plan: dict[str, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(motion_reveal_stages, "MAX_SEQUENCE_SENTENCES", 1)
+    monkeypatch.setattr(motion_reveal_stages, "MAX_PART_SENTENCES", 1)
     plan = {**stage_plan, "placements": [
         {"text": "字", "startFrame": 0, "endFrame": 1, "x": 0, "y": 100},
         {"text": "幕", "startFrame": 1, "endFrame": 30, "x": 0, "y": 100},
     ]}  # fmt: skip
     with pytest.raises(ReplayError, match="Too many"):
         motion_reveal_stages.prepare(sequence_template, plan)
+
+
+def test_a_part_holds_more_titles_than_one_sequence(
+    sequence_template: str, stage_plan: dict[str, object]
+) -> None:
+    placements = [
+        {"text": "あい"[i % 2], "startFrame": i, "endFrame": i + 1, "x": 0, "y": 100}
+        for i in range(33)
+    ]
+    document = motion_reveal_stages.prepare(
+        sequence_template, {**stage_plan, "frames": 33, "placements": placements}
+    )
+    assert document.count('name="Caption Face"') == 33
+
+
+def test_a_sequence_beyond_its_sentence_limit_is_refused(sequence_template: str) -> None:
+    placement = CaptionPlacement("AB", 0, 30, ((Fraction(0), Fraction(1)),), 0, 0)
+    with pytest.raises(ReplayError, match="bounded"):
+        build_caption_sequence(
+            sequence_template, (placement, placement), expected_text="Title", frames=30,
+            width=1080, height=1920, max_sentences=1,
+        )  # fmt: skip
 
 
 def test_the_reveal_cli_writes_once(
@@ -1601,5 +1723,32 @@ def test_the_reveal_cli_writes_once(
     arguments = [str(tmp_path / "t.moti"), str(tmp_path / "p.json"), str(tmp_path / "o.moti")]
     assert motion_reveal_stages.main(arguments) == 0
     assert "字幕" in (tmp_path / "o.moti").read_text(encoding="utf-8")
+    with pytest.raises(ReplayError, match="overwrite"):
+        motion_reveal_stages.main(arguments)
+
+
+def test_the_reveal_cli_times_by_speech_and_records_the_onsets(
+    sequence_template: str, stage_plan: dict[str, object], tmp_path: Path
+) -> None:
+    (tmp_path / "t.moti").write_text(sequence_template, encoding="utf-8")
+    (tmp_path / "p.json").write_text(json.dumps(stage_plan), encoding="utf-8")
+    tokens = {
+        "tokens": [
+            {"text": "字", "start": 1.0, "end": 1.2},
+            {"text": "幕", "start": 1.2, "end": 1.4},
+        ]
+    }
+    (tmp_path / "k.json").write_text(json.dumps(tokens), encoding="utf-8")
+    record = tmp_path / "o.reveal.json"
+    arguments = [
+        str(tmp_path / "t.moti"), str(tmp_path / "p.json"), str(tmp_path / "o.moti"),
+        "--tokens", str(tmp_path / "k.json"), "--offset-frame", "30", "--record", str(record),
+    ]  # fmt: skip
+    assert motion_reveal_stages.main(arguments) == 0
+    titles = json.loads(record.read_text(encoding="utf-8"))
+    assert titles["offsetFrame"] == 30
+    # Each grapheme appears where it is voiced: 幕 at 1.2 s is part frame 6.
+    assert [title["graphemeFrames"] for title in titles["titles"]] == [[0, 6]]
+    (tmp_path / "o.moti").unlink()
     with pytest.raises(ReplayError, match="overwrite"):
         motion_reveal_stages.main(arguments)
