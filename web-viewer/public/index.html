@@ -84,7 +84,9 @@ window.__catalog = fetch(window.__api + "/api/catalog", { cache: "no-cache" }).t
   #empty { color:var(--muted); text-align:center; margin-top:20vh; }
   h2 { font-size:18px; margin:0 0 12px; }
   h3 { font-size:14px; color:var(--muted); margin:22px 0 8px; font-weight:600; }
-  video { display:block; width:100%; aspect-ratio:16/9; max-height:56dvh; background:#000; border-radius:var(--radius); }
+  /* The box takes the movie's own aspect (--ratio, set on loadedmetadata) and is as wide as the
+     column allows without growing taller than --cap. */
+  video { --cap:56dvh; --ratio:1.777778; display:block; width:min(100%, calc(var(--cap) * var(--ratio))); aspect-ratio:var(--ratio); margin-inline:auto; background:#000; border-radius:var(--radius); }
   button, input { line-height:inherit; }
   button, input[type=text], input[type=search] { font:inherit; line-height:inherit; font-size:14px; padding:7px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel2); color:var(--text); cursor:pointer; }
   button:hover { border-color:#3b4252; }
@@ -142,7 +144,8 @@ window.__catalog = fetch(window.__api + "/api/catalog", { cache: "no-cache" }).t
     #cur { font-size:19px; min-height:54px; }
     .near { min-width:230px; }
     button, input[type=text] { min-height:44px; }
-    video { max-height:40dvh; }
+    video { --cap:40dvh; }
+    video.portrait { --cap:68dvh; }
   }
   @media (prefers-reduced-motion: reduce) { * { scroll-behavior:auto !important; } }
 </style>
@@ -252,8 +255,15 @@ const $ = s => document.querySelector(s);
 const API = window.__api, SHARE = Boolean(API);
 // Kept as element references: a pop-out window adopts these nodes, so $() would miss them.
 const UTTS = $("#utts"), SUMMARY = $("#sumBody");
+// The player box follows the movie's own aspect (deliveries are 9:16, originals often 16:9).
+$("#video").addEventListener("loadedmetadata", (event) => {
+  const { videoWidth: width, videoHeight: height } = event.target;
+  if (!width || !height) return;
+  event.target.style.setProperty("--ratio", (width / height).toFixed(6));
+  event.target.classList.toggle("portrait", height > width);
+});
 const mediaSrc = (v, kind) => kind === "original" ? `${API}/media-original/${v.original.movie}` : `${API}/media/${v.movie}`;
-const state = { date: "", month: null, navs: 0, streamer: "", filter: "all", videos: [], current: null, data: new Map(), utterances: [], curIdx: -2, source: "edited" };
+const state = { channels: {}, date: "", month: null, navs: 0, streamer: "", filter: "all", videos: [], current: null, data: new Map(), utterances: [], curIdx: -2, source: "edited" };
 const fmt = s => { s = Math.max(0, Math.floor(s)); const h = s/3600|0, m = s%3600/60|0, r = s%60;
   return `${h}時間${m}分${r}秒`; };
 
