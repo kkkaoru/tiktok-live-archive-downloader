@@ -524,9 +524,9 @@ function renderClips(status = state.clipStatus) {
     const li = document.createElement("li"), head = document.createElement("div"), play = document.createElement("button");
     const title = document.createElement("span"), len = document.createElement("span"), summary = document.createElement("p"), ranges = document.createElement("div");
     li.className = "clip"; li.dataset.id = clip.id; head.className = "head"; title.className = "title"; len.className = "len"; ranges.className = "ranges";
-    play.textContent = "▶ 再生"; play.setAttribute("aria-label", `${clip.title}を再生（${secs(clip.duration)}）`); play.onclick = () => playClip(clip);
+    play.textContent = "🔁 再生"; play.setAttribute("aria-label", `${clip.title}をループ再生（${secs(clip.duration)}）`); play.onclick = () => playClip(clip);
     const loop = document.createElement("button");
-    loop.textContent = "🔁 ループ再生"; loop.setAttribute("aria-label", `${clip.title}をループ再生`); loop.onclick = () => playClip(clip, 0, true);
+    loop.textContent = "▶ 1回再生"; loop.setAttribute("aria-label", `${clip.title}を1回だけ再生`); loop.onclick = () => playClip(clip, 0, false);
     title.textContent = clip.title;
     len.textContent = `${secs(clip.duration)}・${KIND[clip.kind] ?? clip.kind}${PATTERN[clip.pattern] ? `・${PATTERN[clip.pattern]}` : ""}${clip.ranges.length > 1 ? `・${clip.ranges.length}区間` : ""}`;
     summary.textContent = clip.summary;
@@ -538,7 +538,7 @@ function renderClips(status = state.clipStatus) {
     head.append(play, loop, title, len); li.append(head, summary, ranges); return li;
   }));
 }
-function playClip(clip, index = 0, loop = false) {
+function playClip(clip, index = 0, loop = true) {
   const v = state.current; if (!v) return;
   // Clip times follow the edited clock: switch first, then start once the edited movie is loaded.
   if (state.source === "original" && v.movie) { setSource("edited"); $("#video").onloadedmetadata = () => playClip(clip, index, loop); return; }

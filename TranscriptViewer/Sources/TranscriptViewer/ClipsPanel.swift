@@ -62,21 +62,22 @@ struct ClipRow: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Button {
-                    play(clip, 0, false)
-                } label: {
-                    Label("再生", systemImage: "play.fill")
-                        .frame(minWidth: Chrome.hit, minHeight: Chrome.hit)
-                        .contentShape(Rectangle())
-                }
-                .accessibilityLabel("\(clip.title)を再生（\(ClipPoint.seconds(clip.duration))）")
-                Button {
                     play(clip, 0, true)
                 } label: {
-                    Label("ループ再生", systemImage: "repeat")
+                    Label("再生", systemImage: "repeat")
                         .frame(minWidth: Chrome.hit, minHeight: Chrome.hit)
                         .contentShape(Rectangle())
                 }
-                .accessibilityLabel("\(clip.title)をループ再生")
+                .accessibilityLabel("\(clip.title)をループ再生（\(ClipPoint.seconds(clip.duration))）")
+                .help("切り抜きを繰り返し再生します")
+                Button {
+                    play(clip, 0, false)
+                } label: {
+                    Label("1回再生", systemImage: "play.fill")
+                        .frame(minWidth: Chrome.hit, minHeight: Chrome.hit)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("\(clip.title)を1回だけ再生")
                 Text(clip.title).font(.headline)
                 Spacer(minLength: 0)
                 Text(lengthLabel).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
@@ -85,7 +86,7 @@ struct ClipRow: View {
             ScrollView(.horizontal) {
                 HStack(spacing: 6) {
                     ForEach(Array(clip.ranges.enumerated()), id: \.offset) { index, range in
-                        Button(rangeLabel(index, range)) { play(clip, index, false) }
+                        Button(rangeLabel(index, range)) { play(clip, index, true) }
                             .frame(minHeight: Chrome.hit)
                     }
                 }

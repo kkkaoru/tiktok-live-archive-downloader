@@ -140,7 +140,7 @@ final class ClipsModel {
     }
 
     /// Starts `clip` at range `index`; returns where to seek.
-    func start(_ clip: ClipPoint, range index: Int = 0, loop: Bool = false) -> Double? {
+    func start(_ clip: ClipPoint, range index: Int = 0, loop: Bool = true) -> Double? {
         let cursor = ClipCursor(clip: clip, index: index, loop: loop)
         self.cursor = cursor
         return cursor.range?.start

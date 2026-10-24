@@ -484,7 +484,8 @@ final class PlaybackSession {
 
     /// Plays `clip` from range `index`; its later ranges follow on their own, over and over
     /// when `loop` is set.
-    func play(_ clip: ClipPoint, range index: Int = 0, loop: Bool = false) {
+    /// Clips loop by default: a clip is short, and watched again and again.
+    func play(_ clip: ClipPoint, range index: Int = 0, loop: Bool = true) {
         guard let start = clips.start(clip, range: index, loop: loop) else { return }
         resumeTimelineFollow()
         seek(to: start)
