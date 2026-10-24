@@ -13,6 +13,7 @@ const previous = {
   sources: { a: { movie: fp(90, null), transcript: fp(1, "t1"), "sibling:gone": fp(1, "g") } },
   data: { "data/a.json": "old" },
   catalogSha256: "old-catalog",
+  uploads: { "media/a.mp4": { size: 90, sha256: "a".repeat(64), etag: "e-1" } },
 };
 
 it("loads an empty state when no file exists", async () => {
@@ -27,6 +28,7 @@ it("loads and validates a saved state", async () => {
     sources: {},
     data: { "data/a.json": "x" },
     catalogSha256: null,
+    uploads: {},
   });
 });
 
@@ -59,6 +61,9 @@ it("records published data, catalog and settled media", () => {
   expect(state.sources.a?.movie).toStrictEqual(fp(100, null));
   expect(state.data).toStrictEqual({ "data/a.json": "new" });
   expect(state.catalogSha256).toBe("new-catalog");
+  expect(state.uploads).toStrictEqual({
+    "media/a.mp4": { size: 90, sha256: "a".repeat(64), etag: "e-1" },
+  });
 });
 
 it("keeps the previous media record until the upload succeeds", () => {

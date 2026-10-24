@@ -39,6 +39,17 @@ export const stateSchema = z.object({
   sources: z.record(z.string(), z.record(z.string(), fingerprintSchema)),
   data: z.record(z.string(), z.string()),
   catalogSha256: z.string().nullable(),
+  // Per media key, what an upload sent: SHA-256 streamed while reading it, and the multipart ETag.
+  uploads: z
+    .record(
+      z.string(),
+      z.object({
+        size: z.number().int().nonnegative(),
+        sha256: z.string().regex(/^[0-9a-f]{64}$/),
+        etag: z.string().min(1),
+      }),
+    )
+    .default({}),
 });
 
 export type SyncConfig = z.infer<typeof configSchema>;
@@ -48,4 +59,4 @@ export type Fingerprint = z.infer<typeof fingerprintSchema>;
 export type SyncState = z.infer<typeof stateSchema>;
 export type Sources = Record<string, Fingerprint>;
 
-export const EMPTY_STATE: SyncState = { sources: {}, data: {}, catalogSha256: null };
+export const EMPTY_STATE: SyncState = { sources: {}, data: {}, catalogSha256: null, uploads: {} };

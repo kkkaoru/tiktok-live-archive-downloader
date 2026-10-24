@@ -1,15 +1,21 @@
 import { expect, it } from "vitest";
-import { createFakeFs, createFakeHttp, createFakeRunner } from "./fakes.fake.ts";
+import { createFakeFs, createFakeHttp, createFakeRunner, zerosEtag } from "./fakes.fake.ts";
+import type { HttpClient } from "./ports.ts";
 import {
   CHUNK_BYTES,
   deleteUploader,
   deployUploader,
   ensureProxy,
+  PARALLEL_PARTS,
+  PART_ATTEMPTS,
   READY_ATTEMPTS,
   uploaderConfig,
   uploadFile,
   waitUntilReady,
 } from "./uploader.ts";
+
+// The fake file system reads 4 zero bytes per part.
+const ZEROS_MD5 = "f1d3ff8443297732862df21dc4e57262";
 
 const project = {
   directory: "/p/uploader",
@@ -103,7 +109,7 @@ it("uploads a small file as one part", async () => {
     call.url.endsWith("/create")
       ? { status: 200, body: { uploadId: "u1" } }
       : call.url.includes("/part")
-        ? { status: 200, body: { partNumber: 1, etag: "e1" } }
+        ? { status: 200, body: { partNumber: 1, etag: ZEROS_MD5 } }
         : { status: 200, body: { ok: true } },
   );
   const { sleep } = sleeper();
@@ -116,7 +122,11 @@ it("uploads a small file as one part", async () => {
     path: "/f",
     size: 10,
   });
-  expect(parts).toBe(1);
+  expect(parts).toStrictEqual({
+    parts: 1,
+    sha256: "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+    etag: "bb4512f7b430c4ff12d53c6796475fbe-1",
+  });
   expect(calls.map((call) => `${call.method} ${call.url.replace("https://u", "")}`)).toStrictEqual([
     "POST /create",
     "PUT /part?key=media%2Fa%20b.mp4&uploadId=u1&n=1",
@@ -130,7 +140,10 @@ it("splits a large file into several parts", async () => {
     call.url.endsWith("/create")
       ? { status: 200, body: { uploadId: "u" } }
       : call.url.includes("/part")
-        ? { status: 200, body: { partNumber: Number(call.url.split("n=")[1]), etag: "e" } }
+        ? {
+            status: 200,
+            body: { partNumber: Number(call.url.split("n=")[1]), etag: zerosEtag(call.bodyBytes) },
+          }
         : { status: 200, body: {} },
   );
   const { sleep } = sleeper();
@@ -143,7 +156,11 @@ it("splits a large file into several parts", async () => {
     path: "/f",
     size: CHUNK_BYTES + 1,
   });
-  expect(parts).toBe(2);
+  expect(parts).toStrictEqual({
+    parts: 2,
+    sha256: "8855508aade16ec573d21e6a485dfd0a7624085c1a14b5ecdd6485de0c6839a4",
+    etag: "c97bba22a3c3989fbe2132f63bcfe1a5-2",
+  });
   expect(calls.length).toBe(4);
 });
 
@@ -154,7 +171,7 @@ it("retries a failing part", async () => {
     call.url.endsWith("/create")
       ? { status: 200, body: { uploadId: "u" } }
       : call.url.includes("/part")
-        ? { status: statuses.shift() ?? 200, body: { partNumber: 1, etag: "e" } }
+        ? { status: statuses.shift() ?? 200, body: { partNumber: 1, etag: ZEROS_MD5 } }
         : { status: 200, body: {} },
   );
   const { sleep, slept } = sleeper();
@@ -168,6 +185,156 @@ it("retries a failing part", async () => {
     size: 5,
   });
   expect(slept.length).toBe(1);
+});
+
+it("retries a part whose ETag is not its MD5, then gives up", async () => {
+  const { fs } = createFakeFs({});
+  const etags = ['"0123"', `"${ZEROS_MD5}"`];
+  const { http } = createFakeHttp((call) =>
+    call.url.endsWith("/create")
+      ? { status: 200, body: { uploadId: "u" } }
+      : call.url.includes("/part")
+        ? { status: 200, body: { partNumber: 1, etag: etags.shift() ?? "bad" } }
+        : { status: 200, body: {} },
+  );
+  const { sleep, slept } = sleeper();
+  const request = { services: { fs, http }, sleep, url: "https://u", token: "t", key: "k" };
+  const sent = await uploadFile({ ...request, path: "/f", size: 5 });
+  expect(sent.etag).toBe("bb4512f7b430c4ff12d53c6796475fbe-1");
+  expect(slept).toStrictEqual([3000]);
+  await expect(uploadFile({ ...request, path: "/f", size: 5 })).rejects.toThrow(
+    "Part 1 of k failed or did not match its MD5",
+  );
+});
+
+it("aborts without a hash when a part cannot be read", async () => {
+  const { fs } = createFakeFs({});
+  const { http, calls } = createFakeHttp((call) =>
+    call.url.endsWith("/create")
+      ? { status: 200, body: { uploadId: "u" } }
+      : { status: 200, body: {} },
+  );
+  const failing = { ...fs, readChunk: async () => Promise.reject(new Error("disk")) };
+  const { sleep } = sleeper();
+  await expect(
+    uploadFile({
+      services: { fs: failing, http },
+      sleep,
+      url: "https://u",
+      token: "t",
+      key: "k",
+      path: "/f",
+      size: CHUNK_BYTES + 1,
+    }),
+  ).rejects.toThrow("disk");
+  expect(calls.map((call) => call.url)).toStrictEqual(["https://u/create", "https://u/abort"]);
+});
+
+it("doubles the delay between attempts of a part", async () => {
+  const { fs } = createFakeFs({});
+  const { http } = createFakeHttp((call) =>
+    call.url.endsWith("/create")
+      ? { status: 200, body: { uploadId: "u" } }
+      : call.url.includes("/part")
+        ? new Error("network")
+        : { status: 200, body: {} },
+  );
+  const { sleep, slept } = sleeper();
+  await expect(
+    uploadFile({
+      services: { fs, http },
+      sleep,
+      url: "https://u",
+      token: "t",
+      key: "k",
+      path: "/f",
+      size: 5,
+    }),
+  ).rejects.toThrow("Part 1 of k failed");
+  expect(slept).toStrictEqual([3000, 6000, 12000, 24000, 48000, 96000]);
+  expect(slept.length).toBe(PART_ATTEMPTS - 1);
+});
+
+it("starts the next part as soon as any part finishes, never more than the pool at once", async () => {
+  const { fs } = createFakeFs({});
+  const count = PARALLEL_PARTS + 2;
+  const started: number[] = [];
+  const inFlight = { now: 0, most: 0 };
+  const release: { first: () => void } = { first: () => undefined };
+  const firstDone = new Promise<void>((resolve) => {
+    release.first = resolve;
+  });
+  const http: HttpClient = {
+    request: async ({ url, body }) => {
+      if (!url.includes("/part")) {
+        return { status: 200, body: { uploadId: "u", ok: true }, setCookie: null };
+      }
+      const etag = zerosEtag(body?.length ?? 0);
+      const partNumber = Number(url.split("n=")[1]);
+      started.push(partNumber);
+      inFlight.now += 1;
+      inFlight.most = Math.max(inFlight.most, inFlight.now);
+      if (partNumber === count) {
+        release.first(); // the last part started while part 1 is still in flight
+      }
+      await (partNumber === 1 ? firstDone : new Promise((resolve) => setTimeout(resolve, 0)));
+      inFlight.now -= 1;
+      return { status: 200, body: { partNumber, etag }, setCookie: null };
+    },
+  };
+  const { sleep } = sleeper();
+  const parts = await uploadFile({
+    services: { fs, http },
+    sleep,
+    url: "https://u",
+    token: "t",
+    key: "k",
+    path: "/f",
+    size: CHUNK_BYTES * (count - 1) + 1,
+  });
+  expect(parts.parts).toBe(count);
+  expect(started).toStrictEqual(Array.from({ length: count }, (_, index) => index + 1));
+  expect(inFlight.most).toBe(PARALLEL_PARTS);
+});
+
+it("starts no further part once the upload is aborted", async () => {
+  const { fs } = createFakeFs({});
+  const urls: string[] = [];
+  const release: { aborted: () => void } = { aborted: () => undefined };
+  const aborted = new Promise<void>((resolve) => {
+    release.aborted = resolve;
+  });
+  const http: HttpClient = {
+    request: async ({ url }) => {
+      urls.push(url);
+      if (url.endsWith("/abort")) {
+        release.aborted();
+      }
+      if (!url.includes("/part")) {
+        return { status: 200, body: { uploadId: "u", ok: true }, setCookie: null };
+      }
+      if (url.endsWith("n=1")) {
+        throw new Error("network");
+      }
+      await aborted; // the other parts are still in flight when the upload is aborted
+      return { status: 200, body: { partNumber: 2, etag: ZEROS_MD5 }, setCookie: null };
+    },
+  };
+  const { sleep } = sleeper();
+  await expect(
+    uploadFile({
+      services: { fs, http },
+      sleep,
+      url: "https://u",
+      token: "t",
+      key: "k",
+      path: "/f",
+      size: CHUNK_BYTES * 40,
+    }),
+  ).rejects.toThrow("Part 1 of k failed");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const parts = urls.filter((url) => url.includes("/part"));
+  expect(parts.length).toBe(PART_ATTEMPTS + PARALLEL_PARTS - 1);
 });
 
 it("aborts the multipart upload when a part keeps failing", async () => {

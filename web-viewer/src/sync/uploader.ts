@@ -1,5 +1,6 @@
 // Runs with bun. A temporary, token-gated uploader Worker for media larger than the 300 MB
 // limit of `cf r2 objects put`: deployed with a fresh random token, always deleted afterwards.
+import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { z } from "zod";
 import { findWorkersUrl } from "./cf.ts";
@@ -7,7 +8,9 @@ import type { FileSystem, HttpClient, ProcessRunner } from "./ports.ts";
 
 export const CHUNK_BYTES = 64 * 1024 * 1024;
 export const PARALLEL_PARTS = 4;
-export const PART_ATTEMPTS = 4;
+// A failed part aborts the whole multipart upload, so a part rides out a few minutes of outage:
+// the retry delay doubles from READY_DELAY_MS (3 + 6 + ... + 96 s, about 3 min in all).
+export const PART_ATTEMPTS = 7;
 export const READY_ATTEMPTS = 30;
 export const READY_DELAY_MS = 3000;
 const READY_STATUS = 200;
@@ -58,6 +61,15 @@ interface UploadRequest {
 interface PartRequest extends UploadRequest {
   uploadId: string;
   partNumber: number;
+  chunk: Uint8Array;
+}
+
+// What R2 holds after an upload: the whole file's SHA-256 and the multipart ETag, which R2
+// derives from the parts' MD5s (each checked against the ETag R2 returned for it).
+export interface Uploaded {
+  parts: number;
+  sha256: string;
+  etag: string;
 }
 
 interface ProxyRequest {
@@ -182,9 +194,8 @@ async function sendPart(
   request: PartRequest,
   remaining: number,
 ): Promise<z.infer<typeof partSchema>> {
-  const start = (request.partNumber - 1) * CHUNK_BYTES;
-  const length = Math.min(CHUNK_BYTES, request.size - start);
-  const chunk = await request.services.fs.readChunk({ path: request.path, start, length });
+  const { chunk } = request;
+  const md5 = createHash("md5").update(chunk).digest("hex");
   const query = `key=${encodeURIComponent(request.key)}&uploadId=${encodeURIComponent(request.uploadId)}&n=${request.partNumber}`;
   const response = await request.services.http
     .request({
@@ -195,27 +206,38 @@ async function sendPart(
     })
     .catch(() => ({ status: 0, body: null }));
   const parsed = partSchema.safeParse(response.body);
-  if (response.status > 0 && response.status < OK_LIMIT && parsed.success) {
+  const sent = response.status > 0 && response.status < OK_LIMIT && parsed.success;
+  if (sent && parsed.data.etag.replaceAll('"', "") === md5) {
     return parsed.data;
   }
   if (remaining <= 1) {
-    throw new Error(`Part ${request.partNumber} of ${request.key} failed`);
+    throw new Error(`Part ${request.partNumber} of ${request.key} failed or did not match its MD5`);
   }
-  await request.sleep(READY_DELAY_MS);
+  await request.sleep(READY_DELAY_MS * 2 ** (PART_ATTEMPTS - remaining));
   return sendPart(request, remaining - 1);
 }
 
-async function inBatches<T, R>(items: T[], run: (item: T) => Promise<R>): Promise<R[]> {
-  const batches = Array.from({ length: Math.ceil(items.length / PARALLEL_PARTS) }, (_, index) =>
-    items.slice(index * PARALLEL_PARTS, (index + 1) * PARALLEL_PARTS),
-  );
-  return batches.reduce<Promise<R[]>>(async (done, batch) => {
-    const finished = await done;
-    return [...finished, ...(await Promise.all(batch.map(run)))];
-  }, Promise.resolve([]));
+// PARALLEL_PARTS workers each take the next part as soon as theirs is done: fixed batches of four
+// left three connections idle behind the slowest part of every batch.
+async function inPool<T, R>(items: T[], run: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  const pending = [...items.entries()];
+  const worker = async (): Promise<void> => {
+    for (let next = pending.shift(); next !== undefined; next = pending.shift()) {
+      results[next[0]] = await run(next[1]);
+    }
+  };
+  const workers = Array.from({ length: Math.min(PARALLEL_PARTS, items.length) }, worker);
+  try {
+    await Promise.all(workers);
+  } catch (error) {
+    pending.length = 0; // the upload is aborted: start no further part
+    throw error;
+  }
+  return results;
 }
 
-export async function uploadFile(request: UploadRequest): Promise<number> {
+export async function uploadFile(request: UploadRequest): Promise<Uploaded> {
   const { http } = request.services;
   const base = { http, token: request.token };
   const created = uploadIdSchema.parse(
@@ -223,16 +245,40 @@ export async function uploadFile(request: UploadRequest): Promise<number> {
   );
   const count = Math.max(1, Math.ceil(request.size / CHUNK_BYTES));
   const numbers = Array.from({ length: count }, (_, index) => index + 1);
+  // The pool takes parts in order, so chaining the reads hashes the file in order too.
+  const whole = createHash("sha256");
+  let reading: Promise<unknown> = Promise.resolve();
+  const read = (partNumber: number): Promise<Uint8Array> => {
+    const start = (partNumber - 1) * CHUNK_BYTES;
+    const length = Math.min(CHUNK_BYTES, request.size - start);
+    const chunk = reading.then(() =>
+      request.services.fs.readChunk({ path: request.path, start, length }),
+    );
+    // A failed read aborts the upload through its part; the chain only orders the hashing.
+    reading = chunk.then(
+      (bytes) => whole.update(bytes),
+      () => undefined,
+    );
+    return chunk;
+  };
   try {
-    const parts = await inBatches(numbers, (partNumber) =>
-      sendPart({ ...request, uploadId: created.uploadId, partNumber }, PART_ATTEMPTS),
+    const parts = await inPool(numbers, async (partNumber) =>
+      sendPart(
+        { ...request, uploadId: created.uploadId, partNumber, chunk: await read(partNumber) },
+        PART_ATTEMPTS,
+      ),
     );
     await postJson({
       ...base,
       url: `${request.url}/complete`,
       body: { key: request.key, uploadId: created.uploadId, parts },
     });
-    return count;
+    await reading;
+    const md5s = Buffer.concat(
+      parts.map((part) => Buffer.from(part.etag.replaceAll('"', ""), "hex")),
+    );
+    const etag = `${createHash("md5").update(md5s).digest("hex")}-${count}`;
+    return { parts: count, sha256: whole.digest("hex"), etag };
   } catch (error) {
     await postJson({
       ...base,

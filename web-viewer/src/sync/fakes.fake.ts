@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // Runs with bun. In-memory fakes for the sync ports, used by the tests only.
 import type {
   FileStat,
@@ -140,4 +141,11 @@ export function createFakeHttp(respond: (call: HttpCall) => HttpReply | Error): 
     },
   };
   return { http, calls };
+}
+
+// The ETag R2 returns for a part: its MD5. The fake file system's chunks are zero bytes.
+export function zerosEtag(bytes: number | null): string {
+  return createHash("md5")
+    .update(new Uint8Array(bytes ?? 0))
+    .digest("hex");
 }

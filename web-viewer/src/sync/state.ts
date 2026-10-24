@@ -68,5 +68,6 @@ export function nextState(request: NextStateRequest): SyncState {
     sources,
     data: request.dataPublished ? publishedData : request.previous.data,
     catalogSha256: request.catalogPublished ? request.catalogSha : request.previous.catalogSha256,
+    uploads: request.previous.uploads,
   };
 }

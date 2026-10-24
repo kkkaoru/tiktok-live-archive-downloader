@@ -21,5 +21,6 @@ await runSync({
     sleep: (milliseconds) => delay(milliseconds),
     newToken: () => randomBytes(TOKEN_BYTES).toString("base64url"),
     projectDirectory,
+    clock: () => performance.now(),
   },
 });

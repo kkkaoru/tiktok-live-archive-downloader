@@ -34,6 +34,7 @@ function input(overrides: Partial<PlanInput>): PlanInput {
       sources: { "a-review": sources },
       data: { "data/a-review.json": "d1" },
       catalogSha256: "c1",
+      uploads: {},
     },
     remoteSizes: {},
     proxySizes: {},
