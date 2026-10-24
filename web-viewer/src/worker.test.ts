@@ -125,7 +125,7 @@ it("disables the debug route once the token expires", async () => {
 // In-memory R2 with the subset the share routes use.
 function memoryBucket(seed: Record<string, string>) {
   const store = new Map(Object.entries(seed));
-  const object = (key: string) => {
+  const object = (key: string, range?: { offset: number; length: number }) => {
     const body = store.get(key);
     return body === undefined
       ? null
@@ -134,11 +134,16 @@ function memoryBucket(seed: Record<string, string>) {
           httpEtag: '"e"',
           body,
           json: async () => JSON.parse(body),
+          arrayBuffer: async () =>
+            new TextEncoder().encode(
+              range ? body.slice(range.offset, range.offset + range.length) : body,
+            ).buffer,
         };
   };
   return {
     store,
-    get: async (key: string) => object(key),
+    get: async (key: string, options?: { range?: { offset: number; length: number } }) =>
+      object(key, options?.range),
     head: async (key: string) => object(key),
     put: async (key: string, body: string) => {
       store.set(key, body);
@@ -181,14 +186,14 @@ function shareEnvironment() {
 
 type ShareEnvironment = ReturnType<typeof shareEnvironment>;
 
-function shareCall(env: ShareEnvironment, path: string, init: RequestInit = {}) {
+function shareCall(env: object, path: string, init: RequestInit = {}) {
   return worker.fetch(
     new Request(`https://example.test${path}`, { redirect: "manual", ...init }),
     env,
   );
 }
 
-function adminWrite(env: ShareEnvironment, method: string, body: object, as = cookie) {
+function adminWrite(env: object, method: string, body: object, as = cookie) {
   return shareCall(env, "/api/admin/shares", {
     method,
     headers: { Cookie: as, Origin: "https://example.test", "Content-Type": "application/json" },
@@ -211,7 +216,7 @@ function solve(env: object, token: string, response = "ok", origin = "https://ex
   );
 }
 
-async function passChallenge(env: ShareEnvironment, token: string): Promise<string> {
+async function passChallenge(env: object, token: string): Promise<string> {
   stubSiteverify({ success: true, hostname: "example.test" });
   const response = await solve(env, token);
   return (response.headers.get("Set-Cookie") ?? "").split(";")[0] ?? "";
@@ -457,20 +462,45 @@ function clipEnvironment() {
   return { env, sent };
 }
 
-it("queues clips that are missing and reads them once stored", async () => {
+it("never queues clips that are missing and reads them once stored", async () => {
   const { env, sent } = clipEnvironment();
   const get = () => shareCall(env, "/api/clips/v1.json", { headers: { Cookie: cookie } });
   const first = await (await get()).json();
   env.MEDIA.store.set("clips/videos/v1.json", JSON.stringify({ movieKey: "a".repeat(32) }));
   env.MEDIA.store.set(`clips/${"a".repeat(32)}.json`, JSON.stringify(CLIP_RECORD));
-  env.MEDIA.store.delete("clips/pending/v1.json");
   const second = await (await get()).json();
   const unknown = await shareCall(env, "/api/clips/v9.json", { headers: { Cookie: cookie } });
   expect([first, sent, second.status, unknown.status]).toStrictEqual([
-    { status: "pending", force: false },
-    [{ videoId: "v1", force: false }],
+    { status: "missing" },
+    [],
     "ready",
     404,
+  ]);
+});
+
+it("stores a record from the bearer under the published movie's key", async () => {
+  const { env, sent } = clipEnvironment();
+  env.MEDIA.store.set("media/v1.mp4", "abc");
+  const put = (body: unknown, headers: Record<string, string>) =>
+    shareCall(env, "/api/clips/v1.json", { method: "PUT", headers, body: JSON.stringify(body) });
+  const bearer = { Authorization: `Bearer ${CLIPS_TOKEN}` };
+  const stored = await put({ ...CLIP_RECORD, movieKey: "local" }, bearer);
+  const invalid = await put({ videoId: "v1" }, bearer);
+  const cookieUser = await put(CLIP_RECORD, { Cookie: cookie, Origin: "https://example.test" });
+  expect([
+    await stored.json(),
+    invalid.status,
+    cookieUser.status,
+    JSON.parse(String(env.MEDIA.store.get("clips/2e8e504c5e6b886af70f8c03cbfc31ac.json"))).movieKey,
+    env.MEDIA.store.get("clips/videos/v1.json"),
+    sent,
+  ]).toStrictEqual([
+    { outcome: "written" },
+    400,
+    405,
+    "2e8e504c5e6b886af70f8c03cbfc31ac",
+    '{"movieKey":"2e8e504c5e6b886af70f8c03cbfc31ac"}',
+    [],
   ]);
 });
 
@@ -534,4 +564,330 @@ it("acks processed queue messages and retries failures", async () => {
     env,
   );
   expect(log).toStrictEqual(["ack", "retry", "ack"]);
+});
+
+const KASUMI = "UCEmlNV5-edGhNWYDMeGDgWw";
+const MILK = "UCCaEb7R2MKNapKQ6WWN80Ig";
+const CHANNELS_KEY = "config/youtube-channels.json";
+const CACHE_URL = "https://channels.internal/v1";
+let clock = 2_000_000_000_000;
+
+const record = (revision: number, label: string) =>
+  JSON.stringify({ version: 1, revision, channels: { [KASUMI]: { label } } });
+
+// Fresh KV and Cache API fakes, with the clock moved past every isolate-memory entry.
+async function channelTiers() {
+  clock += 3_600_000;
+  vi.spyOn(Date, "now").mockImplementation(() => clock);
+  const edge = new Map<string, string>();
+  vi.stubGlobal("caches", {
+    default: {
+      match: async (key: string) => {
+        const body = edge.get(key);
+        return body === undefined ? undefined : new Response(body);
+      },
+      put: async (key: string, response: Response) => {
+        edge.set(key, await response.text());
+      },
+    },
+  });
+  const kv = new Map<string, string>();
+  const reads: string[] = [];
+  const ALLOW_KV = {
+    get: async (key: string): Promise<unknown> => {
+      reads.push(`kv ${key}`);
+      const body = kv.get(key);
+      return body === undefined ? null : JSON.parse(body);
+    },
+    put: async (key: string, body: string) => {
+      kv.set(key, body);
+    },
+  };
+  const session = await sessionCookie({ uid: "1", u: "tester", exp: clock / 1000 + 600 });
+  const base = clipEnvironment().env;
+  const MEDIA = {
+    ...base.MEDIA,
+    get: async (key: string) => {
+      if (key === CHANNELS_KEY) reads.push("r2");
+      return base.MEDIA.get(key);
+    },
+  };
+  const env = { ...base, ALLOW_KV, MEDIA };
+  const read = async () => {
+    const response = await shareCall(env, "/api/channels.json", { headers: { Cookie: session } });
+    return { etag: response.headers.get("ETag"), body: await response.json() };
+  };
+  return { env, edge, kv, reads, read, session, store: base.MEDIA.store };
+}
+
+function channelsCall(env: object, method: string, body: object, auth: string) {
+  return worker.fetch(
+    new Request("https://example.test/api/channels.json", {
+      method,
+      headers: { Authorization: auth, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+    env,
+  );
+}
+
+it("fills isolate memory, the Cache API and KV from R2 on a cold read", async () => {
+  const tiers = await channelTiers();
+  tiers.store.set(CHANNELS_KEY, record(3, "熊童子かすみ"));
+  const first = await tiers.read();
+  const second = await tiers.read();
+  expect([first, second.etag, tiers.reads]).toStrictEqual([
+    {
+      etag: '"r3"',
+      body: { version: 1, revision: 3, channels: { [KASUMI]: { label: "熊童子かすみ" } } },
+    },
+    '"r3"',
+    ["kv youtube-channels", "r2"],
+  ]);
+  expect([tiers.kv.get("youtube-channels"), tiers.edge.get(CACHE_URL)]).toStrictEqual([
+    record(3, "熊童子かすみ"),
+    record(3, "熊童子かすみ"),
+  ]);
+});
+
+it("reads the Cache API, then KV, once isolate memory expires, refilling the faster tiers", async () => {
+  const tiers = await channelTiers();
+  tiers.edge.set(CACHE_URL, record(5, "edge"));
+  tiers.kv.set("youtube-channels", record(4, "kv"));
+  tiers.store.set(CHANNELS_KEY, record(4, "r2"));
+  const edge = await tiers.read();
+  clock += 29_000;
+  const memory = await tiers.read();
+  clock += 2_000;
+  tiers.edge.delete(CACHE_URL);
+  const kv = await tiers.read();
+  expect([edge.etag, memory.etag, kv.etag, tiers.reads]).toStrictEqual([
+    '"r5"',
+    '"r5"',
+    '"r4"',
+    ["kv youtube-channels"],
+  ]);
+  expect(tiers.edge.get(CACHE_URL)).toBe(record(4, "kv"));
+});
+
+it("treats a malformed tier as a miss and an absent R2 record as no labels", async () => {
+  const tiers = await channelTiers();
+  tiers.edge.set(CACHE_URL, '{"users":[]}');
+  tiers.kv.set("youtube-channels", '{"users":[]}');
+  const empty = await tiers.read();
+  expect([empty.body, tiers.reads]).toStrictEqual([
+    { version: 1, revision: 0, channels: {} },
+    ["kv youtube-channels", "r2"],
+  ]);
+});
+
+it("writes R2, KV, the Cache API and isolate memory, starting from R2 not a stale tier", async () => {
+  const tiers = await channelTiers();
+  tiers.store.set(CHANNELS_KEY, record(7, "熊童子かすみ"));
+  tiers.edge.set(CACHE_URL, record(1, "stale"));
+  await tiers.read();
+  const bearer = `Bearer ${CLIPS_TOKEN}`;
+  const set = await channelsCall(
+    tiers.env,
+    "PUT",
+    { channelId: MILK, label: " かしすみるく " },
+    bearer,
+  );
+  const expected = JSON.stringify({
+    version: 1,
+    revision: 8,
+    channels: { [KASUMI]: { label: "熊童子かすみ" }, [MILK]: { label: "かしすみるく" } },
+  });
+  const afterSet = await tiers.read();
+  const removed = await channelsCall(tiers.env, "DELETE", { channelId: KASUMI }, bearer);
+  const afterRemove = await tiers.read();
+  expect([set.headers.get("ETag"), afterSet.etag, tiers.store.get(CHANNELS_KEY)]).toStrictEqual([
+    '"r8"',
+    '"r8"',
+    '{"version":1,"revision":9,"channels":{"UCCaEb7R2MKNapKQ6WWN80Ig":{"label":"かしすみるく"}}}',
+  ]);
+  expect([tiers.kv.get("youtube-channels"), tiers.edge.get(CACHE_URL)]).toStrictEqual([
+    tiers.store.get(CHANNELS_KEY),
+    tiers.store.get(CHANNELS_KEY),
+  ]);
+  expect([
+    JSON.stringify(afterSet.body),
+    (await removed.json()).revision,
+    afterRemove.body,
+  ]).toStrictEqual([
+    expected,
+    9,
+    { version: 1, revision: 9, channels: { [MILK]: { label: "かしすみるく" } } },
+  ]);
+});
+
+it("rejects channel writes without the bearer and invalid channel IDs or labels", async () => {
+  const tiers = await channelTiers();
+  const bearer = `Bearer ${CLIPS_TOKEN}`;
+  const viewer = await shareCall(tiers.env, "/api/channels.json", {
+    method: "PUT",
+    headers: { Cookie: tiers.session, "Content-Type": "application/json" },
+    body: JSON.stringify({ channelId: KASUMI, label: "x" }),
+  });
+  const anonymous = await shareCall(tiers.env, "/api/channels.json", {});
+  const badId = await channelsCall(tiers.env, "PUT", { channelId: "@handle", label: "x" }, bearer);
+  const empty = await channelsCall(tiers.env, "PUT", { channelId: KASUMI, label: " " }, bearer);
+  const long = await channelsCall(
+    tiers.env,
+    "PUT",
+    { channelId: KASUMI, label: "x".repeat(65) },
+    bearer,
+  );
+  const control = await channelsCall(
+    tiers.env,
+    "PUT",
+    { channelId: KASUMI, label: "a\nb" },
+    bearer,
+  );
+  const post = await channelsCall(tiers.env, "POST", { channelId: KASUMI }, bearer);
+  expect([
+    viewer.status,
+    anonymous.status,
+    badId.status,
+    empty.status,
+    long.status,
+    control.status,
+    post.status,
+    tiers.store.has(CHANNELS_KEY),
+  ]).toStrictEqual([403, 401, 400, 400, 400, 400, 405, false]);
+});
+
+it("gives a share only its own video's channel label", async () => {
+  const tiers = await channelTiers();
+  const catalog = { videos: [{ ...VIDEO, channelId: KASUMI }] };
+  tiers.store.set("catalog.json", JSON.stringify(catalog));
+  tiers.store.set(
+    CHANNELS_KEY,
+    JSON.stringify({
+      version: 1,
+      revision: 2,
+      channels: { [KASUMI]: { label: "熊童子かすみ" }, [MILK]: { label: "別" } },
+    }),
+  );
+  const { env } = tiers;
+  const created = await adminWrite(env, "POST", { videoId: "v1", edited: true }, tiers.session);
+  const token = (await created.json()).share.token;
+  const pass = await passChallenge(env, token);
+  const response = await shareCall(env, `/s/${token}/api/channels.json`, {
+    headers: { Cookie: pass },
+  });
+  expect(await response.json()).toStrictEqual({
+    version: 1,
+    channels: { [KASUMI]: { label: "熊童子かすみ" } },
+  });
+});
+
+// R2's ranged get: offset/length, offset only or suffix; it answers with the whole size.
+function rangeBucket(content: string, refuses: boolean) {
+  const heads: string[] = [];
+  const object = (body: string) => ({ size: content.length, httpEtag: '"m"', body });
+  type R2Range = { offset?: number; length?: number; suffix?: number };
+  return {
+    heads,
+    head: async (key: string) => {
+      heads.push(key);
+      return key === "media/v.mp4" ? object(content) : null;
+    },
+    get: async (key: string, options?: { range?: R2Range }) => {
+      if (key !== "media/v.mp4") return null;
+      const range = options?.range;
+      if (range === undefined) return object(content);
+      const start =
+        range.suffix === undefined ? (range.offset ?? 0) : content.length - range.suffix;
+      if (refuses && start >= content.length) throw new Error("InvalidRange");
+      const end = range.length === undefined ? content.length : start + range.length;
+      return object(content.slice(Math.max(start, 0), end));
+    },
+  };
+}
+
+async function media(
+  range: string | null,
+  options: { refuses?: boolean; path?: string; method?: string } = {},
+) {
+  const MEDIA = rangeBucket("0123456789", options.refuses ?? true);
+  // Minted now: an earlier test moves Date.now() hours ahead.
+  const fresh = await sessionCookie({
+    uid: "1",
+    u: "tester",
+    exp: Math.floor(Date.now() / 1000) + 600,
+  });
+  const headers: Record<string, string> = { Cookie: fresh };
+  if (range !== null) headers.Range = range;
+  const response = await worker.fetch(
+    new Request(`https://example.test${options.path ?? "/media/v.mp4"}`, {
+      method: options.method ?? "GET",
+      headers,
+    }),
+    { ...environment, MEDIA },
+  );
+  return [
+    response.status,
+    response.headers.get("Content-Range"),
+    response.headers.get("Content-Length"),
+    response.headers.get("ETag"),
+    await response.text(),
+    MEDIA.heads.length,
+  ];
+}
+
+it("serves media ranges straight from R2 and asks head() only without a usable range", async () => {
+  expect([
+    await media(null),
+    await media("bytes=4-"),
+    await media("bytes=2-5"),
+    await media("bytes=8-20"),
+    await media("bytes=-3"),
+    await media("bytes=-30"),
+    await media("bytes=12-"),
+    await media("bytes=10-", { refuses: false }),
+    await media("bytes=5-2"),
+    await media("bytes=a-"),
+    await media("bytes=-0"),
+    await media(null, { method: "HEAD" }),
+    await media("bytes=0-1", { path: "/media/missing.mp4" }),
+    await media(null, { path: "/media/missing.mp4" }),
+  ]).toStrictEqual([
+    [200, null, "10", '"m"', "0123456789", 1],
+    [206, "bytes 4-9/10", "6", '"m"', "456789", 0],
+    [206, "bytes 2-5/10", "4", '"m"', "2345", 0],
+    [206, "bytes 8-9/10", "2", '"m"', "89", 0],
+    [206, "bytes 7-9/10", "3", '"m"', "789", 0],
+    [206, "bytes 0-9/10", "10", '"m"', "0123456789", 0],
+    [416, "bytes */10", null, null, "Invalid range", 1],
+    [416, "bytes */10", null, null, "Invalid range", 0],
+    [416, "bytes */10", null, null, "Invalid range", 1],
+    [416, "bytes */10", null, null, "Invalid range", 1],
+    [416, "bytes */10", null, null, "Invalid range", 1],
+    [200, null, "10", '"m"', "", 1],
+    [404, null, null, null, "Not found", 0],
+    [404, null, null, null, "Not found", 1],
+  ]);
+});
+
+it("keeps the download header on a ranged media answer", async () => {
+  const MEDIA = rangeBucket("0123456789", true);
+  const response = await worker.fetch(
+    new Request("https://example.test/media/v.mp4?download=1", {
+      headers: {
+        Cookie: await sessionCookie({
+          uid: "1",
+          u: "tester",
+          exp: Math.floor(Date.now() / 1000) + 600,
+        }),
+        Range: "bytes=0-0",
+      },
+    }),
+    { ...environment, MEDIA },
+  );
+  expect([
+    response.status,
+    response.headers.get("Content-Disposition"),
+    await response.text(),
+  ]).toStrictEqual([206, 'attachment; filename="v.mp4"', "0"]);
 });

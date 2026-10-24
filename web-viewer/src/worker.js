@@ -8,7 +8,7 @@
 // after a Cloudflare Turnstile check (no Turnstile keys configured: shares stay closed).
 // Until X_CLIENT_ID is configured, HTTP Basic (BASIC_USER / BASIC_PASS) stays
 // as the only gate so a half-configured deploy never opens the site.
-import { enqueue, lookup, MOVIE_KEY, refresh, requestOf } from "./clips.ts";
+import { enqueue, lookup, MOVIE_KEY, refresh, requestOf, store } from "./clips.ts";
 
 const SESSION_COOKIE = "tv_session";
 const OAUTH_COOKIE = "tv_oauth";
@@ -23,14 +23,20 @@ const SHARE_PASS_COOKIE = "tv_share";
 const SHARE_PASS_SECONDS = 60 * 60 * 12;
 const TURNSTILE_VERIFY = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const CLIPS_PATH = /^\/api\/clips\/([A-Za-z0-9._-]+)(\.json|\/reload)$/;
+// YouTube channel ID → streamer label, shared by this site and the Mac viewer.
+const CHANNELS_PATH = "/api/channels.json";
+const CHANNELS_KEY = "config/youtube-channels.json";
+const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
+const LABEL_MAX = 64;
 let allowCache = { at: 0, users: [] };
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/s/")) return shareRoute(request, url, env);
-    // The Mac viewer has no X login: it reads and reloads clips with the CLIPS_API_TOKEN bearer.
-    if (CLIPS_PATH.test(url.pathname) && (await clipsBearer(request, env))) return clipsRoute(request, url, env, { admin: true, bearer: true, queue: true });
+    // The Mac has no X login: it reads, reloads and stores clips with the CLIPS_API_TOKEN bearer.
+    if (CLIPS_PATH.test(url.pathname) && (await clipsBearer(request, env))) return clipsRoute(request, url, env, { admin: true, bearer: true });
+    if (url.pathname === CHANNELS_PATH && (await clipsBearer(request, env))) return channelsRoute(request, env, true);
     if (url.pathname === "/robots.txt") {
       return new Response("User-agent: *\nDisallow: /\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     }
@@ -47,7 +53,7 @@ export default {
         return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
       }
       if (url.pathname === "/api/me") return json({ username: session.u, admin: isAdmin(session.u, env) });
-      if (CLIPS_PATH.test(url.pathname)) return clipsRoute(request, url, env, { admin: isAdmin(session.u, env), bearer: false, queue: !session.dbg });
+      if (CLIPS_PATH.test(url.pathname)) return clipsRoute(request, url, env, { admin: isAdmin(session.u, env), bearer: false });
       if (url.pathname === "/admin" || url.pathname.startsWith("/api/admin/")) {
         if (!isAdmin(session.u, env)) return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
         if (url.pathname === "/admin") return adminPage();
@@ -74,7 +80,8 @@ export default {
     if (url.pathname === "/api/catalog") {
       return r2Json(request, env, "catalog.json");
     }
-    if (CLIPS_PATH.test(url.pathname)) return clipsRoute(request, url, env, { admin: true, bearer: false, queue: true });
+    if (url.pathname === CHANNELS_PATH) return channelsRoute(request, env, false);
+    if (CLIPS_PATH.test(url.pathname)) return clipsRoute(request, url, env, { admin: true, bearer: false });
     const dataMatch = url.pathname.match(/^\/api\/videos\/([A-Za-z0-9._-]+)\.json$/);
     if (dataMatch) {
       return r2Json(request, env, `data/${dataMatch[1]}.json`);
@@ -90,7 +97,7 @@ export default {
     return env.ASSETS.fetch(request);
   },
 
-  // R2 event notifications for data/<id>.json and the viewers' own requests: one video per message.
+  // R2 event notifications for data/<id>.json (pointer updates only) and users' reloads: one video per message.
   async queue(batch, env) {
     for (const message of batch.messages) {
       const request = requestOf(message.body);
@@ -111,10 +118,99 @@ async function clipsBearer(request, env) {
   return token.length >= 32 && header.startsWith("Bearer ") && (await sameSecret(header.slice(7), token));
 }
 
-// GET returns the stored clips (a missing record is queued and reads as pending); POST …/reload
-// recomputes them (admins, the bearer, or Basic mode). Pages poll while the status is pending.
-async function clipsRoute(request, url, env, { admin, bearer, queue }) {
+// Channels are read through four tiers, each miss filling the faster ones, like the allow-list:
+// isolate memory (30 s) → Cache API (60 s, this data center) → KV (30 s edge cacheTtl, global
+// propagation up to ~60 s) → R2 (durable source of truth). A write goes R2 → KV → Cache API
+// overwrite → this isolate's memory, so the writing isolate is current at once, other isolates in
+// the same data center within 30 s, and other data centers within the tiers' sum (about 3 min).
+// `revision` (also the ETag) grows with every write so a stale tier is recognisable.
+const CHANNELS_CACHE_URL = "https://channels.internal/v1";
+const CHANNELS_KV_KEY = "youtube-channels";
+const CHANNELS_MEMORY_MS = 30_000;
+const CHANNELS_CACHE_SECONDS = 60;
+const CHANNELS_KV_CACHE_TTL = 30;
+let channelsMemory = { at: 0, record: null };
+
+const channelsRecord = (value) =>
+  value && typeof value.channels === "object" && value.channels !== null
+    ? { version: 1, revision: Number.isInteger(value.revision) ? value.revision : 0, channels: value.channels }
+    : null;
+
+async function readChannelsDurable(env) {
+  const obj = await env.MEDIA.get(CHANNELS_KEY);
+  return (obj && channelsRecord(await obj.json())) || { version: 1, revision: 0, channels: {} };
+}
+
+function cacheChannels(record) {
+  return caches.default.put(
+    CHANNELS_CACHE_URL,
+    new Response(JSON.stringify(record), { headers: { "Cache-Control": `max-age=${CHANNELS_CACHE_SECONDS}` } }),
+  );
+}
+
+async function readChannels(env) {
+  if (channelsMemory.record && Date.now() - channelsMemory.at < CHANNELS_MEMORY_MS) return channelsMemory.record;
+  const cached = await caches.default.match(CHANNELS_CACHE_URL);
+  let record = cached ? channelsRecord(await cached.json()) : null;
+  if (!record) {
+    record = channelsRecord(await env.ALLOW_KV.get(CHANNELS_KV_KEY, { type: "json", cacheTtl: CHANNELS_KV_CACHE_TTL }));
+    if (!record) {
+      record = await readChannelsDurable(env);
+      await env.ALLOW_KV.put(CHANNELS_KV_KEY, JSON.stringify(record));
+    }
+    await cacheChannels(record);
+  }
+  channelsMemory = { at: Date.now(), record };
+  return record;
+}
+
+async function writeChannels(env, record) {
+  const body = JSON.stringify(record);
+  await env.MEDIA.put(CHANNELS_KEY, body, { httpMetadata: { contentType: "application/json" } });
+  await env.ALLOW_KV.put(CHANNELS_KV_KEY, body);
+  await cacheChannels(record);
+  channelsMemory = { at: Date.now(), record };
+}
+
+const channelsResponse = (record) => {
+  const response = json(record);
+  response.headers.set("ETag", `"r${record.revision}"`);
+  return response;
+};
+
+// Signed-in viewers read; only the bearer (CLI, Mac viewer) sets {channelId, label} with PUT
+// or removes {channelId} with DELETE.
+async function channelsRoute(request, env, write) {
+  if (request.method === "GET") return channelsResponse(await readChannels(env));
+  if (request.method !== "PUT" && request.method !== "DELETE") return new Response("Method not allowed", { status: 405 });
+  if (!write) return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
+  const body = await request.json().catch(() => null);
+  const channelId = typeof body?.channelId === "string" ? body.channelId : "";
+  const label = request.method === "PUT" && typeof body?.label === "string" ? body.label.trim() : "";
+  if (!CHANNEL_ID.test(channelId)) return json({ error: "invalid channelId" }, 400);
+  if (request.method === "PUT" && (!label || [...label].length > LABEL_MAX || /[\u0000-\u001f\u007f]/.test(label))) {
+    return json({ error: "invalid label" }, 400);
+  }
+  // Writes start from R2, never a cached tier, so a stale copy cannot drop another write.
+  // shortcut: no ETag check on the R2 put, last writer wins; add onlyIf if several writers appear.
+  const current = await readChannelsDurable(env);
+  const channels = { ...current.channels };
+  if (request.method === "PUT") channels[channelId] = { label };
+  else delete channels[channelId];
+  const record = { version: 1, revision: current.revision + 1, channels };
+  await writeChannels(env, record);
+  return channelsResponse(record);
+}
+
+// GET returns the stored clips. The Mac computes them and stores them with the bearer (PUT); Cloudflare
+// AI runs only when a user asks for it with POST …/reload (admins, the bearer, or Basic mode).
+async function clipsRoute(request, url, env, { admin, bearer }) {
   const [, videoId, kind] = url.pathname.match(CLIPS_PATH);
+  if (kind === ".json" && request.method === "PUT" && bearer) {
+    const body = await request.json().catch(() => null);
+    const outcome = await store(env, videoId, body);
+    return json({ outcome }, outcome === "written" ? 200 : outcome === "invalid" ? 400 : 404);
+  }
   const expected = kind === "/reload" ? "POST" : "GET";
   if (request.method !== expected) return new Response("Method not allowed", { status: 405 });
   if (kind === "/reload") {
@@ -127,11 +223,8 @@ async function clipsRoute(request, url, env, { admin, bearer, queue }) {
   const key = url.searchParams.get("key");
   if (key !== null && !MOVIE_KEY.test(key)) return json({ error: "invalid key" }, 400);
   const found = await lookup(env, { videoId, key, now: new Date() });
-  // Read-only debug sessions never queue work.
-  if (found.status !== "missing" || !queue) return json(found);
-  if (!(await env.MEDIA.head(`data/${videoId}.json`))) return json(found, 404);
-  await enqueue(env, { videoId, force: false }, new Date());
-  return json({ status: "pending", force: false });
+  if (found.status !== "missing" || (await env.MEDIA.head(`data/${videoId}.json`))) return json(found);
+  return json(found, 404);
 }
 
 function redirect(location) {
@@ -439,19 +532,38 @@ async function r2Json(request, env, key) {
 
 // R2 honors HTTP range reads; without this a <video> element cannot seek.
 // ?download=1 adds Content-Disposition; Range stays on so large downloads can resume.
+// A ranged GET asks R2 for the range directly (its answer carries the size); head() is needed
+// only without a range, for HEAD, and when R2 refuses the range so the 416 can name the size.
 async function serveMedia(request, url, env, key) {
+  const wanted = request.method === "HEAD" ? null : r2Range(request.headers.get("Range"));
+  if (wanted) {
+    let obj;
+    try {
+      obj = await env.MEDIA.get(key, { range: wanted.r2 });
+    } catch {
+      obj = undefined; // a range R2 refuses: answered below from head()
+    }
+    if (obj === null) return new Response("Not found", { status: 404 });
+    if (obj) {
+      const range = wanted.resolve(obj.size);
+      if (range) {
+        return new Response(obj.body, {
+          status: 206,
+          headers: {
+            ...mediaHeaders(url, key, obj),
+            "Content-Length": String(range.end - range.start + 1),
+            "Content-Range": `bytes ${range.start}-${range.end}/${obj.size}`,
+          },
+        });
+      }
+      await obj.body?.cancel?.();
+      return new Response("Invalid range", { status: 416, headers: { "Content-Range": `bytes */${obj.size}` } });
+    }
+  }
   const head = await env.MEDIA.head(key);
   if (!head) return new Response("Not found", { status: 404 });
   const size = head.size;
-  const base = {
-    "Content-Type": "video/mp4",
-    "Accept-Ranges": "bytes",
-    "Cache-Control": "private, max-age=3600",
-    ETag: head.httpEtag,
-  };
-  if (url.searchParams.get("download") === "1") {
-    base["Content-Disposition"] = `attachment; filename="${key.split("/").pop()}"`;
-  }
+  const base = mediaHeaders(url, key, head);
   if (request.method === "HEAD") {
     return new Response(null, { headers: { ...base, "Content-Length": String(size) } });
   }
@@ -472,6 +584,39 @@ async function serveMedia(request, url, env, key) {
       "Content-Range": `bytes ${range.start}-${range.end}/${size}`,
     },
   });
+}
+
+function mediaHeaders(url, key, object) {
+  const base = {
+    "Content-Type": "video/mp4",
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, max-age=3600",
+    ETag: object.httpEtag,
+  };
+  if (url.searchParams.get("download") === "1") {
+    base["Content-Disposition"] = `attachment; filename="${key.split("/").pop()}"`;
+  }
+  return base;
+}
+
+// The R2 range of a well-formed Range header, and how it resolves once the size is known
+// (exactly as parseRange); null for anything else, which takes the head() path.
+function r2Range(header) {
+  const m = header?.match(/^bytes=(\d*)-(\d*)$/);
+  if (!m || (m[1] === "" && m[2] === "")) return null;
+  const start = Number(m[1]);
+  let r2;
+  if (m[1] === "") r2 = Number(m[2]) > 0 ? { suffix: Number(m[2]) } : null;
+  else if (m[2] === "") r2 = { offset: start };
+  else r2 = Number(m[2]) < start ? null : { offset: start, length: Number(m[2]) - start + 1 };
+  if (!r2) return null;
+  return {
+    r2,
+    resolve: (size) => {
+      const range = parseRange(header, size);
+      return range === "invalid" ? null : range;
+    },
+  };
 }
 
 function parseRange(header, size) {
@@ -537,6 +682,7 @@ async function shareWrite(request, env, session) {
     video: {
       id: entry.id,
       streamer: entry.streamer,
+      ...(entry.channelId ? { channelId: entry.channelId } : {}),
       title: entry.title,
       broadcastStartJST: entry.broadcastStartJST,
       duration: entry.duration,
@@ -580,6 +726,10 @@ async function shareRoute(request, url, env) {
     return new Response(page.body, { status: page.status, headers });
   }
   if (path === "/api/catalog") return json({ videos: [video], share: { expiresAt: share.expiresAt } });
+  if (path === CHANNELS_PATH) {
+    const entry = video.channelId ? (await readChannels(env)).channels[video.channelId] : undefined;
+    return json({ version: 1, channels: entry ? { [video.channelId]: entry } : {} });
+  }
   if (path === `/api/clips/${video.id}.json`) return json(await lookup(env, { videoId: video.id, key: null, now: new Date() }));
   if (path === `/api/videos/${video.id}.json`) {
     const obj = await env.MEDIA.get(`data/${video.id}.json`);
