@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from replay import delivery_source_assembly as assembly
+from replay import delivery_source_assembly_parallel as parallel
 from replay.core import ReplayError
 from replay.delivery_render import CutRow, clips, read_chunks
 from replay.native_edit_parts import partition
@@ -613,3 +614,61 @@ def test_truncated_media(manifest: Path, tools: tuple[Path, Path]) -> None:
             ffmpeg=tools[0],
             ffprobe=tools[1],
         )
+
+
+def test_probes_cached_at_chunk_acceptance_give_the_same_assembly(
+    manifest: Path, tools: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = manifest.parent
+    ran: list[str] = []
+    real = assembly._run
+
+    def counted(
+        command: list[str],
+        stdout: Path,
+        *,
+        media: Path | None = None,
+        budget: int = assembly.MAX_MEDIA,
+        deadline: float | None = None,
+    ) -> None:
+        ran.append(stdout.name)
+        real(command, stdout, media=media, budget=budget, deadline=deadline)
+
+    monkeypatch.setattr(assembly, "_run", counted)
+
+    def join(probes: Path | None) -> None:
+        parallel.assemble_parallel(
+            manifest, sha256=assembly._digest(manifest), output=root / "joined.mov",
+            evidence=root / "evidence", ffmpeg=tools[0], ffprobe=tools[1], workers=2,
+            probes=probes,
+        )  # fmt: skip
+
+    join(None)
+    (root / "evidence").rename(root / "plain")
+    (root / "joined.mov").rename(root / "plain.mov")
+    shutil.rmtree(root / "joined.mov.assembly")
+    parallel.prefetch(root / "first/candidate.mp4", probes=root / "probes", ffprobe=tools[1])
+    parallel.prefetch(root / "second/candidate.mp4", probes=root / "probes", ffprobe=tools[1])
+    ran.clear()
+    join(root / "probes")
+    assert sorted(ran) == [
+        "concat.log",
+        "output-frames.json",
+        "output-packets.json",
+        "output-streams.json",
+    ]
+    assert (root / "joined.mov").read_bytes() == (root / "plain.mov").read_bytes()
+    plain = sorted(path.name for path in (root / "plain").iterdir())
+    assert sorted(path.name for path in (root / "evidence").iterdir()) == plain
+    differing = [
+        name
+        for name in plain
+        if (root / "plain" / name).read_bytes() != (root / "evidence" / name).read_bytes()
+    ]
+    # Only the recorded chunk clock commands differ: the cached ones decode without -threads,
+    # exactly as the serial assemble records them.
+    assert differing == ["input-0000-frames.command.json", "input-0001-frames.command.json"]
+    threaded = json.loads((root / "plain/input-0000-frames.command.json").read_text("utf-8"))
+    cached = json.loads((root / "evidence/input-0000-frames.command.json").read_text("utf-8"))
+    at = threaded.index("-threads")
+    assert threaded[:at] + threaded[at + 2 :] == cached

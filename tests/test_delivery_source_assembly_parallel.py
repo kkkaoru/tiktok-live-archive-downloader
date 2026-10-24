@@ -1,5 +1,6 @@
 """Chunk probes run concurrently, return in assembly order, and the original probe is restored."""
 
+import json
 import os
 import threading
 from pathlib import Path
@@ -144,3 +145,56 @@ def test_the_wrapped_runner_threads_only_the_clock_probes(
     monkeypatch.setattr(assembly, "load_chunks", lambda *_a, **_k: _chunks(1))
     _run()
     assert ran == [["ffprobe", "-v", "error", "-threads", "0", *FRAMES[3:]], ["ffprobe", "x"]]
+
+
+STREAMS = ["ffprobe", "-show_entries", "stream", "/m/chunk.mp4"]
+
+
+def _cache(probes: Path, command: list[str], sha256: str) -> Path:
+    cache = parallel.cache_directory(probes, Path("/m/chunk.mp4"))
+    cache.mkdir(parents=True)
+    (cache / "probe-streams.json").write_text("{}", "utf-8")
+    (cache / "probe-streams.command.json").write_text(json.dumps(command), "utf-8")
+    (cache / "media.json").write_text(
+        json.dumps({"path": "/m/chunk.mp4", "sha256": sha256}), "utf-8"
+    )
+    return cache
+
+
+def test_a_cached_probe_serves_only_its_exact_command_and_pinned_media(tmp_path: Path) -> None:
+    cache = _cache(tmp_path, STREAMS, "a" * 64)
+    pins = {"/m/chunk.mp4": "a" * 64}
+    stdout = Path("e/input-0003-streams.json")
+    assert parallel._cached(STREAMS, stdout, tmp_path, pins) == cache / "probe-streams.json"
+    assert parallel._cached(STREAMS, stdout, tmp_path, {"/m/chunk.mp4": "b" * 64}) is None
+    assert parallel._cached([*STREAMS[:-1], "-x", STREAMS[-1]], stdout, tmp_path, pins) is None
+    assert parallel._cached(STREAMS, Path("e/output-streams.json"), tmp_path, pins) is None
+    assert parallel._cached(STREAMS, Path("e/input-0003-frames.json"), tmp_path, pins) is None
+    assert parallel._cached(STREAMS, Path("e/input-0003-other.json"), tmp_path, pins) is None
+
+
+def test_prefetch_keeps_an_existing_cache_and_redoes_a_partial_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media = tmp_path / "chunk.mp4"
+    media.write_bytes(b"media")
+    probes = tmp_path / "probes"
+    target = parallel.cache_directory(probes, media)
+    partial = target.with_name(target.name + ".partial")
+    partial.mkdir(parents=True)
+    (partial / "stale.json").write_text("{}", "utf-8")
+    calls: list[str] = []
+
+    def probe(_media: Path, *, directory: Path, name: str, ffprobe: Path) -> assembly.Probe:
+        calls.append(f"{directory.name}:{name}:{ffprobe}")
+        return _probe(name)
+
+    monkeypatch.setattr(assembly, "probe", probe)
+    assert parallel.prefetch(media, probes=probes, ffprobe=Path("ffprobe")) == target
+    assert parallel.prefetch(media, probes=probes, ffprobe=Path("ffprobe")) == target
+    assert calls == [f"{partial.name}:probe:ffprobe"]
+    assert sorted(path.name for path in target.iterdir()) == ["media.json"]
+    assert json.loads((target / "media.json").read_text("utf-8")) == {
+        "path": str(media),
+        "sha256": "721c9525ade2ea8903d343ef25cf68b9bf4ab0aad56bb7b01fbe48d09bc7fcf4",
+    }
