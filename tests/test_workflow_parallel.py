@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from replay import source_caption_binding
+from replay import memory_admission, source_caption_binding
 from replay import workflow_parallel as parallel
 from replay.core import ReplayError
 from replay.stages import Stage, StageError
@@ -148,6 +148,11 @@ def test_headroom_needs_low_load_and_free_memory() -> None:
     assert parallel.headroom(parallel.Load(10, 1.0, 5, 10)) is False
 
 
+def test_paging_in_faster_than_the_limit_leaves_no_headroom() -> None:
+    assert parallel.headroom(parallel.Load(10, 1.0, 80, 10, 1.9 * 1024**3)) is True
+    assert parallel.headroom(parallel.Load(10, 1.0, 80, 10, 8 * 1024**3)) is False
+
+
 def test_read_load_parses_memory_and_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
     outputs = {
         parallel.MEMORY_LEVEL: "63\n",
@@ -160,7 +165,8 @@ def test_read_load_parses_memory_and_gpu(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(os, "cpu_count", lambda: 15)
     monkeypatch.setattr(os, "getloadavg", lambda: (3.5, 0.0, 0.0))
-    assert parallel.read_load() == parallel.Load(15, 3.5, 63, 47)
+    monkeypatch.setattr(memory_admission, "swap_in_rate", lambda: 1024.0)
+    assert parallel.read_load() == parallel.Load(15, 3.5, 63, 47, 1024.0)
 
 
 def test_unreadable_measurements_count_as_no_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,7 +176,9 @@ def test_unreadable_measurements_count_as_no_headroom(monkeypatch: pytest.Monkey
     monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(os, "cpu_count", lambda: None)
     monkeypatch.setattr(os, "getloadavg", lambda: (0.5, 0.0, 0.0))
-    assert parallel.read_load() == parallel.Load(1, 0.5, 0, 100)
+    load = parallel.read_load()  # an unreadable vm_stat pages in without bound
+    assert load == parallel.Load(1, 0.5, 0, 100, float("inf"))
+    assert parallel.headroom(load) is False
 
 
 def test_the_first_failure_stops_admission(tmp_path: Path) -> None:

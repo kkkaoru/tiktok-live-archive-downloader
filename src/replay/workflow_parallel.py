@@ -15,7 +15,8 @@ runner reuses its manifest parsing, dependency graph, layout and input checks an
 - measured admission: ``always`` stages (default 2, so the audio branch is not starved while
   caption removal saturates the CPU) start whenever they are ready; each further stage starts
   only while the 1-minute load stays below ``LOAD_LIMIT`` x cores and the kernel's free-memory
-  level (``kern.memorystatus_level``) stays at or above ``MEMORY_FREE_MIN`` percent. Swap use is
+  level (``kern.memorystatus_level``) stays at or above ``MEMORY_FREE_MIN`` percent and the
+  machine pages in slower than ``memory_admission.SWAP_IN_LIMIT`` per minute. Swap use itself is
   not a signal: on this Mac resident apps keep it above 90% while memory is plentiful;
 - the first failed stage stops admission; running stages finish and the run fails;
 - SIGTERM asks every running stage's process group to stop (SIGTERM, so a stage can stop the
@@ -43,6 +44,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal
 
+from replay import memory_admission
 from replay.core import ReplayError
 from replay.stages import Stage, StageError, execution_lock, run_stage
 from replay.workflow import (
@@ -73,12 +75,14 @@ RunStage = Callable[[Stage, Path], Result]
 
 @dataclass(frozen=True, slots=True)
 class Load:
-    """Cores, 1-minute load average, the kernel's free-memory and the GPU busy percentage."""
+    """Cores, 1-minute load average, the kernel's free-memory, the GPU busy percentage and the
+    machine-wide page-in rate (bytes per minute)."""
 
     cpus: int
     load: float
     memory_free_percent: int
     gpu_percent: int
+    swap_in_per_minute: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -183,12 +187,22 @@ def read_load() -> Load:
     free = int(level) if level.strip().isdigit() else 0
     statistics = subprocess.run(GPU_STATISTICS, capture_output=True, text=True, check=False)
     busy = [int(found) for found in GPU_UTILIZATION.findall(statistics.stdout)]
-    return Load(os.cpu_count() or 1, os.getloadavg()[0], free, max(busy, default=100))
+    return Load(
+        os.cpu_count() or 1,
+        os.getloadavg()[0],
+        free,
+        max(busy, default=100),
+        memory_admission.swap_in_rate(),
+    )
 
 
 def headroom(load: Load) -> bool:
-    """True while measured CPU load and free memory leave room for one more stage."""
-    return load.load < LOAD_LIMIT * load.cpus and load.memory_free_percent >= MEMORY_FREE_MIN
+    """True while measured CPU load, free memory and paging leave room for one more stage."""
+    return (
+        load.load < LOAD_LIMIT * load.cpus
+        and load.memory_free_percent >= MEMORY_FREE_MIN
+        and load.swap_in_per_minute < memory_admission.SWAP_IN_LIMIT
+    )
 
 
 def _validated(stage: Stage, bindings: dict[str, Path]) -> None:
