@@ -365,6 +365,8 @@ def test_mlx_backend_requires_pinned_offline_weights_and_explicit_stream(
             placement.pop()
 
     class Model:
+        layers: list[object] = []
+
         @classmethod
         def from_pretrained(cls, path: Path) -> Model:
             assert path == tmp_path
@@ -711,3 +713,198 @@ def test_gather_merge_matches_the_scatter_add_merge() -> None:
     merged = bgm._gather_merge(mx, split)(masks, 8)
     assert np.array_equal(np.asarray(merged), np.asarray(expected))
     assert np.asarray(merged)[0, 6:].tolist() == [[[0.0, 0.0]] * 4] * 2
+
+
+# Verbatim math of the pinned mlx_audio Mel-RoFormer modules the fast ops replace.
+def _provider_rope(values: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+    shape = values.shape
+    pairs = values.reshape(*shape[:-1], shape[-1] // 2, 2)
+    rotated = mx.stack([-pairs[..., 1], pairs[..., 0]], axis=-1).reshape(shape)
+    return values * cos + rotated * sin
+
+
+class _ProviderNorm:
+    def __init__(self, dim: int) -> None:
+        self.scale = dim**0.5
+        self.weight = mx.ones((dim,))
+
+    def __call__(self, values: mx.array) -> mx.array:
+        norm = mx.sqrt(mx.sum(values * values, axis=-1, keepdims=True))
+        normalized: mx.array = (values / mx.maximum(norm, 1e-12)) * self.scale * self.weight
+        return normalized
+
+
+class _ProviderRotary:
+    def __init__(self, dim_head: int) -> None:
+        half = dim_head // 2
+        self.freqs_mx = mx.array(1.0 / (10000.0 ** (np.arange(0, half, dtype=np.float32) / half)))
+
+    def get_cos_sin(self, frames: int) -> tuple[mx.array, mx.array]:
+        freqs = mx.repeat(mx.outer(mx.arange(frames).astype(mx.float32), self.freqs_mx), 2, axis=-1)
+        return mx.cos(freqs), mx.sin(freqs)
+
+
+class _Linear:
+    def __init__(self, generator: np.random.Generator, inputs: int, outputs: int) -> None:
+        values = generator.standard_normal((outputs, inputs + 1)).astype(np.float32) / inputs
+        self.weight, self.bias = mx.array(values[:, :-1]), mx.array(values[:, -1])
+
+    def __call__(self, values: mx.array) -> mx.array:
+        return values @ self.weight.T + self.bias
+
+
+class _ProviderAttention:
+    def __init__(self, generator: np.random.Generator, dim: int, heads: int, dim_head: int) -> None:
+        self.heads, self.dim_head = heads, dim_head
+        self.norm = _ProviderNorm(dim)
+        self.to_q, self.to_k, self.to_v = (
+            _Linear(generator, dim, heads * dim_head) for _ in range(3)
+        )
+        self.to_gates = _Linear(generator, dim, heads)
+        self.to_out = _Linear(generator, heads * dim_head, dim)
+        self.rotary_embed = _ProviderRotary(dim_head)
+
+    def __call__(self, values: mx.array) -> mx.array:
+        batch, frames, _ = values.shape
+        hidden = self.norm(values)
+
+        def heads(projected: mx.array) -> mx.array:
+            return projected.reshape(batch, frames, self.heads, self.dim_head).transpose(0, 2, 1, 3)
+
+        cos, sin = self.rotary_embed.get_cos_sin(frames)
+        query = _provider_rope(heads(self.to_q(hidden)), cos, sin)
+        key = _provider_rope(heads(self.to_k(hidden)), cos, sin)
+        scale = 1.0 / np.sqrt(self.dim_head)
+        attended = mx.fast.scaled_dot_product_attention(
+            query, key, heads(self.to_v(hidden)), scale=float(scale)
+        )
+        gates = mx.sigmoid(self.to_gates(hidden)).transpose(0, 2, 1)[..., None]
+        return self.to_out((attended * gates).transpose(0, 2, 1, 3).reshape(batch, frames, -1))
+
+
+class _ProviderFeedForward:
+    def __init__(self, generator: np.random.Generator, dim: int) -> None:
+        self.net = (_ProviderNorm(dim), _Linear(generator, dim, dim * 4), None, None)
+        self.compress = _Linear(generator, dim * 4, dim)
+
+    def __call__(self, values: mx.array) -> mx.array:
+        expanded = self.net[1](self.net[0](values))
+        return self.compress(expanded * (1 + mx.erf(expanded / np.sqrt(2.0))) / 2)
+
+
+class _ProviderTransformer:
+    def __init__(self, generator: np.random.Generator) -> None:
+        self.layers = [
+            (_ProviderAttention(generator, 16, 2, 8), _ProviderFeedForward(generator, 16))
+        ]
+        self.norm = _ProviderNorm(16)
+
+    def __call__(self, values: mx.array) -> mx.array:
+        for attention, feed_forward in self.layers:
+            values = attention(values) + values
+            values = feed_forward(values) + values
+        return self.norm(values)
+
+
+class _ProviderModel:
+    def __init__(self) -> None:
+        generator = np.random.default_rng(11)
+        self.layers = [(_ProviderTransformer(generator), _ProviderTransformer(generator))]
+
+
+@pytest.mark.parametrize(("frames", "heads", "dim_head"), [(801, 2, 64), (60, 8, 64), (5, 3, 8)])
+def test_the_fast_rope_matches_the_provider_rope(frames: int, heads: int, dim_head: int) -> None:
+    rope, _ = bgm._fast_ops(mx)
+    rotary = _ProviderRotary(dim_head)
+    cos, sin = rotary.get_cos_sin(frames)
+    values = mx.array(
+        np.random.default_rng(frames).standard_normal((3, heads, frames, dim_head)), mx.float32
+    )
+    fast = np.asarray(rope(rotary, values))
+    assert np.abs(fast - np.asarray(_provider_rope(values, cos, sin))).max() < 1e-4
+
+
+@pytest.mark.parametrize("dim", [384, 16, 7])
+def test_the_fast_norm_matches_the_provider_rmsnorm(dim: int) -> None:
+    _, norm = bgm._fast_ops(mx)
+    provider = _ProviderNorm(dim)
+    provider.weight = mx.array(np.random.default_rng(dim).standard_normal(dim).astype(np.float32))
+    values = np.random.default_rng(dim + 1).standard_normal((4, 50, dim)).astype(np.float32)
+    values[1, 0] = 0.0  # zero norm stays zero
+    values[1, 1] *= 1e-6
+    values[1, 2] *= 1e6
+    rows = mx.array(values)
+    fast, plain = np.asarray(norm(provider, rows)), np.asarray(provider(rows))
+    assert np.abs(fast - plain).max() < 1e-5 * np.abs(plain).max()
+    assert not fast[1, 0].any()
+
+
+def test_the_gpu_backend_runs_every_transformer_through_the_fast_ops(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    weights = tmp_path / "model.safetensors"
+    mx.save_safetensors(str(weights), {"weight": mx.zeros((1,))})
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(bgm, "MODEL_SHA256", hashlib.sha256(weights.read_bytes()).hexdigest())
+    monkeypatch.setattr(bgm, "MODEL_CONFIG_SHA256", hashlib.sha256(b"{}").hexdigest())
+    built: list[_ProviderModel] = []
+
+    class Model(_ProviderModel):
+        @classmethod
+        def from_pretrained(cls, path: Path) -> Model:
+            model = cls()
+            built.append(model)
+            return model
+
+        def sanitize(self, weights_dict: dict[str, object]) -> dict[str, object]:
+            return weights_dict
+
+        def load_weights(self, values: object, strict: bool = True) -> Model:
+            return self
+
+        def eval(self) -> None:
+            return None
+
+    hub = SimpleNamespace(try_to_load_from_cache=lambda *args, **kwargs: str(weights))
+    modules = {
+        "mlx.core": mx,
+        "huggingface_hub": hub,
+        "mlx_audio.sts.models.mel_roformer": SimpleNamespace(MelRoFormer=Model),
+    }
+    monkeypatch.setattr(bgm, "_import", modules.__getitem__)
+    calls: list[str] = []
+    ops = bgm._fast_ops
+
+    def counted(module: Any) -> tuple[Any, Any]:
+        rotate, norm = ops(module)
+
+        def rope(*args: Any) -> Any:
+            calls.append("rope")
+            return rotate(*args)
+
+        def tail(*args: Any) -> Any:
+            calls.append("norm")
+            return norm(*args)
+
+        return rope, tail
+
+    monkeypatch.setattr(bgm, "_fast_ops", counted)
+    bgm._MlxBackend("mps")
+    model = built[-1]
+    twin = _ProviderModel()
+    values = mx.array(np.random.default_rng(5).standard_normal((2, 12, 16)).astype(np.float32))
+    for pair, reference in zip(model.layers, twin.layers, strict=True):
+        for transformer, plain in zip(pair, reference, strict=True):
+            assert type(transformer) is _ProviderTransformer
+            attention, feed_forward = transformer.layers[0]
+            assert type(attention).__name__ == "Fast_ProviderAttention"
+            for norm in (transformer.norm, attention.norm, feed_forward.net[0]):
+                assert type(norm).__name__ == "Fast_ProviderNorm"
+            assert isinstance(attention, _ProviderAttention)
+            calls.clear()
+            fast = np.asarray(transformer(values))
+            assert calls == ["norm", "rope", "rope", "norm", "norm"]
+            assert np.abs(fast - np.asarray(plain(values))).max() < 1e-4
+    cpu = bgm._MlxBackend("cpu")
+    assert type(built[-1].layers[0][0].norm) is _ProviderNorm
+    assert cpu.sources == ("vocals", "instrumental")

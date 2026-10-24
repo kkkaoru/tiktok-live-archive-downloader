@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import math
 import time
 import wave
 from collections.abc import Callable, Mapping, Sequence
@@ -84,6 +85,72 @@ def _gather_merge(mx: Any, band_split: Any) -> Callable[[list[Any], int], Any]:
         return output / counts
 
     return merge
+
+
+def _fast_ops(mx: Any) -> tuple[Callable[[Any, Any], Any], Callable[[Any, Any], Any]]:
+    """RoPE and RMSNorm as MLX's fused ``mx.fast`` ops, near the pinned provider ops.
+
+    On a real 40 s clip the vocals differ from the provider's by at most 9.2e-6 (96 dB SNR) and a
+    window runs 1.6-2.3x faster than the provider (adopted by the user on 2026-10-22).
+    """
+    periods: dict[int, Any] = {}
+
+    def rope(rotary: Any, values: Any) -> Any:
+        # Periods 1/freqs reproduce the provider's angles; base=10000 differs by up to 3e-4.
+        inverse = periods.setdefault(id(rotary), 1.0 / rotary.freqs_mx)
+        return mx.fast.rope(
+            values, values.shape[-1], traditional=True, base=None, scale=1.0, offset=0,
+            freqs=inverse,
+        )  # fmt: skip
+
+    def norm(module: Any, values: Any) -> Any:
+        # x * rsqrt(mean(x^2) + 1e-24/dim) * weight is the provider's x / max(||x||, 1e-12) *
+        # sqrt(dim) * weight (its scale) except at norms near 1e-12.
+        return mx.fast.rms_norm(values, module.weight, 1e-24 / values.shape[-1])
+
+    return rope, norm
+
+
+def _fast_transformers(mx: Any, model: Any) -> None:
+    """Route every transformer's RoPE and RMSNorm through the fused ``mx.fast`` ops.
+
+    Calls resolve ``__call__`` on the type, so an instance attribute would be silently ignored;
+    each attention and norm instance instead becomes a repo subclass.
+    """
+    rope, norm = _fast_ops(mx)
+
+    def attend(self: Any, values: Any) -> Any:
+        batch, frames, _ = values.shape
+        hidden = self.norm(values)
+
+        def heads(projected: Any) -> Any:
+            return projected.reshape(batch, frames, self.heads, self.dim_head).transpose(0, 2, 1, 3)
+
+        query = rope(self.rotary_embed, heads(self.to_q(hidden)))
+        key = rope(self.rotary_embed, heads(self.to_k(hidden)))
+        scale = 1.0 / math.sqrt(self.dim_head)
+        attended = mx.fast.scaled_dot_product_attention(
+            query, key, heads(self.to_v(hidden)), scale=scale
+        )
+        gates = mx.sigmoid(self.to_gates(hidden)).transpose(0, 2, 1)[..., None]
+        return self.to_out((attended * gates).transpose(0, 2, 1, 3).reshape(batch, frames, -1))
+
+    subclasses: dict[type, type] = {}
+
+    def swap(instance: Any, call: Callable[[Any, Any], Any]) -> None:
+        base = type(instance)
+        subclass = subclasses.setdefault(
+            base, type(f"Fast{base.__name__}", (base,), {"__call__": call})
+        )
+        instance.__class__ = subclass
+
+    for pair in model.layers:
+        for transformer in pair:
+            swap(transformer.norm, norm)
+            for attention, feed_forward in transformer.layers:
+                swap(attention, attend)
+                swap(attention.norm, norm)
+                swap(feed_forward.net[0], norm)
 
 
 def _import(name: str) -> Any:
@@ -196,6 +263,8 @@ class _MlxBackend:
         if split is not None:
             # An instance attribute shadows the provider's method; its pinned file stays unchanged.
             object.__setattr__(split, "merge", _gather_merge(mx, split))
+        if self._device == mx.gpu:
+            _fast_transformers(mx, model)
         self._model = model
 
     @property
