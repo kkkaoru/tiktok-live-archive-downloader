@@ -44,6 +44,7 @@ from replay.tracking_observations import _digest
 MAX_JSON = 128 * 1024**2
 WINDOW = 60 * MODEL_SAMPLE_RATE
 MINIMUM_CORRELATION = 0.995
+MAX_GAIN_DB = 40.0  # bound on a recorded static voice gain
 Runner = Callable[[Sequence[str], Path], None]
 
 
@@ -390,13 +391,22 @@ def quality_windows(
     backend: SeparationBackend,
     directory: Path,
     cache_key: str,
+    gain_db: float = 0.0,
+    stem_scale: float = 1.0,
 ) -> dict[str, object]:
     """One persistent backend, bounded 60s windows, independent first-pass reference.
 
     Every speech-bearing window and the exact full-file statistics must pass.
     Empty-mask windows still receive instrumental inspection. Caller must validate
     packet presentation extent before excluding any decoded terminal codec padding.
+    ``gain_db`` is the static voice gain the delivery applied (its pinned loudness record):
+    the first-pass voice is compared scaled by it and the instrumental level before removal is
+    offset by it, so a level change the delivery made on purpose is not speech or music loss.
+    The thresholds are unchanged. ``stem_scale`` is the static output gain separation wrote
+    the first-pass stem with (its pinned ``result.json``); the instrumental estimate subtracts
+    the stem scaled back to the model input's level, so no voice leaks into it.
     """
+    scale = np.float32(10 ** (gain_db / 20))
     total = sum(high - low for low, high in spans)
     if WINDOW % ADAPTIVE_FRAME_SAMPLES:
         raise ValueError("Quality windows must align to the existing 10ms speech metric")
@@ -415,8 +425,9 @@ def quality_windows(
     ):
         for start in range(0, total, WINDOW):
             count = min(WINDOW, total - start)
-            original = selected_window(voice, spans, start, count)
+            unscaled = selected_window(voice, spans, start, count)
             baseline = selected_window(mix, spans, start, count)
+            original = unscaled * scale
             candidate = read_samples(final, start, count)
             predicted = backend.extract_vocals(candidate)
             if predicted.shape != candidate.shape or not np.isfinite(predicted).all():
@@ -433,7 +444,7 @@ def quality_windows(
                 and stats.level_delta_db_p05 >= -policy.maximum_speech_loss_db
             )
             before, after = (
-                signal_level_dbfs(baseline - original),
+                signal_level_dbfs(baseline - unscaled / np.float32(stem_scale)) + gain_db,
                 signal_level_dbfs(candidate - predicted),
             )
             gate = verify_music_removal(
@@ -466,6 +477,8 @@ def quality_windows(
             asdict(full_speech) if full_speech is not None else None
         ),
         "policy": asdict(policy),
+        "voiceGainDb": gain_db,
+        "stemOutputScale": stem_scale,
         "minimumSpeechCorrelation": MINIMUM_CORRELATION,
         "speechAggregation": (
             "Exact full-file 10ms percentiles/moments plus every protected 60-second window"
@@ -475,6 +488,42 @@ def quality_windows(
         "speechGatePassed": speech_passed and global_passed and protected > 0,
         "musicGatePassed": music_passed,
     }
+
+
+def stem_output_scale(stem: Path, pins: dict[str, Fingerprint]) -> float:
+    """The static output gain separation wrote ``stem`` with, from the ``result.json`` beside it
+    (pinned here, and required to pin this stem). Stems with no receipt or no ``outputScale``
+    (written before the gain existed) are at unit scale."""
+    result_path = stem.with_name("result.json")
+    if not result_path.is_file():
+        return 1.0
+    pin = fingerprint(result_path)
+    pins[str(result_path)] = pin
+    result = read_json(result_path)
+    outputs = result.get("outputs")
+    if not isinstance(outputs, list) or not any(
+        record(item).get("path") == str(stem)
+        and record(item).get("sha256") == pins[str(stem)]["sha256"]
+        for item in outputs
+    ):
+        raise ValueError("The separation receipt beside the first-pass voice does not pin it")
+    if "outputScale" not in result:
+        return 1.0
+    scale = result["outputScale"]
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not 0 < scale <= 1:
+        raise ValueError("The separation receipt's outputScale is not a valid gain")
+    return float(scale)
+
+
+def voice_gain(data: dict[str, object], pins: dict[str, Fingerprint]) -> float:
+    """The static voice gain (dB) the delivery applied, from its pinned loudness record
+    (``caption_compose``'s ``tempo.m4a.loudness.json``); 0 when the delivery has none."""
+    if "voiceLoudness" not in data:
+        return 0.0
+    gain = read_json(reference(data["voiceLoudness"], pins)).get("gainDb")
+    if isinstance(gain, bool) or not isinstance(gain, (int, float)) or not abs(gain) <= MAX_GAIN_DB:
+        raise ValueError("The voice loudness record holds no valid gainDb")
+    return float(gain)
 
 
 def load_model(data: dict[str, object], pins: dict[str, Fingerprint]) -> SeparationBackend:
@@ -670,6 +719,10 @@ def analyze(
         "Lossy AAC is not PCM-identical to the selected voice.",
         "Protected speech/first-pass provenance is explicitly supplied, not ASR re-reviewed.",
     ]
+    gain_db = voice_gain(data, pins)
+    measurements["voiceGainDb"] = gain_db
+    stem_scale = stem_output_scale(paths["firstPassVoice"], pins)
+    measurements["stemOutputScale"] = stem_scale
     if phase == "quality" and aac_ok:
         backend = model_loader(data, pins)
         # Cache identity includes every input, tool, model and implementation byte binding.
@@ -683,6 +736,8 @@ def analyze(
             backend=backend,
             directory=output,
             cache_key=key,
+            gain_db=gain_db,
+            stem_scale=stem_scale,
         )
         measurements["quality"] = quality
         checks.update({key: quality[key] for key in ("speechGatePassed", "musicGatePassed")})

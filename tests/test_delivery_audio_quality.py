@@ -1,4 +1,5 @@
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -691,3 +692,129 @@ def test_real_aac_tail_is_distinct_from_native_drift(config: Path) -> None:
         "inputsStable": True,
     }
     assert facts["accepted"] is False
+
+
+HALF_DB = 20 * math.log10(0.5)
+
+
+def test_a_delivery_gained_on_purpose_passes_at_its_recorded_gain(tmp_path: Path) -> None:
+    source = wav(tmp_path / "source.wav")
+    gained = wav(tmp_path / "gained.wav", scale=0.5)
+    baseline = wav(tmp_path / "baseline.wav", scale=1.5)
+    (tmp_path / "plain").mkdir()
+    plain = q.quality_windows(
+        decoded=gained, first_pass=source, model_input=baseline, spans=((0, 441),),
+        speech=((0, 441),), backend=Model(), directory=tmp_path / "plain", cache_key="abc",
+    )  # fmt: skip
+    assert plain["speechGatePassed"] is False
+    result = q.quality_windows(
+        decoded=gained, first_pass=source, model_input=baseline, spans=((0, 441),),
+        speech=((0, 441),), backend=Model(), directory=tmp_path, cache_key="abc",
+        gain_db=HALF_DB,
+    )  # fmt: skip
+    assert (result["speechGatePassed"], result["musicGatePassed"]) == (True, True)
+    assert result["voiceGainDb"] == HALF_DB
+    before = json.loads((tmp_path / "window-0000000000.json").read_text("utf-8"))
+    unscaled = json.loads((tmp_path / "plain/window-0000000000.json").read_text("utf-8"))
+    assert before["beforeInstrumentalDBFS"] == pytest.approx(
+        unscaled["beforeInstrumentalDBFS"] + HALF_DB
+    )
+
+
+def test_real_speech_loss_still_fails_beside_the_recorded_gain(tmp_path: Path) -> None:
+    source = wav(tmp_path / "source.wav")
+    lost = wav(tmp_path / "lost.wav", scale=0.25)
+    baseline = wav(tmp_path / "baseline.wav", scale=1.5)
+    result = q.quality_windows(
+        decoded=lost, first_pass=source, model_input=baseline, spans=((0, 441),),
+        speech=((0, 441),), backend=Model(), directory=tmp_path, cache_key="abc",
+        gain_db=HALF_DB,
+    )  # fmt: skip
+    assert result["speechGatePassed"] is False
+
+
+def test_analysis_reads_the_gain_from_the_pinned_loudness_record(config: Path) -> None:
+    record = write_json(config.parent / "tempo.m4a.loudness.json", {"gainDb": HALF_DB})
+    data = json.loads(config.read_text(encoding="utf-8"))
+    config.write_text(json.dumps({**data, "voiceLoudness": ref(record)}), encoding="utf-8")
+
+    def gained_runner(arguments: Sequence[str], destination: Path) -> None:
+        runner(arguments, destination)
+        if "-show_frames" not in arguments and "-show_packets" not in arguments:
+            wav(Path(arguments[-1]), scale=0.5)
+
+    receipt = q.analyze(
+        config, config.parent / "edits/work/gained", sha256=file_digest(config),
+        phase="quality", runner=gained_runner, model_loader=loader,
+    )  # fmt: skip
+    data = q.read_json(receipt)
+    assert data["accepted"] is True
+    assert json.loads(receipt.read_text("utf-8"))["measurements"]["voiceGainDb"] == HALF_DB
+    record.write_text(json.dumps({"gainDb": "loud"}), encoding="utf-8")
+    config.write_text(
+        json.dumps({**json.loads(config.read_text("utf-8")), "voiceLoudness": ref(record)}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="no valid gainDb"):
+        q.analyze(config, config.parent / "edits/work/bad", sha256=file_digest(config),
+                  phase="mapping", runner=gained_runner)  # fmt: skip
+
+
+def test_a_scaled_stem_is_scaled_back_before_the_instrumental_estimate(tmp_path: Path) -> None:
+    stem = wav(tmp_path / "stem.wav", scale=0.5)  # the voice written at half scale
+    mix = wav(tmp_path / "mix.wav", scale=1.5)  # voice + an instrumental at half the voice
+    delivered = wav(tmp_path / "delivered.wav", scale=0.5)
+    (tmp_path / "raw").mkdir()
+    q.quality_windows(
+        decoded=delivered, first_pass=stem, model_input=mix, spans=((0, 441),),
+        speech=((0, 441),), backend=Model(), directory=tmp_path / "raw", cache_key="abc",
+    )  # fmt: skip
+    result = q.quality_windows(
+        decoded=delivered, first_pass=stem, model_input=mix, spans=((0, 441),),
+        speech=((0, 441),), backend=Model(), directory=tmp_path, cache_key="abc",
+        stem_scale=0.5,
+    )  # fmt: skip
+    leaked = json.loads((tmp_path / "raw/window-0000000000.json").read_text("utf-8"))
+    fixed = json.loads((tmp_path / "window-0000000000.json").read_text("utf-8"))
+    assert fixed["beforeInstrumentalDBFS"] == pytest.approx(
+        leaked["beforeInstrumentalDBFS"] - 20 * math.log10(2), abs=0.01
+    )
+    assert result["stemOutputScale"] == 0.5
+
+
+def separation_receipt(stem: Path, **fields: object) -> Path:
+    outputs = [{"path": str(stem), "sha256": file_digest(stem), "bytes": stem.stat().st_size}]
+    return write_json(stem.with_name("result.json"), {"outputs": outputs, **fields})
+
+
+def test_the_stem_scale_comes_from_the_receipt_that_pins_the_stem(tmp_path: Path) -> None:
+    stem = wav(tmp_path / "vocals.wav")
+    pins: dict[str, q.Fingerprint] = {str(stem): q.fingerprint(stem)}
+    assert q.stem_output_scale(stem, pins) == 1.0
+    separation_receipt(stem)
+    assert q.stem_output_scale(stem, pins) == 1.0
+    receipt = separation_receipt(stem, outputScale=0.5)
+    assert q.stem_output_scale(stem, pins) == 0.5
+    assert pins[str(receipt)]["sha256"] == file_digest(receipt)
+
+
+@pytest.mark.parametrize("scale", ["half", 0.0, 1.5, True])
+def test_an_invalid_stem_scale_is_refused(tmp_path: Path, scale: object) -> None:
+    stem = wav(tmp_path / "vocals.wav")
+    separation_receipt(stem, outputScale=scale)
+    with pytest.raises(ValueError, match="not a valid gain"):
+        q.stem_output_scale(stem, {str(stem): q.fingerprint(stem)})
+
+
+def test_a_receipt_that_does_not_pin_the_stem_is_refused(tmp_path: Path) -> None:
+    stem = wav(tmp_path / "vocals.wav")
+    write_json(stem.with_name("result.json"), {"outputs": [], "outputScale": 0.5})
+    with pytest.raises(ValueError, match="does not pin it"):
+        q.stem_output_scale(stem, {str(stem): q.fingerprint(stem)})
+
+
+def test_analysis_records_the_stem_scale(config: Path) -> None:
+    separation_receipt(config.parent / "voice.wav", outputScale=0.5)
+    receipt = q.analyze(config, config.parent / "edits/work/scaled", sha256=file_digest(config),
+                        phase="mapping", runner=runner)  # fmt: skip
+    assert json.loads(receipt.read_text("utf-8"))["measurements"]["stemOutputScale"] == 0.5
