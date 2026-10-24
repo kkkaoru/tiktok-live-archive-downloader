@@ -182,3 +182,11 @@ def test_malformed_binding(config: Path) -> None:
     write(config, data)
     with pytest.raises(ReplayError, match="artifact"):
         run(config, config.parent / "out.json")
+
+
+def test_float_noise_in_equal_onsets_is_not_a_reversal() -> None:
+    # 10/2 (2026-10-22): a point at 3981.5100000000007 s followed by a word at 3981.51 s.
+    clock = AudioFrameClock((0,), (65536,), 10000, Fraction(1, 10000))
+    labels = (ClockLabel("ー", 0.1 + 0.2, 0.1 + 0.2, "a"), ClockLabel("エ", 0.3, 0.6, "b"))
+    result = project_labels(labels, clock)
+    assert [(label.start, label.end) for label in result] == [(0.3, 0.3), (0.3, 0.6)]

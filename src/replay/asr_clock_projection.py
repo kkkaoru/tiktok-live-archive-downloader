@@ -22,6 +22,7 @@ from replay.recordings import record
 from replay.stages import file_digest
 
 MAX_JSON_BYTES = 128 * 1024 * 1024
+CLOCK_DIGITS = 6
 
 
 def project_labels(
@@ -34,7 +35,13 @@ def project_labels(
             start = end = clock.source_time(label.start)
         else:
             start, end = clock.source_interval(label.start, label.end)
-        projected.append(replace(label, start=float(start), end=float(end)))
+        # Microseconds: recognition clocks carry float sums whose noise (~1e-12 s) otherwise
+        # reverses equal onsets; rounding is monotonic, so real order is kept.
+        projected.append(
+            replace(
+                label, start=round(float(start), CLOCK_DIGITS), end=round(float(end), CLOCK_DIGITS)
+            )
+        )
     if any(right.start < left.start for left, right in pairwise(projected)):
         raise ReplayError("Projected recognition reverses word onsets")
     return tuple(projected)
