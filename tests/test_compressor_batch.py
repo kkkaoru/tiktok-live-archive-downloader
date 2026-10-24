@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -1587,3 +1588,109 @@ def test_batches_share_one_recent_monitor_snapshot(
     monkeypatch.setattr(batch, "SHARED_SNAPSHOT_SECONDS", 60.0)
     first.snapshot()
     assert len(calls) == 3
+
+
+def test_a_rejected_submission_that_queued_nothing_is_submitted_once_more(tmp_path: Path) -> None:
+    jobs_path, output = job_file(tmp_path)
+    calls: list[list[str]] = []
+    submits: list[str | subprocess.CalledProcessError] = [
+        subprocess.CalledProcessError(3, "submit", stderr="rejected"),
+        SUBMITTED,
+    ]
+
+    def runner(arguments: Sequence[str]) -> str:
+        calls.append(list(arguments))
+        if "-jobpath" in arguments:
+            outcome = submits.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        if len(calls) == 2:
+            return "[]"
+        output.write_bytes(b"movie")
+        return SUCCESS
+
+    worker = batch.Batch(tmp_path / "state", Path("/Compressor"), "test", runner, lambda _s: None)
+    assert batch.run(batch.read_jobs(jobs_path), worker, in_flight=1) == 1
+    saved = json.loads((tmp_path / "state" / "alpha-0000.json").read_text(encoding="utf-8"))
+    assert saved["status"] == "Successful"
+    assert saved["rejectedSubmission"] == {
+        "exitCode": 3,
+        "stderr": "rejected",
+        "receipt": str(tmp_path / "state" / "alpha-0000.rejected-0.receipt.json"),
+    }
+    rejected = (tmp_path / "state" / "alpha-0000.rejected-0.receipt.json").read_text()
+    assert json.loads(rejected)["status"] == "submitting"
+    assert len(calls) == 4
+
+
+def test_a_rejected_submission_that_compressor_lists_stays_unknown(tmp_path: Path) -> None:
+    jobs_path, _output = job_file(tmp_path)
+    calls: list[list[str]] = []
+    listed = time.strftime(batch.SUBMITTED_AT, time.localtime(time.time() + 5))
+
+    def runner(arguments: Sequence[str]) -> str:
+        calls.append(list(arguments))
+        if "-jobpath" in arguments:
+            raise subprocess.CalledProcessError(3, "submit")
+        return (
+            '[{"jobStatus":{"jobid":"J9","status":"Processing","name":"part.moti",'
+            f'"submissionTime":"{listed}"}}}}]'
+        )
+
+    worker = batch.Batch(tmp_path / "state", Path("/Compressor"), "test", runner, lambda _s: None)
+    with pytest.raises(subprocess.CalledProcessError):
+        batch.run(batch.read_jobs(jobs_path), worker, in_flight=1)
+    saved = json.loads((tmp_path / "state" / "alpha-0000.json").read_text(encoding="utf-8"))
+    assert saved["status"] == "submitting"
+    assert not (tmp_path / "state" / "alpha-0000.rejected-0.receipt.json").exists()
+    assert len(calls) == 2
+
+
+def test_a_second_rejection_is_not_submitted_again(tmp_path: Path) -> None:
+    jobs_path, _output = job_file(tmp_path)
+    calls: list[list[str]] = []
+
+    def runner(arguments: Sequence[str]) -> str:
+        calls.append(list(arguments))
+        if "-jobpath" in arguments:
+            raise subprocess.CalledProcessError(3, "submit")
+        return "[]"
+
+    worker = batch.Batch(tmp_path / "state", Path("/Compressor"), "test", runner, lambda _s: None)
+    with pytest.raises(subprocess.CalledProcessError):
+        batch.run(batch.read_jobs(jobs_path), worker, in_flight=1)
+    saved = json.loads((tmp_path / "state" / "alpha-0000.json").read_text(encoding="utf-8"))
+    assert saved["status"] == "submitting"
+    assert saved["rejectedSubmission"]["exitCode"] == 3
+    assert len(calls) == 3
+
+
+def test_a_rejected_submission_with_an_output_is_not_submitted_again(tmp_path: Path) -> None:
+    jobs_path, output = job_file(tmp_path)
+    calls: list[list[str]] = []
+
+    def runner(arguments: Sequence[str]) -> str:
+        calls.append(list(arguments))
+        output.write_bytes(b"partial")
+        raise subprocess.CalledProcessError(3, "submit")
+
+    worker = batch.Batch(tmp_path / "state", Path("/Compressor"), "test", runner, lambda _s: None)
+    with pytest.raises(subprocess.CalledProcessError):
+        batch.run(batch.read_jobs(jobs_path), worker, in_flight=1)
+    assert len(calls) == 1
+
+
+def test_submitted_since_matches_only_newer_rows_of_the_part() -> None:
+    since = time.mktime(time.strptime("2026/10/22 12:45:00", batch.SUBMITTED_AT))
+    rows = (
+        '[{"jobStatus":{"jobid":"J1","status":"Successful","name":"a.moti",'
+        '"submissionTime":"2026/10/22 12:23:28"}},'
+        '{"jobStatus":{"jobid":"J2","status":"Successful","name":"b.moti",'
+        '"submissionTime":"2026/10/22 12:46:00"}}]'
+    )
+    assert batch.submitted_since(rows, "a.moti", since) is False
+    assert batch.submitted_since(rows, "b.moti", since) is True
+    assert batch.submitted_since(rows, "c.moti", since) is False
+    unreadable = '[{"jobStatus":{"jobid":"J1","status":"Successful","name":"a.moti"}}]'
+    assert batch.submitted_since(unreadable, "a.moti", since) is True

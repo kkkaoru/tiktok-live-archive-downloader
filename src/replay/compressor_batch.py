@@ -39,6 +39,8 @@ POLL_SECONDS = 10.0
 SHARED_SNAPSHOT_SECONDS = 8.0
 LOST_POLLS = 30  # about 5 minutes absent from the history
 SHARED_MONITOR = Path(__file__).resolve().parents[2] / "edits/work/compressor-monitor"
+SUBMITTED_AT = "%Y/%m/%d %H:%M:%S"
+MAX_STDERR_CHARS = 2000
 MAX_JOBS = 20_000
 MAX_IN_FLIGHT = 64
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
@@ -214,6 +216,25 @@ def parse_snapshot(text: str) -> dict[str, str]:
             raise ReplayError("Compressor snapshot exceeds its job budget")
         statuses[job_id] = status
     return statuses
+
+
+def submitted_since(text: str, name: str, since: float) -> bool:
+    """Whether a snapshot lists a job named ``name`` submitted at or after ``since``.
+
+    Compressor reports submission times in whole local seconds; a time it does not report in
+    that form counts as a match, so an unreadable row never authorizes a resubmission.
+    """
+    rows = json.loads(text[text.find("[") :])
+    for row in _snapshot_jobs(rows):
+        if row.get("name") != name:
+            continue
+        try:
+            submitted = time.mktime(time.strptime(str(row.get("submissionTime")), SUBMITTED_AT))
+        except ValueError:
+            return True
+        if submitted >= int(since):
+            return True
+    return False
 
 
 def _controller_failed(status: str) -> bool:
@@ -456,7 +477,13 @@ class Batch:
         )
         _write(self.state / f"{job.name}.json", receipt)
         verify_submission(job, receipt, rehash=False)
-        text = self.runner(command)
+        started = time.time()
+        try:
+            text = self.runner(command)
+        except subprocess.CalledProcessError as error:
+            if attempt is not None or not self._queued_nothing(job, started):
+                raise
+            return self._resubmit_rejected(job, error)
         receipt["submitResponse"] = text
         _write(self.state / f"{job.name}.json", receipt)
         job_id = parse_submission(text)
@@ -464,6 +491,39 @@ class Batch:
         _write(self.state / f"{job.name}.json", receipt)
         verify_submission(job, receipt, rehash=False)
         return job_id
+
+    def _queued_nothing(self, job: Job, started: float) -> bool:
+        """After a failed submit CLI: no output, and no job of this part since it ran.
+
+        The submit CLI has exited with an error status (3) while queueing nothing; a fresh
+        snapshot a poll later is the observation that it did not queue the part after all.
+        """
+        if job.output.exists() or any(job.output.parent.glob(f"{job.output.stem}.*")):
+            return False
+        self.sleep(POLL_SECONDS)
+        self.guard()
+        self._snapshot()
+        return not submitted_since(str(self.monitor_response), job.source.name, started)
+
+    def _resubmit_rejected(self, job: Job, error: subprocess.CalledProcessError) -> str:
+        """Submit a part again once after Compressor rejected it without queueing it."""
+        evidence = self.state / f"{job.name}.rejected-0.receipt.json"
+        with evidence.open("xb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write((self.state / f"{job.name}.json").read_bytes())
+        print(
+            f"COMPRESSOR_SUBMIT_RETRY {job.name} exit={error.returncode}",
+            file=sys.stderr,
+            flush=True,
+        )
+        attempt: dict[str, object] = {
+            "rejectedSubmission": {
+                "exitCode": error.returncode,
+                "stderr": str(error.stderr or "")[-MAX_STDERR_CHARS:],
+                "receipt": str(evidence),
+            }
+        }
+        return self._submit(job, attempt=attempt)
 
     def status(self, job_id: str) -> str:
         arguments = [str(self.executable), "-monitor", "-jobid", job_id, "-once"]
