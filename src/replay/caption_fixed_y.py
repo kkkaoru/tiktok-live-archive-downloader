@@ -7,6 +7,7 @@ run is displayed. Unlike face-following placement, a run that does not fit above
 hard error: nothing shrinks, clips or silently moves.
 """
 
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -78,15 +79,23 @@ def split_runs(cues: Sequence[RunCue], *, rate: int) -> tuple[tuple[int, ...], .
     return tuple(tuple(run) for run in runs)
 
 
-def worst_person_top(series: Sequence[TrackingPosition], start: Fraction, end: Fraction) -> float:
+def worst_person_top(
+    series: Sequence[TrackingPosition],
+    start: Fraction,
+    end: Fraction,
+    *,
+    times: Sequence[Fraction] | None = None,
+) -> float:
     """Smallest person-top Y over the samples bracketing [start, end].
 
     Observations bracketing the interval are included because the person may move between samples.
+    The series is time-sorted; `times` are its sample times, precomputed by callers that ask often.
     """
     if not series or start >= end or series[0].time > start or series[-1].time < end:
         raise ReplayError("Person-top series does not cover the caption interval")
-    first = max(i for i, point in enumerate(series) if point.time <= start)
-    last = min(i for i, point in enumerate(series) if point.time >= end)
+    stamps = [point.time for point in series] if times is None else times
+    first = bisect_right(stamps, start) - 1  # the last sample at or before start
+    last = bisect_left(stamps, end)  # the first sample at or after end
     window = series[first : last + 1]
     top = min(point.y for point in window)
     if not isfinite(top):
@@ -112,23 +121,24 @@ def person_top_with_hold(
     end: Fraction,
     *,
     maximum_drift: float,
+    times: Sequence[Fraction] | None = None,
 ) -> PersonTopEstimate:
     """Observed worst-case top inside [start, end]; otherwise hold the nearest observations.
 
-    `series` holds only observed samples. When none falls inside the interval, the nearest observed
-    sample before and after are used and the estimate is marked held. If they differ by more than
+    `series` holds only observed samples, time-sorted; `times` are their times, precomputed by
+    callers that ask often. When none falls inside the interval, the nearest observed sample
+    before and after are used and the estimate is marked held. If they differ by more than
     `maximum_drift` pixels, or either side is missing, the run fails rather than guessing.
     """
     if maximum_drift < 0 or not isfinite(maximum_drift) or start >= end:
         raise ReplayError("Invalid person-top hold request")
-    inside = [point for point in series if start <= point.time <= end]
-    if inside:
-        return PersonTopEstimate(min(point.y for point in inside), False)
-    before = [point for point in series if point.time < start]
-    after = [point for point in series if point.time > end]
-    if not before or not after:
+    stamps = [point.time for point in series] if times is None else times
+    low, high = bisect_left(stamps, start), bisect_right(stamps, end)  # start <= time <= end
+    if low < high:
+        return PersonTopEstimate(min(point.y for point in series[low:high]), False)
+    if low == 0 or high == len(series):
         raise UnknownPerson("No observed person on one side of an unobserved caption run")
-    near_before, near_after = before[-1], after[0]
+    near_before, near_after = series[low - 1], series[high]
     if abs(near_before.y - near_after.y) > maximum_drift:
         raise UnknownPerson("Observed person top differs too much across an unobserved caption run")
     return PersonTopEstimate(min(near_before.y, near_after.y), True)

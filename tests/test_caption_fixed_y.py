@@ -220,3 +220,64 @@ def test_a_calibration_missing_from_or_different_in_the_inputs_is_refused() -> N
             result, canvas=(1080, 1920), rate=30, coordinate_system="c",
             inputs={"/cal.json": "2" * 64}, calibration=("/cal.json", "1" * 64),
         )  # fmt: skip
+
+
+def ties() -> list[TrackingPosition]:
+    """Two samples share t=1 and two share t=3: ties at both interval edges."""
+    return [
+        TrackingPosition(Fraction(0), 540.0, 900.0),
+        TrackingPosition(Fraction(1), 540.0, 800.0),
+        TrackingPosition(Fraction(1), 540.0, 600.0),
+        TrackingPosition(Fraction(2), 540.0, 850.0),
+        TrackingPosition(Fraction(3), 540.0, 500.0),
+        TrackingPosition(Fraction(3), 540.0, 950.0),
+        TrackingPosition(Fraction(5), 540.0, 990.0),
+    ]
+
+
+def test_samples_tied_at_the_interval_edges_count_inside() -> None:
+    series = ties()
+    times = [point.time for point in series]
+    assert fixed.person_top_with_hold(
+        series, Fraction(1), Fraction(3), maximum_drift=0.0, times=times
+    ) == fixed.PersonTopEstimate(500.0, False)
+    assert fixed.person_top_with_hold(
+        series, Fraction(3, 2), Fraction(3), maximum_drift=0.0
+    ) == fixed.PersonTopEstimate(500.0, False)
+    assert fixed.person_top_with_hold(
+        series, Fraction(1), Fraction(3, 2), maximum_drift=0.0, times=times
+    ) == fixed.PersonTopEstimate(600.0, False)
+
+
+def test_an_empty_inside_holds_the_last_tied_sample_before_and_the_first_after() -> None:
+    series = ties()
+    times = [point.time for point in series]
+    # Nothing in [3.5, 4.5]: the last of the t=3 pair (950) and t=5 (990).
+    assert fixed.person_top_with_hold(
+        series, Fraction(7, 2), Fraction(9, 2), maximum_drift=50.0, times=times
+    ) == fixed.PersonTopEstimate(950.0, True)
+    # Nothing in [1.5, 1.75]: the last of the t=1 pair (600) and t=2 (850).
+    assert fixed.person_top_with_hold(
+        series, Fraction(3, 2), Fraction(7, 4), maximum_drift=300.0, times=times
+    ) == fixed.PersonTopEstimate(600.0, True)
+
+
+def test_no_sample_before_or_after_an_empty_inside_fails() -> None:
+    series = ties()
+    times = [point.time for point in series]
+    with pytest.raises(ReplayError, match="one side"):
+        fixed.person_top_with_hold(
+            series, Fraction(-2), Fraction(-1), maximum_drift=50.0, times=times
+        )
+    with pytest.raises(ReplayError, match="one side"):
+        fixed.person_top_with_hold(series, Fraction(6), Fraction(7), maximum_drift=50.0)
+
+
+def test_the_worst_top_brackets_with_ties_at_both_edges() -> None:
+    series = ties()
+    times = [point.time for point in series]
+    # The first sample at or after end=3 is the first of the t=3 pair; the last at or before
+    # start=1 is the second of the t=1 pair.
+    assert fixed.worst_person_top(series, Fraction(1), Fraction(3), times=times) == 500.0
+    assert fixed.worst_person_top(series, Fraction(1), Fraction(2)) == 600.0
+    assert fixed.worst_person_top(series, Fraction(7, 2), Fraction(4), times=times) == 950.0

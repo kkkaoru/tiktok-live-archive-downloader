@@ -510,3 +510,10 @@ def test_a_smaller_source_track_is_scaled_onto_the_caption_canvas(tmp_path: Path
     )  # fmt: skip
     with pytest.raises(ReplayError, match="no source width"):
         job.load_yolo(widthless, minimum_confidence=0.5, canvas_width=1080.0)
+
+
+def test_person_top_samples_out_of_time_order_are_refused() -> None:
+    with pytest.raises(ReplayError, match="time-sorted"):
+        job.person_top_from(
+            list(reversed(observed())), job.cut_map(CUTS), rate=30, maximum_drift=100.0
+        )

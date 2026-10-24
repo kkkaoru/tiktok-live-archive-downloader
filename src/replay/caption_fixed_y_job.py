@@ -106,6 +106,9 @@ def person_top_from(
     observed: Sequence[TrackingPosition], mapping: CutMap, *, rate: int, maximum_drift: float
 ) -> fixed.PersonTop:
     """A person-top function over output seconds; observed samples live in source time."""
+    times = [point.time for point in observed]
+    if any(later < earlier for earlier, later in zip(times, times[1:], strict=False)):
+        raise ReplayError("Observed person-top samples must be time-sorted")
 
     def person_top(start: Fraction, end: Fraction) -> float:
         first = int(start * rate)
@@ -116,6 +119,7 @@ def person_top_from(
             Fraction(source_first, rate),
             Fraction(max(source_last, source_first) + 1, rate),
             maximum_drift=maximum_drift,
+            times=times,
         )
         return estimate.top
 
