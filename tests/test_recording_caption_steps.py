@@ -1,15 +1,17 @@
 """Caption steps rebind the reference plans, call the producers in order and reset on force."""
 
 import json
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
 
 from replay import caption_gradient_audit as gradient_audit
-from replay import pipeline_completion
+from replay import compressor_guard, pipeline_completion, r2_fetch
 from replay import recording_caption_steps as captions
 from replay import recording_steps as steps
+from replay import recording_viewer_steps as viewer
 from replay.caption_compose import Part
 from replay.core import ReplayError
 
@@ -146,13 +148,18 @@ class Producers:
         elif name == "replay.caption_fixed_y_job":
             placed = {"plannedRuns": {"placedCues": 9, "failedRuns": [{}]}}
             Path(arguments[4]).write_text(json.dumps(placed), encoding="utf-8")
+        elif name == "replay.speech_onsets":
+            Path(arguments[2]).write_text('{"tokens": []}', encoding="utf-8")
         elif name == "replay.caption_parts":
             Path(arguments[1]).mkdir()
             for output in ("parts.json", "jobs.json"):
                 (Path(arguments[1]) / output).write_text("[]", encoding="utf-8")
         elif name == "replay.caption_compose" and arguments[0] == "plan":
             Path(arguments[5]).mkdir(parents=True)
-            (Path(arguments[5]) / "groups.json").write_text("[]", encoding="utf-8")
+            groups = '[{"frames": 5}, {"frames": 2}]'
+            (Path(arguments[5]) / "groups.json").write_text(groups, encoding="utf-8")
+            video = {"encoding": {"averageBitRate": 8_200_000}}
+            (Path(arguments[5]) / "g000.json").write_text(json.dumps({"recipe": {"video": video}}))
         elif name == "replay.caption_compose" and arguments[0] == "finish":
             Path(arguments[3]).write_bytes(b"movie")
 
@@ -288,17 +295,46 @@ def test_placement_runs_over_the_whole_output_with_the_yolo_track(tmp_path: Path
     assert outputs["calibration"]["status"].startswith("provisional")
 
 
+def test_onsets_align_the_tokens_in_the_ctc_environment_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    producers = Producers(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    for name in ("cut-plan", "paging"):
+        (tmp_path / "steps" / f"{name}.json").write_text("{}", encoding="utf-8")
+    receipt = steps.execute("onsets", path, run=producers, graph=captions.BACK)
+    command = producers.commands[-1]
+    assert command[0] == "/usr/bin/env"
+    # The package the step runs (here src/), not the working directory's.
+    assert f"PYTHONPATH={Path(captions.__file__).resolve().parents[1]}" in command
+    assert f"TMPDIR={tmp_path / 'replay-123/speech-onsets-scratch'}" in command
+    assert command[command.index("-m") - 2 :] == [
+        str(tmp_path / "edits/.venv-ctc-alignment/bin/python"), "-B",
+        "-m", "replay.speech_onsets",
+        str(tmp_path / "replay-123/cut-plan-v1/projected-tokens.json"),
+        str(tmp_path / "replay-123/paging-v1/prepared/tempo/candidate.wav"),
+        str(tmp_path / "replay-123/speech-onsets-v1.json"),
+        "--model", str(tmp_path / "edits/models/japanese-wav2vec2-large-rs35kh-2162c9ed"),
+    ]  # fmt: skip
+    outputs = json.loads(receipt.read_text(encoding="utf-8"))["outputs"]
+    assert outputs["onsets"]["path"] == str(tmp_path / "replay-123/speech-onsets-v1.json")
+    receipt.unlink()
+    steps.execute("onsets", path, run=producers, graph=captions.BACK)
+    assert len(producers.commands) == 1  # an existing onsets file is reused
+
+
 def test_parts_render_compose_and_finish_chain_the_producers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = configure(tmp_path)
     producers = Producers(tmp_path)
     (tmp_path / "replay-123/placement-v1.json").write_text("{}", encoding="utf-8")
-    upstream = ("cut-plan", "paging", "placement")
+    upstream = ("cut-plan", "paging", "placement", "onsets")
     for name in upstream:
         (tmp_path / "steps" / f"{name}.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(captions, "load_parts", lambda *_a: [])
-    monkeypatch.setattr(captions, "packet_count", lambda _p: 7)
+    monkeypatch.setattr(captions, "packet_count", lambda _p: -1)  # the join's count is used
     monkeypatch.setattr(captions, "rendered_gradient", lambda _parts: {"lines": 3})
     run_through(path, producers, "caption-parts", "caption-render", "compose", "finish")
     assert modules(producers) == [
@@ -307,13 +343,48 @@ def test_parts_render_compose_and_finish_chain_the_producers(
     ]  # fmt: skip
     parts = producers.commands[0]
     assert parts[parts.index("--") + 1 :] == ["--font-size", "82"]
+    assert parts[parts.index("--tokens") + 1] == str(tmp_path / "replay-123/speech-onsets-v1.json")
     assert producers.opened == ["open", "-g", "-a", "/Applications/Compressor Creator Studio.app"]
     assert producers.commands[2][producers.commands[2].index("plan") + 3] == str(
         tmp_path / "clean.mov"
     )
+    planned = producers.commands[2]
+    assert planned[-4:] == [
+        "--rate-source", str(tmp_path / "source.mp4"),
+        "--frame-clock", str(tmp_path / "replay-123/video-clock.json"),
+    ]  # fmt: skip
+    composed = json.loads((tmp_path / "steps/compose.json").read_text(encoding="utf-8"))
+    assert composed["outputs"]["averageBitRate"] == 8_200_000
+    render = producers.commands[3]
+    assert render[render.index("--tempo") :] == [
+        "--tempo", str(tmp_path / "replay-123/paging-v1/prepared/tempo/candidate.wav"),
+        "--audio", str(tmp_path / "media/replay-123/final/audio/tempo.m4a"),
+        "--ffmpeg", "/ffmpeg",
+    ]  # fmt: skip
     finish = json.loads((tmp_path / "steps/finish.json").read_text(encoding="utf-8"))
     assert finish["outputs"]["packets"] == 7
     assert (tmp_path / "media/replay-123/final/candidate.mp4").read_bytes() == b"movie"
+
+
+def test_a_recording_palette_reaches_the_caption_parts(tmp_path: Path) -> None:
+    path = configure(tmp_path)
+    settings = json.loads((tmp_path / "captions.json").read_text(encoding="utf-8"))
+    green = {"gradientTop": "#B6DF9E", "gradientBottom": "#6DBE3C"}
+    (tmp_path / "captions.json").write_text(json.dumps({**settings, "palette": green}), "utf-8")
+    producers = Producers(tmp_path)
+    (tmp_path / "replay-123/placement-v1.json").write_text("{}", encoding="utf-8")
+    for name in ("cut-plan", "paging", "placement", "onsets"):
+        (tmp_path / "steps" / f"{name}.json").write_text("{}", encoding="utf-8")
+    run_through(path, producers, "caption-parts")
+    parts = producers.commands[0]
+    assert parts[parts.index("--palette") : parts.index("--")] == [
+        "--palette", "#B6DF9E", "#6DBE3C"
+    ]  # fmt: skip
+    (tmp_path / "captions.json").write_text(
+        json.dumps({**settings, "palette": {"gradientTop": "#000000"}}), "utf-8"
+    )
+    with pytest.raises(ReplayError, match="exactly gradientTop"):
+        captions.load_captions(steps.load(path))
 
 
 def test_forcing_the_render_removes_only_the_rendered_movies(tmp_path: Path) -> None:
@@ -389,7 +460,7 @@ def test_the_render_gradient_is_measured_on_parts_until_enough_lines(
         return [path, path]
 
     monkeypatch.setattr(gradient_audit, "frames", frames)
-    monkeypatch.setattr(gradient_audit, "line_lifts", lambda _frame: [30.0] * 10)
+    monkeypatch.setattr(gradient_audit, "line_measures", lambda _frame: [(80, 30.0)] * 10)
     parts = [Part(f"p{index}", 0, 1, Path(f"/r{index}.mov")) for index in range(3)]
     assert captions.rendered_gradient(parts) == {
         "lines": 20,
@@ -412,18 +483,29 @@ def test_upload_runs_the_web_viewer_sync_under_its_lock(
     (tmp_path / "steps" / "publish.json").write_text(
         '{"outputs": {"delivery": "/d/movie.mp4"}}', encoding="utf-8"
     )
-    monkeypatch.setattr(captions, "WEB_VIEWER", tmp_path / "web")
+    monkeypatch.setattr(viewer, "WEB_VIEWER", tmp_path / "web")
     monkeypatch.setattr("shutil.which", lambda _name: "/bin/bun")
+    monkeypatch.setattr(time, "monotonic", lambda: 3.0)
+    checked: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        viewer, "require_uploaded", lambda video, movie, root: checked.append((video, movie))
+    )
     (tmp_path / "web").mkdir()
     commands: list[list[str]] = []
     outputs = captions.upload(pipeline, lambda command, _log: commands.append(list(command)))
-    assert commands == [["/bin/bun", str(tmp_path / "web/src/bin/sync.ts")]]
+    assert commands == [["/bin/bun", str(tmp_path / "web/src/bin/sync.ts"), "--only", "movie"]]
+    log = tmp_path / "steps/logs/upload.log"
+    assert log.read_text(encoding="utf-8") == "PHASE lock 0.0 s\n"
+    assert checked == [("movie", Path("/d/movie.mp4"))]
     assert outputs == {"published": {"delivery": "/d/movie.mp4"}}
     assert (tmp_path / "web/sync.lock").exists()
 
 
 def test_upload_without_bun_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     pipeline = steps.load(configure(tmp_path))
+    (tmp_path / "steps" / "publish.json").write_text(
+        '{"outputs": {"delivery": "/d/movie.mp4"}}', encoding="utf-8"
+    )
     monkeypatch.setattr("shutil.which", lambda _name: None)
     with pytest.raises(ReplayError, match="bun is required"):
         captions.upload(pipeline, lambda _command, _log: None)
@@ -437,6 +519,14 @@ def test_source_probe_records_the_original_once(tmp_path: Path) -> None:
     }
     with pytest.raises(ReplayError, match="different original"):
         captions.source_probe(tmp_path, "/m/other.mp4")
+
+
+def test_source_probe_follows_a_relocated_original(tmp_path: Path) -> None:
+    captions.source_probe(tmp_path, "/m/2026-10-07_18-30-20_JST_replay-1.mp4")
+    captions.source_probe(tmp_path, "/m/replay-1/2026-10-07_18-30-20_JST_replay-1.mp4")
+    assert json.loads((tmp_path / "evidence/source-probe.json").read_text(encoding="utf-8")) == {
+        "format": {"filename": "/m/replay-1/2026-10-07_18-30-20_JST_replay-1.mp4"}
+    }
 
 
 def test_publish_writes_the_storage_source_probe(
@@ -459,9 +549,420 @@ def test_publish_writes_the_storage_source_probe(
         return delivery, index
 
     monkeypatch.setattr(pipeline_completion, "publish", publish)
+    released: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        viewer, "release_older", lambda root, published: released.append((root, published))
+    )
     outputs = captions.publish(pipeline, lambda _command, _log: None)
     assert seen == ["pipeline-abcdef012345"]
+    assert released == [(tmp_path / "edit", delivery)]
     assert outputs["delivery"] == str(delivery)
     assert json.loads((storage / "evidence/source-probe.json").read_text(encoding="utf-8")) == {
         "format": {"filename": "/m/source.mp4"}
     }
+
+
+def test_an_unverified_candidate_selection_is_moved_aside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(time, "time_ns", lambda: 42)
+    selection = tmp_path / "evidence/candidate-selection.json"
+    selection.parent.mkdir()
+    selection.write_text('{"status": "unverified-candidate"}', encoding="utf-8")
+    retired = captions.retire_selection(tmp_path)
+    assert retired == tmp_path / "evidence/retired/candidate-selection-retired-42.json"
+    assert retired.read_text(encoding="utf-8") == '{"status": "unverified-candidate"}'
+    assert not selection.exists()
+    assert captions.retire_selection(tmp_path) is None
+
+
+def test_a_selection_of_another_status_is_kept(tmp_path: Path) -> None:
+    selection = tmp_path / "evidence/candidate-selection.json"
+    selection.parent.mkdir()
+    selection.write_text('{"status": "verified"}', encoding="utf-8")
+    assert captions.retire_selection(tmp_path) is None
+    assert selection.read_text(encoding="utf-8") == '{"status": "verified"}'
+
+
+def renders(tmp_path: Path, *, gate: object, evidence: str) -> steps.Pipeline:
+    """A recording that published, summarized, and still holds its render media."""
+    pipeline = steps.load(configure(tmp_path))
+    media = tmp_path / "media/replay-123"
+    (media / "alpha/w001").mkdir(parents=True)
+    (media / "alpha/w001/part.mov").write_bytes(b"alpha")
+    (media / "compose").mkdir()
+    (media / "compose/g001.mov").write_bytes(b"composed")
+    (media / "final").mkdir()
+    (media / "final/candidate.mp4").write_bytes(b"movie")
+    index = tmp_path / "storage/metadata/pipeline-evidence.json"
+    index.parent.mkdir(parents=True)
+    index.write_text(evidence, encoding="utf-8")
+    published = {"delivery": str(media / "final/candidate.mp4"), "evidence": {"path": str(index)}}
+    (tmp_path / "steps/publish.json").write_text(
+        json.dumps({"outputs": published}), encoding="utf-8"
+    )
+    (tmp_path / "steps/summary.json").write_text(
+        json.dumps({"outputs": {"gate": gate}}), encoding="utf-8"
+    )
+    return pipeline
+
+
+def test_renders_are_retired_after_the_gate_passed(tmp_path: Path) -> None:
+    pipeline = renders(tmp_path, gate={"complete": True}, evidence="{}")
+    outputs = captions.retire_renders(pipeline, lambda _command, _log: None)
+    assert outputs == {
+        "removed": [
+            {"path": str(tmp_path / "media/replay-123/alpha"), "bytes": 5},
+            {"path": str(tmp_path / "media/replay-123/compose"), "bytes": 8},
+        ],
+        "bytes": 13,
+    }
+    assert (tmp_path / "media/replay-123/final/candidate.mp4").read_bytes() == b"movie"
+
+
+def test_renders_renamed_aside_are_retired_with_them(tmp_path: Path) -> None:
+    pipeline = renders(tmp_path, gate={"complete": True}, evidence="{}")
+    media = tmp_path / "media/replay-123"
+    (media / "compose.groups300-20261023").mkdir()
+    (media / "compose.groups300-20261023/g001.mov").write_bytes(b"old")
+    (media / "alpha.v1").mkdir()
+    (media / "alpha.v1/part.mov").write_bytes(b"older")
+    outputs = captions.retire_renders(pipeline, lambda _command, _log: None)
+    assert outputs == {
+        "removed": [
+            {"path": str(tmp_path / "media/replay-123/alpha"), "bytes": 5},
+            {"path": str(tmp_path / "media/replay-123/compose"), "bytes": 8},
+            {"path": str(tmp_path / "media/replay-123/alpha.v1"), "bytes": 5},
+            {"path": str(tmp_path / "media/replay-123/compose.groups300-20261023"), "bytes": 3},
+        ],
+        "bytes": 21,
+    }
+    assert (tmp_path / "media/replay-123/final/candidate.mp4").read_bytes() == b"movie"
+
+
+def test_a_renamed_render_named_by_the_evidence_is_kept(tmp_path: Path) -> None:
+    media = tmp_path / "media/replay-123"
+    pipeline = renders(tmp_path, gate={"complete": True}, evidence=f'["{media}/compose.old/g.mov"]')
+    (media / "compose.old").mkdir()
+    (media / "compose.old/g.mov").write_bytes(b"old")
+    with pytest.raises(ReplayError, match="still references"):
+        captions.retire_renders(pipeline, lambda _command, _log: None)
+    assert (media / "compose.old/g.mov").read_bytes() == b"old"
+
+
+def test_renders_named_by_the_evidence_are_kept(tmp_path: Path) -> None:
+    media = tmp_path / "media/replay-123"
+    pipeline = renders(tmp_path, gate={"complete": True}, evidence=f'["{media}/compose/g001.mov"]')
+    with pytest.raises(ReplayError, match="still references"):
+        captions.retire_renders(pipeline, lambda _command, _log: None)
+    assert (media / "compose/g001.mov").read_bytes() == b"composed"
+
+
+def test_an_older_summary_passes_the_gate_before_renders_are_retired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = renders(tmp_path, gate=None, evidence="{}")
+    gated: list[str] = []
+
+    def gate(passed: steps.Pipeline) -> dict[str, object]:
+        gated.append(passed.text("recording"))
+        return {}
+
+    monkeypatch.setattr(viewer, "gate", gate)
+    outputs = captions.retire_renders(pipeline, lambda _command, _log: None)
+    assert gated == ["123"]
+    assert outputs["bytes"] == 13
+
+
+def test_a_failed_gate_keeps_the_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = renders(tmp_path, gate={"complete": False}, evidence="{}")
+
+    def refuse(_pipeline: steps.Pipeline) -> dict[str, object]:
+        raise ReplayError("The completion gate did not pass")
+
+    monkeypatch.setattr(viewer, "gate", refuse)
+    with pytest.raises(ReplayError, match="gate did not pass"):
+        captions.retire_renders(pipeline, lambda _command, _log: None)
+    assert (tmp_path / "media/replay-123/alpha/w001/part.mov").read_bytes() == b"alpha"
+
+
+def test_the_in_flight_override_replaces_the_configured_count(tmp_path: Path) -> None:
+    override = tmp_path / "in-flight.json"
+    assert captions.in_flight(2, override) == 2
+    override.write_text('{"inFlight": 3}', encoding="utf-8")
+    assert captions.in_flight(2, override) == 3
+
+
+def test_an_in_flight_override_beyond_four_is_refused(tmp_path: Path) -> None:
+    override = tmp_path / "in-flight.json"
+    override.write_text('{"inFlight": 5}', encoding="utf-8")
+    with pytest.raises(ReplayError, match="inFlight integer from 1 to 4"):
+        captions.in_flight(2, override)
+    override.write_text('{"inFlight": "3"}', encoding="utf-8")
+    with pytest.raises(ReplayError, match="inFlight integer from 1 to 4"):
+        captions.in_flight(2, override)
+
+
+def test_finish_counts_a_movie_left_by_an_earlier_run_and_refuses_a_changed_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    pipeline = steps.load(path)
+    movie = captions.final_movie(pipeline)
+    movie.parent.mkdir(parents=True)
+    movie.write_bytes(b"movie")
+    monkeypatch.setattr(captions, "packet_count", lambda _p: 9)
+    assert captions.finish(pipeline, lambda _c, _l: None)["packets"] == 9
+    groups = tmp_path / "groups.json"
+    groups.write_text('[{"frames": 4}]', encoding="utf-8")
+    receipt = {"outputs": {"groups": {"path": str(groups), "sha256": "0" * 64}}}
+    (tmp_path / "steps" / "compose.json").write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ReplayError, match="differs from the compose receipt's pin"):
+        captions.planned_frames(pipeline)
+
+
+def test_finish_fetches_an_offloaded_candidate_back_before_counting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = steps.load(configure(tmp_path))
+    movie = captions.final_movie(pipeline)
+    asked: list[tuple[Path, Path]] = []
+
+    def restore(path: Path, *, root: Path) -> bool:
+        asked.append((path, root))
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"movie")
+        return True
+
+    monkeypatch.setattr(r2_fetch, "restore_if_offloaded", restore)
+    monkeypatch.setattr(captions, "packet_count", lambda _p: 9)
+    assert captions.finish(pipeline, lambda _c, _l: None)["packets"] == 9
+    assert asked == [(movie, pipeline.path_of("editRoot"))]
+
+
+def compressor_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[steps.Pipeline, list[str]]:
+    pipeline = steps.load(configure(tmp_path))
+    (tmp_path / "replay-123" / "caption-parts-v1").mkdir(parents=True)
+    (tmp_path / "replay-123" / "caption-parts-v1" / "parts.json").write_text("[]", "utf-8")
+    monkeypatch.setattr(captions, "load_parts", lambda *_a: [])
+    monkeypatch.setattr(captions, "rendered_gradient", lambda _parts: {"lines": 3})
+    events: list[str] = []
+    monkeypatch.setattr(compressor_guard, "restart", lambda _app: events.append("restart"))
+    return pipeline, events
+
+
+def test_caption_render_restarts_compressor_once_when_its_controller_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline, events = compressor_steps(tmp_path, monkeypatch)
+
+    def run(command: Sequence[str], log: Path) -> None:
+        if "replay.compressor_batch" not in command:
+            return
+        events.append("batch")
+        if events.count("batch") == 1:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write("COMPRESSOR_BATCH_ERROR … job controller is down\n")
+            raise ReplayError("Producer failed (1)")
+
+    captions.caption_render(pipeline, run)
+    assert events == ["batch", "restart", "batch"]
+
+
+def test_caption_render_does_not_restart_for_other_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline, events = compressor_steps(tmp_path, monkeypatch)
+
+    def run(command: Sequence[str], _log: Path) -> None:
+        if "replay.compressor_batch" in command:
+            raise ReplayError("Producer failed (1)")
+
+    with pytest.raises(ReplayError):
+        captions.caption_render(pipeline, run)
+    assert events == []
+
+
+def test_caption_render_resubmits_parts_reported_successful_without_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline, events = compressor_steps(tmp_path, monkeypatch)
+    monkeypatch.setattr(compressor_guard, "unverified", lambda *_a: ["w000-part-0001"])
+    monkeypatch.setattr(compressor_guard, "retire", lambda _s, names: events.extend(names))
+
+    def run(command: Sequence[str], _log: Path) -> None:
+        if "replay.compressor_batch" in command:
+            events.append("batch")
+
+    captions.caption_render(pipeline, run)
+    assert events == ["batch", "w000-part-0001", "batch"]
+
+
+def refusing_run(output: Path, events: list[str]) -> Callable[[Sequence[str], Path], None]:
+    """A batch whose first run refuses ``output`` as untracked, as compressor_batch does."""
+
+    def run(command: Sequence[str], log: Path) -> None:
+        if "replay.compressor_batch" not in command:
+            return
+        events.append("batch")
+        if events.count("batch") == 1:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    f"COMPRESSOR_BATCH_ERROR Refusing to overwrite an untracked output: {output}\n"
+                )
+            raise ReplayError("Producer failed (1)")
+
+    return run
+
+
+def test_caption_render_sets_an_untracked_output_aside_and_submits_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline, events = compressor_steps(tmp_path, monkeypatch)
+    part = tmp_path / "media/replay-123/alpha/w028-part-0000"
+    output = part / "compressor-batch-v1/motion-alpha.mov"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"")
+    captions.caption_render(pipeline, refusing_run(output, events))
+    assert events == ["batch", "batch"]
+    assert list(output.parent.iterdir()) == []
+    assert [path.name.startswith("motion-alpha.unverified-") for path in part.glob("*.mov")] == [
+        True
+    ]
+
+
+def test_caption_render_never_moves_a_refused_file_outside_its_media(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline, events = compressor_steps(tmp_path, monkeypatch)
+    output = tmp_path / "elsewhere/compressor-batch-v1/motion-alpha.mov"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"")
+    with pytest.raises(ReplayError):
+        captions.caption_render(pipeline, refusing_run(output, events))
+    assert events == ["batch"]
+    assert output.read_bytes() == b""
+
+
+def test_a_render_is_counted_once_per_version(tmp_path: Path) -> None:
+    movie = tmp_path / "motion-alpha.mov"
+    movie.write_bytes(b"abc")
+    counted: list[Path] = []
+
+    def count(path: Path) -> int:
+        counted.append(path)
+        return 3
+
+    packets = captions.remembered(count)
+    assert [packets(movie), packets(movie)] == [3, 3]
+    movie.write_bytes(b"abcdef")  # resubmitted: a new version is counted again
+    assert packets(movie) == 3
+    assert packets(tmp_path / "absent.mov") == 3
+    assert counted == [movie, movie, tmp_path / "absent.mov"]
+
+
+def test_closure_files_map_to_the_package_this_step_runs() -> None:
+    package = Path(captions.__file__).resolve().parent
+    assert captions.running_copy("/old/checkout/src/replay/stages.py") == str(package / "stages.py")
+    assert captions.running_copy("/old/checkout/src/replay/sub/x.py") == str(package / "sub/x.py")
+    assert captions.running_copy("/usr/lib/python3/os.py") == "/usr/lib/python3/os.py"
+
+
+def native_render(tmp_path: Path) -> dict[str, object]:
+    return {"binary": "/native/caption-alpha-render", "binarySha256": "a" * 64,
+            "floor": "/pinned/floor.json", "sample": 2, "workers": 2}  # fmt: skip
+
+
+def test_native_render_gates_then_renders_the_same_parts_instead_of_compressor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    settings = json.loads((tmp_path / "captions.json").read_text(encoding="utf-8"))
+    (tmp_path / "captions.json").write_text(
+        json.dumps({**settings, "nativeRender": native_render(tmp_path)}), "utf-8"
+    )
+    producers = Producers(tmp_path)
+    (tmp_path / "steps/caption-parts.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(captions, "load_parts", lambda *_a: [])
+    monkeypatch.setattr(captions, "rendered_gradient", lambda _parts: {"lines": 3})
+    native_work = tmp_path / "replay-123/caption-render-v1/native"
+    native_work.mkdir(parents=True)
+    (native_work / "receipt.json").write_text(
+        json.dumps({"renderer": "mixed", "fallback": {"w000-part-0000": "refused"}}), "utf-8"
+    )
+    monkeypatch.setattr(captions, "in_flight", lambda configured, _override: int(str(configured)))
+    hashed: list[Path] = []
+    monkeypatch.setattr(compressor_guard, "record_hashes", lambda *a: hashed.append(a[2]))
+    run_through(path, producers, "caption-render")
+    assert modules(producers) == ["replay.caption_render_native"]
+    assert producers.opened == ["open", "-g", "-a", "/Applications/Compressor Creator Studio.app"]
+    command = producers.commands[0]
+    parts = tmp_path / "replay-123/caption-parts-v1"
+    assert command[command.index("-m") + 2 :] == [
+        "run", str(parts / "parts.json"), str(parts / "jobs.json"),
+        "--binary", "/native/caption-alpha-render", "--binary-sha256", "a" * 64,
+        "--work", str(native_work), "--floor-json", "/pinned/floor.json", "--sample", "2",
+        "--state", str(tmp_path / "replay-123/caption-render-v1/state"), "--workers", "2",
+        "--in-flight", "2", "--submit-workers", "1",
+    ]  # fmt: skip
+    assert hashed == [tmp_path / "replay-123/caption-render-v1/verified-outputs.json"]
+    receipt = json.loads((tmp_path / "steps/caption-render.json").read_text(encoding="utf-8"))
+    outputs = receipt["outputs"]
+    assert (outputs["renderer"], outputs["fallback"]) == ("mixed", {"w000-part-0000": "refused"})
+    assert outputs["native"]["path"] == str(native_work / "receipt.json")
+
+
+def test_incomplete_native_render_settings_are_refused(tmp_path: Path) -> None:
+    path = configure(tmp_path)
+    settings = json.loads((tmp_path / "captions.json").read_text(encoding="utf-8"))
+    (tmp_path / "captions.json").write_text(
+        json.dumps({**settings, "nativeRender": {"binary": "/b"}}), "utf-8"
+    )
+    with pytest.raises(ReplayError, match="Incomplete nativeRender settings"):
+        captions.load_captions(steps.load(path))
+
+
+def test_a_voice_level_policy_reaches_compose_and_finish_and_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    settings = json.loads((tmp_path / "captions.json").read_text(encoding="utf-8"))
+    level = {"targetLufs": -18, "truePeakDbtp": -1}
+    (tmp_path / "captions.json").write_text(
+        json.dumps({**settings, "voiceLoudness": level}), "utf-8"
+    )
+    producers = Producers(tmp_path)
+    (tmp_path / "steps/caption-render.json").write_text("{}", encoding="utf-8")
+    sidecar = tmp_path / "media/replay-123/final/audio/tempo.m4a.loudness.json"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text('{"gainDb": -9.4}', encoding="utf-8")
+    monkeypatch.setattr(captions, "packet_count", lambda _p: -1)
+    run_through(path, producers, "compose", "finish")
+    render, finished = producers.commands[1], producers.commands[2]
+    assert render[-4:] == ["--loudness-target", "-18", "--true-peak-ceiling", "-1"]
+    assert finished[-4:] == ["--loudness-target", "-18", "--true-peak-ceiling", "-1"]
+    composed = json.loads((tmp_path / "steps/compose.json").read_text(encoding="utf-8"))
+    assert composed["outputs"]["voiceLoudness"]["path"] == str(sidecar)
+
+
+def test_an_invalid_voice_level_policy_is_refused(tmp_path: Path) -> None:
+    path = configure(tmp_path)
+    settings = json.loads((tmp_path / "captions.json").read_text(encoding="utf-8"))
+    (tmp_path / "captions.json").write_text(
+        json.dumps({**settings, "voiceLoudness": {"targetLufs": "loud", "truePeakDbtp": -1}}),
+        "utf-8",
+    )
+    with pytest.raises(ReplayError, match="Incomplete voiceLoudness settings"):
+        captions.load_captions(steps.load(path))
+
+
+def test_captions_read_the_stock_phrase_filtered_labels_when_the_asr_step_wrote_them(
+    tmp_path: Path,
+) -> None:
+    assert captions.asr_labels(tmp_path) == tmp_path / "labels-silence-v1.json"
+    (tmp_path / "labels-hallucination-v1.json").write_text("{}", encoding="utf-8")
+    assert captions.asr_labels(tmp_path) == tmp_path / "labels-hallucination-v1.json"

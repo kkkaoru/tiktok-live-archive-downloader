@@ -4,14 +4,27 @@ import json
 import signal
 import subprocess
 import sys
+import time
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from replay import gpu_lease, recording_caption_steps, recording_steps
+from replay import (
+    code_snapshot,
+    failure_notify,
+    gpu_lease,
+    memory_admission,
+    recording_caption_steps,
+    recording_steps,
+    volume_events,
+)
 from replay import recording_pipeline as pipeline
+from replay import recording_priority as priority
+from replay import recording_retirement as retirement
 from replay.core import ReplayError
-from replay.stages import Stage, execution_lock
+from replay.stages import Stage, StageError, execution_lock
 
 STEP_SCRIPT = """
 import json, pathlib, sys
@@ -28,10 +41,26 @@ recording_steps.execute(step, pathlib.Path(sys.argv[2]), run=lambda c, l: None, 
 
 
 @pytest.fixture(autouse=True)
+def no_failure_notices(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]:
+    """Failure notices go to a list, never to the desktop or the shared failures record."""
+    sent: list[tuple[object, ...]] = []
+    monkeypatch.setattr(failure_notify, "notify", lambda *args, **kw: sent.append((*args, kw)))
+    return sent
+
+
+@pytest.fixture(autouse=True)
+def no_volume_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Steps see no mounted volumes (no diskutil call per step attempt)."""
+    monkeypatch.setattr(volume_events, "snapshot", dict)
+
+
+@pytest.fixture(autouse=True)
 def private_gpu_leases(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """GPU stages lease from a test directory, never the checkout's shared one."""
     monkeypatch.setattr(gpu_lease, "root", lambda: tmp_path / "gpu-leases")
     monkeypatch.setenv(gpu_lease.STARTED_VARIABLE, "1")
+    monkeypatch.setattr(memory_admission, "root", lambda: tmp_path / "memory-reservations")
+    monkeypatch.setattr(memory_admission, "pressure", lambda: (95, 1))
 
 
 @pytest.fixture(autouse=True)
@@ -123,6 +152,23 @@ def test_prepare_writes_the_pipeline_configuration(tmp_path: Path) -> None:
     assert config.steps == layout.steps
 
 
+def test_prepare_writes_captions_with_the_recordings_palette(tmp_path: Path) -> None:
+    root = edit_root(tmp_path)
+    path = defaults(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["captions"]["motionFinish"] = ["--top", "1", "1", "1", "--bottom", "0", "0", "0"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    (root / "caption-colors.json").write_text(
+        '{"version": 1, "gradientTop": "#B6DF9E", "gradientBottom": "#6DBE3C"}', encoding="utf-8"
+    )
+    layout = pipeline.prepare("42", path, checkout=tmp_path)
+    written = json.loads((layout.directory / "captions.json").read_text(encoding="utf-8"))
+    assert written["palette"] == {"gradientTop": "#B6DF9E", "gradientBottom": "#6DBE3C"}
+    assert written["motionFinish"][:4] == [
+        "--top", "0.7137254901960784", "0.8745098039215686", "0.6196078431372549"
+    ]  # fmt: skip
+
+
 def test_prepare_is_idempotent_and_refuses_changed_content(tmp_path: Path) -> None:
     edit_root(tmp_path)
     path = defaults(tmp_path)
@@ -130,6 +176,23 @@ def test_prepare_is_idempotent_and_refuses_changed_content(tmp_path: Path) -> No
     assert pipeline.prepare("42", path, checkout=tmp_path) == first
     with pytest.raises(ReplayError, match="different content"):
         pipeline.prepare("42", defaults(tmp_path, ffmpeg="/other"), checkout=tmp_path)
+
+
+def test_prepare_keeps_captions_that_predate_optional_default_keys(tmp_path: Path) -> None:
+    edit_root(tmp_path)
+    layout = pipeline.prepare("42", defaults(tmp_path), checkout=tmp_path)
+    captions = layout.directory / "captions.json"
+    before = captions.read_text(encoding="utf-8")
+    data = json.loads(defaults(tmp_path).read_text(encoding="utf-8"))
+    data["captions"]["voiceLoudness"] = {"targetLufs": -18, "truePeakDbtp": -1}
+    later = tmp_path / "later.json"
+    later.write_text(json.dumps(data), encoding="utf-8")
+    assert pipeline.prepare("42", later, checkout=tmp_path) == layout
+    assert captions.read_text(encoding="utf-8") == before
+    data["captions"]["relocations"] = "/other.tsv"
+    later.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ReplayError, match="captions.json exists with different content"):
+        pipeline.prepare("42", later, checkout=tmp_path)
 
 
 def test_run_executes_every_step_then_skips_them_all(
@@ -140,11 +203,14 @@ def test_run_executes_every_step_then_skips_them_all(
     first = pipeline.run("42", path, checkout=tmp_path)
     assert set(first.values()) == {"completed"}
     assert sorted(ran(tmp_path)) == sorted(pipeline.DEPENDENCIES)
-    assert ran(tmp_path)[0] == "clocks"
+    # clocks and separation both wait only for the audio clock, so either may start first.
+    assert ran(tmp_path)[0] == "audio-clock"
+    assert sorted(ran(tmp_path)[1:3]) == ["clocks", "separation"]
     assert ran(tmp_path).index("finish") > ran(tmp_path).index("compose")
+    assert ran(tmp_path).index("summary") > ran(tmp_path).index("summarize")
     second = pipeline.run("42", path, checkout=tmp_path)
     assert set(second.values()) == {"reused"}
-    assert len(ran(tmp_path)) == 16
+    assert len(ran(tmp_path)) == 24
 
 
 def test_forcing_a_step_redoes_it_and_its_dependents(
@@ -155,22 +221,30 @@ def test_forcing_a_step_redoes_it_and_its_dependents(
     pipeline.run("42", path, checkout=tmp_path)
     results = pipeline.run("42", path, checkout=tmp_path, forcing=pipeline.Forcing(("separation",)))
     assert results == {
+        "audio-clock": "reused",
         "clocks": "reused",
         "separation": "completed",
         "cleanup-bootstrap": "reused",
         "cleanup": "reused",
         "asr": "completed",
         "yolo-track": "reused",
+        "upload-original": "reused",
         "retire-intermediates": "completed",
         "cut-plan": "completed",
         "paging": "completed",
+        "onsets": "completed",
         "placement": "completed",
         "caption-parts": "completed",
         "caption-render": "completed",
         "compose": "completed",
         "finish": "completed",
         "publish": "completed",
+        "summarize": "completed",
+        "excitement": "completed",
         "upload": "completed",
+        "summary": "completed",
+        "clips": "completed",
+        "retire-renders": "completed",
     }
 
 
@@ -182,7 +256,7 @@ def test_forcing_everything_redoes_every_step(
     pipeline.run("42", path, checkout=tmp_path)
     results = pipeline.run("42", path, checkout=tmp_path, forcing=pipeline.Forcing(every=True))
     assert set(results.values()) == {"completed"}
-    assert len(ran(tmp_path)) == 32
+    assert len(ran(tmp_path)) == 48
 
 
 def test_a_second_run_of_the_same_recording_is_refused(
@@ -205,7 +279,12 @@ def test_downstream_includes_every_dependent_step() -> None:
         "compose",
         "finish",
         "publish",
+        "excitement",
         "upload",
+        "summarize",
+        "summary",
+        "clips",
+        "retire-renders",
     ]
     assert pipeline.downstream([]) == []
     with pytest.raises(ReplayError, match="Unknown steps: nope"):
@@ -291,6 +370,11 @@ def test_start_launches_the_run_detached_with_its_forcing(
 
 def test_a_launch_name_skips_earlier_launches(tmp_path: Path) -> None:
     (tmp_path / "pipeline-v1.launch").mkdir()
+    assert pipeline.launch_name(pipeline.Layout(tmp_path)) == "pipeline-v2"
+
+
+def test_a_launch_name_skips_a_name_whose_log_remains(tmp_path: Path) -> None:
+    (tmp_path / "pipeline-v1.log").write_text("killed\n", encoding="utf-8")
     assert pipeline.launch_name(pipeline.Layout(tmp_path)) == "pipeline-v2"
 
 
@@ -419,3 +503,259 @@ def test_an_undecodable_source_is_copied_for_the_pipeline_only(
         tmp_path / "deliveries/source-decodable/replay-42/source.mp4"
     )
     assert bound == []
+
+
+def test_a_reframe_intent_crops_the_decodable_copy_before_the_lead_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = edit_root(tmp_path)
+    monkeypatch.undo()
+    calls: list[tuple[Path, Path, str, dict[str, object], tuple[int, int]]] = []
+
+    def prepared(
+        source: Path,
+        directory: Path,
+        *,
+        ffmpeg: str,
+        ffprobe: str,
+        python: str,
+        yolo: dict[str, object],
+        native: str,
+        aspect: tuple[int, int],
+    ) -> Path:
+        calls.append((source, directory, python + native, yolo, aspect))
+        return directory / source.name
+
+    class Config:
+        source = tmp_path / "source.mp4"
+        storage_root: Path | None = tmp_path / "deliveries/youtube-x"
+
+    monkeypatch.setattr(
+        "replay.source_decodable.prepared", lambda source, directory, **_k: directory / source.name
+    )
+    monkeypatch.setattr("replay.source_vertical.prepared", prepared)
+    monkeypatch.setattr("replay.source_lead_in.prepared", lambda source, *_a, **_k: source)
+    monkeypatch.setattr(pipeline, "load_config", lambda _root: Config)
+    monkeypatch.setattr(pipeline, "bind_source", lambda _r, _s: pytest.fail("rebound"))
+    (root / "reframe.json").write_text(
+        '{"version": 1, "aspect": [9, 16], "follow": "character"}', encoding="utf-8"
+    )
+    data: dict[str, object] = {
+        "ffmpeg": "/ffmpeg", "ffprobe": "/ffprobe", "python": "/py", "native": "/n",
+        "yolo": {"step": "2"},
+    }  # fmt: skip
+    assert pipeline.zero_origin_source(data, root) == (
+        tmp_path / "deliveries/source-vertical/replay-42/source.mp4"
+    )
+    assert calls == [
+        (tmp_path / "deliveries/source-decodable/replay-42/source.mp4",
+         tmp_path / "deliveries/source-vertical/replay-42", "/py/n", {"step": "2"}, (9, 16))
+    ]  # fmt: skip
+
+
+def test_caption_render_waits_on_compressor_without_a_gpu_lease() -> None:
+    assert frozenset({"separation", "asr", "yolo-track", "onsets", "compose"}) == pipeline.GPU_STEPS
+
+
+def test_compressor_leases_hold_one_render_at_a_time(tmp_path: Path) -> None:
+    directory = pipeline.serial_leases("caption-render")
+    assert directory == tmp_path / "compressor-leases"
+    assert gpu_lease.settings(directory) == (1, ())
+    first = gpu_lease.Waiter(directory, "1", start=1)
+    held = first.try_acquire()
+    assert held is not None
+    second = gpu_lease.Waiter(directory, "2", start=2)
+    assert second.try_acquire() is None
+    second.close()
+    gpu_lease.release(held)
+
+
+def test_the_broadcast_comes_from_the_dated_original(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = Path("/originals/2026-10-21_18-30-00_JST_replay-2.mp4")
+    monkeypatch.setattr(pipeline, "load_config", lambda _root: SimpleNamespace(source=original))
+    assert pipeline.broadcast(Path("/edits/replay-2")) == 1792575000000000000
+
+
+def test_the_lease_rank_serves_the_newest_broadcast_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    starts = {"replay-2": 1792575000000000000, "replay-1": 1792488600000000000}
+    monkeypatch.setattr(pipeline, "broadcast", lambda root: starts[root.name])
+    assert pipeline.lease_rank(Path("/edits/replay-2")) == 1207425000000000000
+    assert pipeline.lease_rank(Path("/edits/replay-1")) == 1207511400000000000
+
+
+def test_a_recording_without_a_dated_original_ranks_by_start_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(time, "time_ns", lambda: 7)
+    assert pipeline.lease_rank(edit_root(tmp_path)) == 7
+
+
+def test_finish_shares_the_compose_lease(tmp_path: Path) -> None:
+    assert pipeline.serial_leases("finish") == tmp_path / "compose-leases"
+
+
+def test_composes_take_their_own_single_machine_wide_lease(tmp_path: Path) -> None:
+    directory = pipeline.serial_leases("compose")
+    assert directory == tmp_path / "compose-leases"
+    assert gpu_lease.settings(directory) == (1, ())
+
+
+def ml_stage(name: str) -> Stage:
+    return Stage(
+        name=name,
+        command=("py", "-m", "x", name),
+        inputs=(Path("/in.json"),),
+        outputs=(Path("/out.json"),),
+        timeout_seconds=1,
+    )
+
+
+def test_an_ml_step_holds_its_memory_reservation_and_gets_a_measured_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(memory_admission, "physical", lambda: 48 * 2**30)
+    monkeypatch.setattr(memory_admission, "pressure", lambda: (95, 1))  # not this machine's
+    directory = tmp_path / "memory-reservations"
+    with ExitStack() as held:
+        assert pipeline.admitted_command(ml_stage("asr"), "1", held) == ("py", "-m", "x", "asr")
+        assert memory_admission.reserved(directory) == 6 * 2**30
+    assert memory_admission.reserved(directory) == 0
+    memory_admission.record_peak(directory, "onsets", 4 * 2**30)
+    memory_admission.record_peak(directory, "onsets", 4 * 2**30)  # two runs measured
+    with ExitStack() as held:
+        assert pipeline.admitted_command(ml_stage("onsets"), "1", held) == (
+            "/usr/bin/env",
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.2137",
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO=0.2137",
+            "py", "-m", "x", "onsets",
+        )  # fmt: skip
+    with ExitStack() as held:
+        assert pipeline.admitted_command(ml_stage("clocks"), "1", held) == (
+            "py", "-m", "x", "clocks",
+        )  # fmt: skip
+
+
+def test_the_clips_step_reserves_its_model_footprint_until_measured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(memory_admission, "physical", lambda: 48 * 2**30)
+    monkeypatch.setattr(memory_admission, "pressure", lambda: (95, 1))  # not this machine's
+    directory = tmp_path / "memory-reservations"
+    with ExitStack() as held:
+        assert pipeline.admitted_command(ml_stage("clips"), "1", held) == ("py", "-m", "x", "clips")
+        assert memory_admission.reserved(directory) == 24 * 2**30
+    memory_admission.record_peak(directory, "clips", 22 * 2**30)
+    with ExitStack() as held:
+        pipeline.admitted_command(ml_stage("clips"), "1", held)
+        assert memory_admission.reserved(directory) == 27.5 * 2**30  # measured x 1.25
+    assert memory_admission.reserved(directory) == 0
+
+
+def test_a_drained_run_exits_with_its_own_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    edit_root(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(pipeline, "prepare", lambda *_a, **_k: None)
+
+    def drained(*_a: object, **_k: object) -> None:
+        raise StageError("Workflow stages failed: asr: StageError: Drained (drain) before asr")
+
+    monkeypatch.setattr(pipeline, "run", drained)
+    arguments = ["run", "42", "--defaults", str(defaults(tmp_path))]
+    assert pipeline.main(arguments) == 1  # no drain was asked for: a failure
+    priority.drain(tmp_path, "42", "drain")  # gpu_lease.root() is tmp_path / "gpu-leases"
+    assert pipeline.main(arguments) == pipeline.DRAINED_EXIT
+    assert capsys.readouterr().err.count("Drained (drain) before asr") == 2
+
+
+def test_a_step_runs_from_a_code_snapshot_once_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(code_snapshot, "root", lambda: tmp_path / "snapshots")
+    with ExitStack() as held:
+        assert pipeline.snapshotted("paging", held) == ()
+    (tmp_path / "snapshots").mkdir()
+    (tmp_path / "snapshots" / "settings.json").write_text('{"enabled": true}', "utf-8")
+    monkeypatch.setattr(
+        code_snapshot, "materialise", lambda _package: ("ab" * 32, tmp_path / "snapshots" / "x")
+    )
+    (tmp_path / "snapshots" / "x").mkdir()
+    with ExitStack() as held:
+        assert pipeline.snapshotted("paging", held) == (
+            f"PYTHONPATH={tmp_path / 'snapshots' / 'x'}",
+            "REPLAY_CODE_SNAPSHOT=" + "ab" * 32,
+        )
+        assert len(list((tmp_path / "snapshots").glob("x.in-use.*"))) == 1
+        assert pipeline.snapshotted("caption-render", held) == ()
+    assert list((tmp_path / "snapshots").glob("x.in-use.*")) == []
+
+
+def test_defaults_may_turn_native_caption_rendering_on(tmp_path: Path) -> None:
+    path = defaults(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    native = {"binary": "/b", "binarySha256": "a" * 64, "floor": "/f.json", "sample": 2,
+              "workers": 2}  # fmt: skip
+    data["captions"]["nativeRender"] = native
+    data["captions"]["voiceLoudness"] = {"targetLufs": -18, "truePeakDbtp": -1}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert pipeline.load_defaults(path) == data
+    data["captions"]["unknown"] = {}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ReplayError, match="Incomplete caption pipeline defaults"):
+        pipeline.load_defaults(path)
+
+
+def test_retirement_settings_live_beside_the_defaults(tmp_path: Path) -> None:
+    path = defaults(tmp_path)
+    assert pipeline.retirement_settings(path) == retirement.Settings()
+    settings = path.with_name(pipeline.RETIREMENT_SETTINGS)
+    settings.write_text(
+        '{"version": 1, "retainIntermediates": true, "retirementHold": ["replay-7"]}',
+        encoding="utf-8",
+    )
+    assert pipeline.retirement_settings(path) == retirement.Settings(
+        retain=True, hold=("replay-7",)
+    )
+    settings.write_text('{"version": 1, "other": 1}', encoding="utf-8")
+    with pytest.raises(ReplayError, match="Unsupported retirement settings"):
+        pipeline.retirement_settings(path)
+    settings.write_text('{"version": 1, "retainIntermediates": "yes"}', encoding="utf-8")
+    with pytest.raises(ReplayError, match="must be a boolean"):
+        pipeline.retirement_settings(path)
+    settings.write_text('{"version": 1, "retirementHold": [""]}', encoding="utf-8")
+    with pytest.raises(ReplayError, match="edit-root name"):
+        pipeline.retirement_settings(path)
+
+
+def test_a_finished_run_retires_and_a_later_run_forces_what_a_step_needs_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = fake_steps(tmp_path, monkeypatch)
+    layout = pipeline.prepare("42", path, checkout=tmp_path)
+    calls: list[object] = []
+
+    def retire(_pipeline: object, settings: object) -> dict[str, object]:
+        calls.append(settings)
+        return {"bytes": 0}
+
+    monkeypatch.setattr(retirement, "retire", retire)
+    pipeline.run("42", path, checkout=tmp_path)
+    assert calls == [retirement.Settings()]
+    assert 'retirement: {"bytes": 0}' in capsys.readouterr().out
+    gone = tmp_path / "gone.mov"
+    (layout.steps / retirement.RECORD).write_text(
+        json.dumps({"version": 1, "retired": [
+            {"category": "cleaned-source", "path": str(gone), "producer": "cleanup",
+             "consumers": ["cleanup", "compose"]},
+        ]}),
+        encoding="utf-8",
+    )  # fmt: skip
+    # Nothing to run: nothing is forced.
+    assert set(pipeline.run("42", path, checkout=tmp_path).values()) == {"reused"}
+    results = pipeline.run("42", path, checkout=tmp_path, forcing=pipeline.Forcing(("compose",)))
+    out = capsys.readouterr().out
+    assert f"retired intermediates: forcing cleanup for compose ({gone})" in out
+    assert results["cleanup"] == "completed"
+    assert results["compose"] == "completed"
+    assert results["separation"] == "reused"

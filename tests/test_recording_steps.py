@@ -72,9 +72,15 @@ class Producers:
         if name == "replay.replay_preparation_plan":
             work.mkdir()
             plan_file(work / "workflow.json", work / "clock-out.txt")
-        elif name == "replay.workflow" and command[4] == str(work / "workflow.json"):
+        elif name == "replay.workflow_parallel" and command[4] == str(work / "workflow.json"):
             (work / "video-clock.json").write_text('{"frames": [{}, {}, {}]}', "utf-8")
             (work / "audio-clock.json").write_text("{}", encoding="utf-8")
+            (work / "preparation.json").write_text("{}", encoding="utf-8")
+            pinned = {"path": str(self.tmp / "source.mp4"), "sha256": "ab" * 32}
+            (work / "video-clock.producer.json").write_text(json.dumps({"source": pinned}), "utf-8")
+        elif name == "replay.workflow" and command[4] == str(work / "workflow.json"):
+            (work / "audio-clock.json").write_text("{}", encoding="utf-8")
+            (work / "audio-clock.producer.json").write_text("{}", encoding="utf-8")
             (work / "preparation.json").write_text("{}", encoding="utf-8")
         elif name == "replay.cleanup_bootstrap_request":
             (work / "cleanup-preparation-v1").mkdir()
@@ -110,6 +116,8 @@ class Producers:
             Path(command[-2]).write_text("{}", encoding="utf-8")
         elif name == "replay.asr_silence_exclude":
             Path(command[6]).write_text("{}", encoding="utf-8")
+        elif name == "replay.asr_hallucination":
+            Path(command[-1]).write_text("{}", encoding="utf-8")
 
 
 def upstream(tmp_path: Path, *names: str) -> None:
@@ -122,61 +130,151 @@ def modules(producers: Producers) -> list[str]:
     return [command[command.index("-m") + 1] for command in producers.commands]
 
 
-def test_clocks_prepare_run_both_clock_stages_and_hash_the_source(tmp_path: Path) -> None:
+def clocked(path: Path, tmp_path: Path) -> None:
+    """The audio clock, then both clocks: what every step after them waits for."""
+    steps.execute("audio-clock", path, run=Producers(tmp_path))
+    steps.execute("clocks", path, run=Producers(tmp_path))
+
+
+def test_the_audio_clock_prepares_and_runs_only_the_audio_clock_stage(tmp_path: Path) -> None:
     producers = Producers(tmp_path)
-    receipt = steps.execute("clocks", configure(tmp_path), run=producers)
+    receipt = steps.execute("audio-clock", configure(tmp_path), run=producers)
     assert modules(producers) == ["replay.replay_preparation_plan", "replay.workflow"]
-    assert producers.commands[1][-4:] == [
+    assert producers.commands[1][-2:] == ["--target", "source-audio-clock"]
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    assert data["inputs"] == {
+        str(tmp_path / "pipeline.json"): steps.sha256(tmp_path / "pipeline.json")
+    }
+    assert sorted(data["outputs"]) == ["audioClock", "audioClockProducer", "preparation"]
+
+
+def test_the_audio_clock_of_a_recording_whose_clocks_passed_runs_nothing(tmp_path: Path) -> None:
+    path = configure(tmp_path)
+    clocked(path, tmp_path)
+    (tmp_path / "steps/audio-clock.json").unlink()
+    producers = Producers(tmp_path)
+    receipt = steps.execute("audio-clock", path, run=producers)
+    assert producers.commands == []
+    assert json.loads(receipt.read_text(encoding="utf-8"))["outputs"]["audioClock"] == {
+        "path": str(tmp_path / "replay-123/audio-clock.json"),
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    }
+
+
+def test_receipts_bound_before_the_audio_clock_step_are_still_finished(tmp_path: Path) -> None:
+    path = configure(tmp_path)
+    pipeline = steps.load(path)
+    clocked(path, tmp_path)
+    steps.execute("separation", path, run=Producers(tmp_path))
+    clocks = json.loads((tmp_path / "steps/clocks.json").read_text(encoding="utf-8"))
+    alone = {str(tmp_path / "pipeline.json"): steps.sha256(tmp_path / "pipeline.json")}
+    (tmp_path / "steps/clocks.json").write_text(json.dumps({**clocks, "inputs": alone}), "utf-8")
+    assert steps.finished(pipeline, "clocks") is True
+    separation = json.loads((tmp_path / "steps/separation.json").read_text(encoding="utf-8"))
+    legacy = {
+        **alone,
+        str(tmp_path / "steps/clocks.json"): steps.sha256(tmp_path / "steps/clocks.json"),
+    }
+    (tmp_path / "steps/separation.json").write_text(
+        json.dumps({**separation, "inputs": legacy}), "utf-8"
+    )
+    assert steps.finished(pipeline, "separation") is True
+    (tmp_path / "steps/clocks.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ReplayError, match="separation receipt predates"):
+        steps.finished(pipeline, "separation")
+
+
+def test_reset_of_the_clocks_keeps_the_audio_clock_that_separation_used(tmp_path: Path) -> None:
+    path = configure(tmp_path)
+    clocked(path, tmp_path)
+    (tmp_path / "replay-123/state").mkdir()
+    (tmp_path / "replay-123/state/source-video-clock.json").write_text("{}", encoding="utf-8")
+    paths = [item["path"] for item in steps.reset(steps.load(path), "clocks")]
+    assert paths == [
+        str(tmp_path / "replay-123/video-clock.json"),
+        str(tmp_path / "replay-123/video-clock.producer.json"),
+        str(tmp_path / "replay-123/state/source-video-clock.json"),
+        str(tmp_path / "replay-123/source.sha256"),
+        str(tmp_path / "steps/clocks.json"),
+    ]
+    assert (tmp_path / "replay-123/audio-clock.json").exists() is True
+
+
+def test_clocks_run_both_clock_stages_after_the_audio_clock_and_hash_the_source(
+    tmp_path: Path,
+) -> None:
+    path = configure(tmp_path)
+    steps.execute("audio-clock", path, run=Producers(tmp_path))
+    producers = Producers(tmp_path)
+    receipt = steps.execute("clocks", path, run=producers)
+    assert modules(producers) == ["replay.workflow_parallel"]
+    assert producers.commands[0][-4:] == [
         "--target",
         "source-video-clock",
         "--target",
         "source-audio-clock",
     ]
     assert (tmp_path / "replay-123/source.sha256").read_text(encoding="utf-8") == (
-        f"{steps.sha256(tmp_path / 'source.mp4')}  {tmp_path / 'source.mp4'}\n"
+        f"{'ab' * 32}  {tmp_path / 'source.mp4'}\n"
     )
     data = json.loads(receipt.read_text(encoding="utf-8"))
     assert data["step"] == "clocks"
     assert data["qualityApproved"] is False
     assert data["inputs"] == {
-        str(tmp_path / "pipeline.json"): steps.sha256(tmp_path / "pipeline.json")
+        str(tmp_path / "pipeline.json"): steps.sha256(tmp_path / "pipeline.json"),
+        str(tmp_path / "steps/audio-clock.json"): steps.sha256(tmp_path / "steps/audio-clock.json"),
     }
     assert sorted(data["outputs"]) == ["audioClock", "preparation", "videoClock"]
+
+
+def test_clocks_refuse_evidence_of_another_source(tmp_path: Path) -> None:
+    class Elsewhere(Producers):
+        def __call__(self, command: Sequence[str], log: Path) -> None:
+            super().__call__(command, log)
+            evidence = self.work() / "video-clock.producer.json"
+            if evidence.exists():
+                evidence.write_text('{"source": {"path": "/other.mp4"}}', encoding="utf-8")
+
+    path = configure(tmp_path)
+    steps.execute("audio-clock", path, run=Producers(tmp_path))
+    with pytest.raises(ReplayError, match="another source"):
+        steps.execute("clocks", path, run=Elsewhere(tmp_path))
+    assert not (tmp_path / "replay-123/source.sha256").exists()
 
 
 def test_a_partial_preparation_is_removed_and_prepared_again(tmp_path: Path) -> None:
     (tmp_path / "replay-123").mkdir()
     (tmp_path / "replay-123/half.txt").write_text("x", encoding="utf-8")
     producers = Producers(tmp_path)
-    steps.execute("clocks", configure(tmp_path), run=producers)
+    steps.execute("audio-clock", configure(tmp_path), run=producers)
     assert modules(producers) == ["replay.replay_preparation_plan", "replay.workflow"]
     assert (tmp_path / "replay-123/half.txt").exists() is False
 
 
 def test_a_finished_preparation_is_reused(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     (tmp_path / "steps/clocks.json").unlink()
     producers = Producers(tmp_path)
     steps.execute("clocks", path, run=producers)
-    assert modules(producers) == ["replay.workflow"]
+    assert modules(producers) == ["replay.workflow_parallel"]
 
 
 def test_a_finished_step_is_not_run_again(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    steps.execute("audio-clock", path, run=Producers(tmp_path))
     with pytest.raises(ReplayError, match="receipt exists"):
-        steps.execute("clocks", path, run=Producers(tmp_path))
+        steps.execute("audio-clock", path, run=Producers(tmp_path))
 
 
 def test_finished_compares_the_receipt_with_its_current_inputs(tmp_path: Path) -> None:
     path = configure(tmp_path)
     pipeline = steps.load(path)
     assert steps.finished(pipeline, "separation") is False
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    steps.execute("audio-clock", path, run=Producers(tmp_path))
     steps.execute("separation", path, run=Producers(tmp_path))
     assert steps.finished(pipeline, "separation") is True
-    (tmp_path / "steps/clocks.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "steps/audio-clock.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ReplayError, match="predates its inputs"):
         steps.finished(pipeline, "separation")
 
@@ -296,7 +394,7 @@ def test_a_sub_stage_still_running_elsewhere_is_refused(tmp_path: Path) -> None:
 
 def test_the_bootstrap_stops_at_the_profile_settings(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     producers = Producers(tmp_path)
     steps.execute("cleanup-bootstrap", path, run=producers)
     assert modules(producers) == [
@@ -330,7 +428,7 @@ def test_a_band_free_source_is_surveyed_and_composed_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     monkeypatch.setattr("replay.caption_absence.no_band", lambda _request, _output: True)
     monkeypatch.setattr(
         "replay.caption_absence.summary", lambda _request, _output: {"reason": "none"}
@@ -351,11 +449,62 @@ def test_a_band_free_source_is_surveyed_and_composed_unchanged(
     assert steps.step_outputs(steps.load(path), "cleanup-bootstrap")[-1] == survey
 
 
+def test_a_band_free_source_with_comment_boxes_is_cleaned_by_its_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    clocked(path, tmp_path)
+    monkeypatch.setattr("replay.caption_absence.no_band", lambda _request, _output: True)
+    monkeypatch.setattr(
+        "replay.caption_absence.summary", lambda _request, _output: {"reason": "none"}
+    )
+    steps.execute("cleanup-bootstrap", path, run=CaptionFreeProducers(tmp_path))
+    (tmp_path / "edit").mkdir(exist_ok=True)
+    (tmp_path / "edit/cleanup.json").write_text(
+        '{"version": 1, "remove": "comment-boxes"}', encoding="utf-8"
+    )
+    cleaned = tmp_path / "deliveries/source-comment-clean/edit/source.mp4"
+    monkeypatch.setattr(
+        "replay.source_comment_clean.location", lambda _root, source: cleaned.parent / source.name
+    )
+    commands: list[list[str]] = []
+
+    def run(command: Sequence[str], _log: Path) -> None:
+        commands.append(list(command[2:]))
+        cleaned.parent.mkdir(parents=True)
+        (cleaned.parent / "comment-clean.json").write_text("{}", encoding="utf-8")
+
+    receipt = steps.execute("cleanup", path, run=run)
+    survey = tmp_path / "replay-123/caption-absence-v1"
+    assert commands == [
+        ["-m", "replay.source_comment_clean", str(tmp_path / "edit"), str(tmp_path / "source.mp4"),
+         "--defaults", str(tmp_path / "cleanupDefaults.json"),
+         "--ffmpeg", "/ffmpeg", "--ffprobe", "/ffprobe"]
+    ]  # fmt: skip
+    assert json.loads(receipt.read_text("utf-8"))["outputs"] == {
+        "captionFree": steps.pin(survey / "summary.json"),
+        "commentClean": steps.pin(cleaned.parent / "comment-clean.json"),
+        "cleanSource": str(cleaned),
+    }
+
+
+def test_comment_box_removal_refuses_a_source_with_a_caption_band(tmp_path: Path) -> None:
+    path = configure(tmp_path)
+    (tmp_path / "edit").mkdir(exist_ok=True)
+    (tmp_path / "edit/cleanup.json").write_text(
+        '{"version": 1, "remove": "comment-boxes"}', encoding="utf-8"
+    )
+    clocked(path, tmp_path)
+    steps.execute("cleanup-bootstrap", path, run=Producers(tmp_path))
+    with pytest.raises(ReplayError, match="without a caption band"):
+        steps.execute("cleanup", path, run=Producers(tmp_path))
+
+
 def test_a_failed_survey_with_a_band_still_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     verdicts = iter((True, False))
     monkeypatch.setattr("replay.caption_absence.no_band", lambda _request, _output: next(verdicts))
 
@@ -374,7 +523,7 @@ def test_a_bootstrap_failing_for_another_reason_is_not_surveyed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     monkeypatch.setattr("replay.caption_absence.no_band", lambda _request, _output: False)
     producers = CaptionFreeProducers(tmp_path)
     with pytest.raises(ReplayError, match="Producer failed"):
@@ -384,10 +533,12 @@ def test_a_bootstrap_failing_for_another_reason_is_not_surveyed(
 
 def test_yolo_track_covers_every_clock_frame(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
+    (tmp_path / "cleanupDefaults.json").write_text('{"chunkFrames": 900}', "utf-8")
     producers = Producers(tmp_path)
     steps.execute("yolo-track", path, run=producers)
     command = producers.commands[0]
+    assert command[command.index("--batch") :][:4] == ["--batch", "32", "--chunk-frames", "900"]
     assert command[command.index("--end") + 1] == "3"
     assert command[command.index("--step") + 1] == "2"
     assert command[command.index("--device") + 1] == "mps"
@@ -396,7 +547,7 @@ def test_yolo_track_covers_every_clock_frame(tmp_path: Path) -> None:
 
 def test_separation_uses_a_gpu_copy_of_the_reference_template(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     producers = Producers(tmp_path)
     steps.execute("separation", path, run=producers)
     assert modules(producers) == [
@@ -425,7 +576,7 @@ def test_separation_uses_a_gpu_copy_of_the_reference_template(tmp_path: Path) ->
 
 def test_an_interrupted_separation_resumes(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     namespace = tmp_path / "replay-123/separation-v1"
     (namespace / "pipeline").mkdir(parents=True)
     (namespace / "PIPELINE-PLAN-v1.json").write_text("{}", encoding="utf-8")
@@ -437,7 +588,7 @@ def test_an_interrupted_separation_resumes(tmp_path: Path) -> None:
 
 def test_a_plan_pinning_an_older_closure_is_rebuilt_before_it_runs(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     namespace = tmp_path / "replay-123/separation-v1"
     namespace.mkdir()
     (namespace / "PIPELINE-PLAN-v1.json").write_text('{"codeInputs": []}', encoding="utf-8")
@@ -460,7 +611,7 @@ def test_a_plan_pinning_the_current_closure_is_kept(tmp_path: Path) -> None:
 
 def test_asr_prepares_runs_and_excludes_silence(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     upstream(tmp_path, "separation")
     producers = Producers(tmp_path)
     receipt = steps.execute("asr", path, run=producers)
@@ -469,6 +620,7 @@ def test_asr_prepares_runs_and_excludes_silence(tmp_path: Path) -> None:
         "replay.asr_context_streams",
         "replay.asr_context_streams",
         "replay.asr_silence_exclude",
+        "replay.asr_hallucination",
     ]
     prepared = tmp_path / "replay-123/asr-v1/prepared"
     assert producers.commands[1][-5:] == [
@@ -488,6 +640,10 @@ def test_asr_prepares_runs_and_excludes_silence(tmp_path: Path) -> None:
         "--clamp-partial",
     ]
     assert sorted(json.loads(receipt.read_text("utf-8"))["outputs"]) == ["labels", "mono"]
+    assert producers.commands[4][-3:] == [
+        str(prepared / "labels-silence-v1.json"), str(prepared / "mono.wav"),
+        str(prepared / "labels-hallucination-v1.json"),
+    ]  # fmt: skip
 
 
 def write_cleanup(tmp_path: Path) -> Path:
@@ -501,6 +657,79 @@ def write_cleanup(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return description
+
+
+def test_a_chunk_decoding_other_pts_than_the_packet_clock_refuses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    write_cleanup(tmp_path)
+    (tmp_path / "replay-123").mkdir()
+    clock = tmp_path / "replay-123/video-clock.json"
+    clock.write_text('{"clockProducer": {"method": "packet-v1"}}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    upstream(tmp_path, "cleanup-bootstrap")
+
+    def run(command: Sequence[str], log: Path) -> None:
+        if command[-1] == "run":
+            (tmp_path / "clean/logs").mkdir()
+            (tmp_path / "clean/logs/chunk-00000.log").write_text(
+                "ValueError: Actual decoded PTS differ from the supplied source clock", "utf-8"
+            )
+            raise ReplayError("Producer failed (1)")
+
+    with pytest.raises(ReplayError, match="DECODED_CLOCK_MISMATCH cleanup chunk-00000"):
+        steps.execute("cleanup", path, run=run)
+    assert json.loads((tmp_path / "replay-123/packet-clock-refused.json").read_text("utf-8")) == {
+        "version": 1,
+        "consumer": "cleanup chunk-00000",
+        "reason": "Actual decoded PTS differ from the supplied source clock",
+    }
+
+
+def test_a_failed_chunk_with_a_decoded_clock_fails_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    write_cleanup(tmp_path)
+    (tmp_path / "replay-123").mkdir()
+    (tmp_path / "replay-123/video-clock.json").write_text('{"frames": []}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    upstream(tmp_path, "cleanup-bootstrap")
+
+    def run(command: Sequence[str], log: Path) -> None:
+        if command[-1] == "run":
+            raise ReplayError("Producer failed (1)")
+
+    with pytest.raises(ReplayError, match=r"^Producer failed \(1\)$"):
+        steps.execute("cleanup", path, run=run)
+
+
+def test_only_the_current_failed_chunk_logs_classify_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    write_cleanup(tmp_path)
+    (tmp_path / "replay-123").mkdir()
+    clock = tmp_path / "replay-123/video-clock.json"
+    clock.write_text('{"clockProducer": {"method": "packet-v1"}}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    upstream(tmp_path, "cleanup-bootstrap")
+    mismatch = "Actual decoded PTS differ from the supplied source clock"
+
+    def run(command: Sequence[str], log: Path) -> None:
+        if command[-1] == "run":
+            (tmp_path / "clean/logs").mkdir()
+            (tmp_path / "clean/state/chunk-00000").mkdir(parents=True)
+            (tmp_path / "clean/state/chunk-00000/chunk-receipt.json").write_text("{}", "utf-8")
+            (tmp_path / "clean/logs/chunk-00000.log").write_text(mismatch, "utf-8")
+            (tmp_path / "clean/logs/chunk-00001.interrupted-1.log").write_text(mismatch, "utf-8")
+            (tmp_path / "clean/logs/chunk-00002.log").write_text("other failure", "utf-8")
+            raise ReplayError("Producer failed (1)")
+
+    with pytest.raises(ReplayError, match=r"^Producer failed \(1\)$"):
+        steps.execute("cleanup", path, run=run)
+    assert (tmp_path / "replay-123/packet-clock-refused.json").exists() is False
 
 
 def test_cleanup_redoes_only_unfinished_chunks_and_reuses_the_assembly(
@@ -614,7 +843,7 @@ def test_intermediates_retire_only_after_their_consumers_passed(tmp_path: Path) 
 
 def test_reset_removes_a_step_outputs_and_receipt(tmp_path: Path) -> None:
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     steps.execute("separation", path, run=Producers(tmp_path))
     pipeline = steps.load(path)
     removed = steps.reset(pipeline, "separation")
@@ -731,9 +960,9 @@ def test_the_cli_prints_the_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = configure(tmp_path)
-    monkeypatch.setitem(steps.STEPS, "clocks", lambda pipeline, run: {"called": True})
-    assert steps.main(["clocks", str(path)]) == 0
-    assert capsys.readouterr().out.strip() == str(tmp_path / "steps/clocks.json")
+    monkeypatch.setitem(steps.STEPS, "audio-clock", lambda pipeline, run: {"called": True})
+    assert steps.main(["audio-clock", str(path)]) == 0
+    assert capsys.readouterr().out.strip() == str(tmp_path / "steps/audio-clock.json")
 
 
 def test_sigterm_stops_a_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -745,10 +974,10 @@ def test_sigterm_stops_a_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             handler(signal.SIGTERM, None)
         return {}
 
-    monkeypatch.setitem(steps.STEPS, "clocks", interrupted)
+    monkeypatch.setitem(steps.STEPS, "audio-clock", interrupted)
     with pytest.raises(ReplayError, match="Step stopped"):
-        steps.main(["clocks", str(path)])
-    assert (tmp_path / "steps/clocks.json").exists() is False
+        steps.main(["audio-clock", str(path)])
+    assert (tmp_path / "steps/audio-clock.json").exists() is False
 
 
 def test_the_cli_runs_as_a_module(tmp_path: Path) -> None:
@@ -764,7 +993,7 @@ def test_asr_with_windows_assembles_the_windowed_recognition(
 ) -> None:
     monkeypatch.setattr(steps, "ASR_METHOD", "windows")
     path = configure(tmp_path)
-    steps.execute("clocks", path, run=Producers(tmp_path))
+    clocked(path, tmp_path)
     upstream(tmp_path, "separation")
     producers = Producers(tmp_path)
     steps.execute("asr", path, run=producers)
@@ -777,3 +1006,86 @@ def test_a_recording_is_named_by_its_replay_or_youtube_id() -> None:
     assert steps.recording_name("youtube-Eg9-gl3Z954") == "youtube-Eg9-gl3Z954"
     with pytest.raises(ReplayError, match="TikTok replay ID or youtube-<video id>"):
         steps.recording_name("youtube-../x")
+
+
+def test_a_failed_workflow_keeps_its_failed_stages_log_tails(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    (state / "native-pos-paging-ab12cd_3").mkdir(parents=True)
+    (state / "native-pos-paging-ab12cd_3/run.log").write_text(
+        "".join(f"line {n}\n" for n in range(50)) + "ReplayError: geometry\n", "utf-8"
+    )
+    (state / "native-pos-paging.json").write_text('{"status": "running"}', "utf-8")
+    (state / "cut-tempo-audio-zz99zz99").mkdir()
+    (state / "cut-tempo-audio-zz99zz99/run.log").write_text("fine\n", "utf-8")
+    (state / "cut-tempo-audio.json").write_text('{"status": "complete"}', "utf-8")
+    (state / "broken.json").write_text("[", "utf-8")
+    (state / "orphan.json").write_text('{"status": "running"}', "utf-8")
+    log = tmp_path / "logs/paging.log"
+    with pytest.raises(ReplayError, match="Producer failed \\(3\\)"):
+        steps.Producer()([sys.executable, "-c", "raise SystemExit(3)", "--state", str(state)], log)
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert lines[1] == (
+        f"--- failed stage native-pos-paging: last lines of "
+        f"{state}/native-pos-paging-ab12cd_3/run.log ---"
+    )
+    assert lines[2:4] == ["line 11", "line 12"]
+    assert lines[-1] == "ReplayError: geometry"
+    assert len(lines) == 42
+
+
+def test_cleanup_defaults_must_name_the_chunk_size(tmp_path: Path) -> None:
+    pipeline = steps.load(configure(tmp_path))
+    (tmp_path / "cleanupDefaults.json").write_text("{}", "utf-8")
+    with pytest.raises(ReplayError, match="name no chunkFrames"):
+        steps.cleanup_frames(pipeline)
+
+
+def test_a_step_receipt_records_the_code_snapshot_it_ran_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = configure(tmp_path)
+    monkeypatch.setenv(steps.SNAPSHOT, "4f" * 32)
+    receipt = steps.execute("audio-clock", path, run=Producers(tmp_path))
+    assert json.loads(receipt.read_text("utf-8"))["codeSnapshot"] == "4f" * 32
+
+
+def test_a_forced_asr_keeps_the_keyed_chunk_results_and_the_legacy_manifest(
+    tmp_path: Path,
+) -> None:
+    path = configure(tmp_path)
+    prepared = tmp_path / "replay-123/asr-v1/prepared"
+    (prepared / "context-streams/chunks").mkdir(parents=True)
+    (prepared / "asr").mkdir()
+    (prepared / "context-streams/chunks/000000000000.json").write_text("{}", encoding="utf-8")
+    (prepared / "asr/inputs.json").write_text("{}", encoding="utf-8")
+    (prepared / "context-streams/labels.json").write_text("{}", encoding="utf-8")
+    (prepared / "mono.wav").write_bytes(b"m")
+    (tmp_path / "replay-123/asr-v1/CONFIG-v1.json").write_text("{}", encoding="utf-8")
+    paths = [item["path"] for item in steps.reset(steps.load(path), "asr")]
+    assert paths == [
+        str(tmp_path / "replay-123/asr-v1/CONFIG-v1.json"),
+        str(prepared / "mono.wav"),
+        str(prepared / "context-streams/labels.json"),
+    ]
+    assert (prepared / "context-streams/chunks/000000000000.json").exists() is True
+    assert (prepared / "asr/inputs.json").exists() is True
+
+
+def test_the_windowed_asr_reset_removes_its_whole_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(steps, "ASR_METHOD", "windows")
+    assert steps.asr_outputs(tmp_path) == (tmp_path / "asr-v1",)
+
+
+def test_asr_moves_a_published_manifest_into_its_chunk_store(tmp_path: Path) -> None:
+    path = configure(tmp_path)
+    clocked(path, tmp_path)
+    upstream(tmp_path, "separation")
+    prepared = tmp_path / "replay-123/asr-v1/prepared"
+    (prepared / "context-streams/chunks").mkdir(parents=True)
+    (prepared / "asr").mkdir()
+    (prepared / "asr/inputs.json").write_text('{"inputs": {}}', encoding="utf-8")
+    steps.execute("asr", path, run=Producers(tmp_path))
+    moved = prepared / "context-streams/chunks/previous-inputs.manifest"
+    assert moved.read_text(encoding="utf-8") == '{"inputs": {}}'

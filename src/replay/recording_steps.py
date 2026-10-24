@@ -19,8 +19,10 @@ redoes only what an interruption left unfinished:
 
 Steps and producers:
 
-- ``clocks``: ``replay_preparation_plan prepare`` and its video and audio clock stages; writes
-  ``source.sha256`` for the cleanup description;
+- ``audio-clock``: ``replay_preparation_plan prepare`` and its audio clock stage, all that
+  separation reads, so separation need not wait for the video clock's full decode;
+- ``clocks``: the video and audio clock stages of that preparation; writes ``source.sha256`` for
+  the cleanup description;
 - ``cleanup-bootstrap``: ``cleanup_bootstrap_request``, ``replay_cleanup_plan prepare`` and the
   bootstrap workflow up to ``profile-settings``;
 - ``cleanup``: ``source_clean_run describe/configs/run/assemble`` (revision ``p1``); a source
@@ -46,11 +48,13 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FrameType
 
 from replay import caption_absence as absence
+from replay import packet_clock
+from replay import source_comment_clean as comments
 from replay.code_dependency_inventory import capture
 from replay.core import ReplayError
 from replay.recordings import record
@@ -86,8 +90,13 @@ REFERENCES = frozenset(
 )
 YOLO_KEYS = frozenset({"weights", "sha256", "configDirectory", "step"})
 CLOCK_STAGES = ("source-video-clock", "source-audio-clock")
+SNAPSHOT = "REPLAY_CODE_SNAPSHOT"  # code_snapshot.VARIABLE
+YOLO_CHUNK_BATCH = 32  # subtitle_yolo_regions.BATCH: the batch a cleanup chunk detects in
 BOOTSTRAP_TARGET = "profile-settings"
+# subtitle_video_fast's refusal when a chunk decodes other PTS than its clock slice.
+CHUNK_CLOCK_MISMATCH = b"Actual decoded PTS differ from the supplied source clock"
 SILENCE_ARGUMENTS = ("--minimum-seconds", "5", "--maximum-amplitude", "8", "--clamp-partial")
+HALLUCINATION_LABELS = "labels-hallucination-v1.json"  # the asr step's labels
 # Recognition: "context-streams" (pause-cut chunks with previous-text context, one persistent
 # model; replay.asr_context_streams, adopted 2026-10-18) or "windows" (60/30 s windows without
 # context, one process per window). Code is not a receipt input: switching needs --force asr.
@@ -97,6 +106,9 @@ YOLO_DEVICE, YOLO_DECODER = "mps", "videotoolbox"  # detector on the GPU, media-
 # The producers check their code pins against these closures (``code_inputs`` in each).
 PREPARATION_CLOSURE = ("separation_pipeline_prepare", "code_dependency_inventory")
 PLAN_CLOSURE = ("separation_window_pipeline", "code_dependency_inventory")
+# A failed workflow stage's attempt directory may be replaced before anyone reads it; the step
+# log keeps the end of its run and verify logs.
+FAILED_TAIL_LINES = 40
 CLEANUP_REVISION = "p1"
 YOUTUBE_RECORDING = re.compile(r"youtube-[A-Za-z0-9_-]{11}")
 
@@ -210,6 +222,10 @@ class Producer:
                 with self._lock:
                     self._child = None
         if code != 0:
+            if "--state" in command:
+                tails = failed_stage_tails(Path(command[list(command).index("--state") + 1]))
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write(tails)
             raise ReplayError(f"Producer failed ({code}); inspect {log}")
 
     def stop(self) -> None:
@@ -235,6 +251,30 @@ def sha256(path: Path) -> str:
 
 def pin(path: Path) -> dict[str, str]:
     return {"path": str(path), "sha256": sha256(path)}
+
+
+def failed_stage_tails(state: Path) -> str:
+    """The last lines of the newest attempt logs of each stage a workflow left running."""
+    sections: list[str] = []
+    for receipt in sorted(state.glob("*.json")):
+        try:
+            status = record(json.loads(receipt.read_text(encoding="utf-8"))).get("status")
+        except (OSError, ValueError, ReplayError):
+            continue  # not a stage receipt
+        attempt = re.compile(rf"{re.escape(receipt.stem)}-[A-Za-z0-9_]{{8}}")
+        attempts = [path for path in state.iterdir() if attempt.fullmatch(path.name)]
+        if status != "running" or not attempts:
+            continue
+        newest = max(attempts, key=lambda path: path.stat().st_mtime)
+        for name in ("run.log", "verify.log"):
+            path = newest / name
+            if path.is_file():
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                sections.append(
+                    f"--- failed stage {receipt.stem}: last lines of {path} ---\n"
+                    + "".join(f"{line}\n" for line in lines[-FAILED_TAIL_LINES:])
+                )
+    return "".join(sections)
 
 
 def module(pipeline: Pipeline, name: str, *arguments: str, provider: bool = False) -> list[str]:
@@ -322,14 +362,17 @@ def clear_interrupted(plan: Path, state: Path) -> list[str]:
     return cleared
 
 
-def workflow(pipeline: Pipeline, plan: Path, state: Path, *targets: str) -> list[str]:
+def workflow(
+    pipeline: Pipeline, plan: Path, state: Path, *targets: str, runner: str = "workflow"
+) -> list[str]:
+    """``runner`` ``workflow_parallel`` runs independent stages at once (same stage receipts)."""
     clear_interrupted(plan, state)
     selected = [argument for target in targets for argument in ("--target", target)]
-    return module(pipeline, "workflow", str(plan), "--state", str(state), *selected)
+    return module(pipeline, runner, str(plan), "--state", str(state), *selected)
 
 
-def clocks(pipeline: Pipeline, run: Runner) -> dict[str, object]:
-    work, log = pipeline.work, pipeline.logs / "clocks.log"
+def prepared(pipeline: Pipeline, run: Runner, log: Path) -> None:
+    work = pipeline.work
     clear_partial(work, work / "workflow.json")
     if not work.exists():
         tools = str(pipeline.reference("preparationTools"))
@@ -339,11 +382,38 @@ def clocks(pipeline: Pipeline, run: Runner) -> dict[str, object]:
             "--source", str(pipeline.path_of("source")),
         )  # fmt: skip
         run(prepare, log)
-    run(workflow(pipeline, work / "workflow.json", work / "state", *CLOCK_STAGES), log)
+
+
+def audio_clock(pipeline: Pipeline, run: Runner) -> dict[str, object]:
+    work, log = pipeline.work, pipeline.logs / "clocks.log"
+    # A recording whose clocks passed before this step existed: its clocks receipt vouches for
+    # the audio clock, and re-verifying it would re-check that preparation's old code pins.
+    if not (pipeline.steps / "clocks.json").exists():
+        prepared(pipeline, run, log)
+        run(workflow(pipeline, work / "workflow.json", work / "state", CLOCK_STAGES[1]), log)
+    return {
+        "audioClock": pin(work / "audio-clock.json"),
+        "audioClockProducer": pin(work / "audio-clock.producer.json"),
+        "preparation": pin(work / "preparation.json"),
+    }
+
+
+def clocks(pipeline: Pipeline, run: Runner) -> dict[str, object]:
+    work, log = pipeline.work, pipeline.logs / "clocks.log"
+    prepared(pipeline, run, log)
+    # The audio clock does not read the video clock: both run at once (FeR: 230 s and 100 s).
+    clocks = workflow(pipeline, work / "workflow.json", work / "state", *CLOCK_STAGES,
+                      runner="workflow_parallel")  # fmt: skip
+    run(clocks, log)
     source = pipeline.path_of("source")
     hashed = work / "source.sha256"
     if not hashed.exists():
-        hashed.write_text(f"{sha256(source)}  {source}\n", encoding="utf-8")
+        # The digest the clock stages' verifiers just re-read; hashing it again costs a full read.
+        producer = json.loads((work / "video-clock.producer.json").read_text(encoding="utf-8"))
+        pinned = record(record(producer).get("source"))
+        if pinned.get("path") != str(source):
+            raise ReplayError("The clock evidence names another source")
+        hashed.write_text(f"{pinned['sha256']}  {source}\n", encoding="utf-8")
     return {
         "videoClock": pin(work / "video-clock.json"),
         "audioClock": pin(work / "audio-clock.json"),
@@ -433,10 +503,29 @@ def clear_partial_chunks(work: Path, media: Path) -> None:
 
 def cleanup(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     bootstrap = record(read_receipt(pipeline, "cleanup-bootstrap").get("outputs", {}))
-    if "captionFree" in bootstrap:
-        # Nothing to remove: the measured source is composed unchanged.
-        return {"captionFree": bootstrap["captionFree"], "cleanSource": pipeline.text("source")}
     log, description = pipeline.logs / "cleanup.log", pipeline.description
+    edit_root = pipeline.path_of("editRoot")
+    if "captionFree" in bootstrap:
+        if not comments.intent(edit_root):
+            # Nothing to remove: the measured source is composed unchanged.
+            return {"captionFree": bootstrap["captionFree"], "cleanSource": pipeline.text("source")}
+        # The recording asks for its chat comment boxes to be filled instead.
+        run(
+            module(pipeline, "source_comment_clean", str(edit_root), pipeline.text("source"),
+                   "--defaults", str(pipeline.reference("cleanupDefaults")),
+                   "--ffmpeg", pipeline.text("ffmpeg"), "--ffprobe", pipeline.text("ffprobe")),
+            log,
+        )  # fmt: skip
+        cleaned = comments.location(edit_root, pipeline.path_of("source"))
+        return {
+            "captionFree": bootstrap["captionFree"],
+            "commentClean": pin(cleaned.parent / comments.RECORD),
+            "cleanSource": str(cleaned),
+        }
+    if comments.intent(edit_root):
+        # shortcut: comment boxes are removed only from a caption-free source; merge them into
+        # the caption cleanup's masks when a recording needs both.
+        raise ReplayError("Comment box removal needs a source without a caption band")
     if not description.exists():
         defaults = str(pipeline.reference("cleanupDefaults"))
         run(
@@ -447,7 +536,13 @@ def cleanup(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     work, media = cleanup_layout(description)
     run(module(pipeline, "source_clean_run", str(description), "configs"), log)  # idempotent
     clear_partial_chunks(work, media)
-    run(module(pipeline, "source_clean_run", str(description), "run"), log)
+    try:
+        run(module(pipeline, "source_clean_run", str(description), "run"), log)
+    except ReplayError as error:
+        refused = refused_clock(pipeline, work)
+        if refused is not None:
+            raise refused from error
+        raise
     consumer = work / "consumer" / "source-cleanup.json"
     if not consumer.exists():
         remove(work / "consumer")
@@ -461,12 +556,41 @@ def cleanup(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     }
 
 
+def refused_clock(pipeline: Pipeline, work: Path) -> ReplayError | None:
+    """The classified refusal when a failed chunk decoded other PTS than the packet clock gave.
+
+    A chunk's render compares every PTS it decodes with its clock slice before its receipt;
+    retrying would fail the same way, so the packet clock is refused instead.
+    """
+    clock = pipeline.work / "video-clock.json"
+    if not packet_clock.is_packet(clock):
+        return None
+    # The current attempt's logs only: an interrupted attempt's log was renamed aside.
+    for chunk in sorted((work / "logs").glob("chunk-[0-9][0-9][0-9][0-9][0-9].log")):
+        if not (work / "state" / chunk.stem / "chunk-receipt.json").exists() and (
+            CHUNK_CLOCK_MISMATCH in chunk.read_bytes()
+        ):
+            return packet_clock.refuse(
+                clock, consumer=f"cleanup {chunk.stem}", reason=CHUNK_CLOCK_MISMATCH.decode()
+            )
+    return None
+
+
 def frame_count(clock: Path) -> int:
     """Decoded frames in the ``ffprobe -show_frames`` video clock."""
     frames = record(json.loads(clock.read_text(encoding="utf-8"))).get("frames")
     if not isinstance(frames, list) or not frames:
         raise ReplayError("The video clock has no frames")
     return len(frames)
+
+
+def cleanup_frames(pipeline: Pipeline) -> int:
+    """The cleanup chunk size (``chunkFrames`` of the cleanup defaults)."""
+    defaults = pipeline.reference("cleanupDefaults").read_text(encoding="utf-8")
+    frames = record(json.loads(defaults)).get("chunkFrames")
+    if type(frames) is not int or frames < 1:
+        raise ReplayError("The cleanup defaults name no chunkFrames")
+    return frames
 
 
 def yolo_track(pipeline: Pipeline, run: Runner) -> dict[str, object]:
@@ -481,7 +605,13 @@ def yolo_track(pipeline: Pipeline, run: Runner) -> dict[str, object]:
                    "--work", str(Path.cwd().resolve() / "edits"), "--end", str(frames),
                    "--step", pipeline.yolo("step"), "--device", YOLO_DEVICE,
                    "--decoder", YOLO_DECODER, "--ffmpeg", pipeline.text("ffmpeg"),
-                   "--ffprobe", pipeline.text("ffprobe")),
+                   "--ffprobe", pipeline.text("ffprobe"),
+                   # The same pass streams every frame's caption boxes to the cleanup chunks.
+                   "--boxes", str(pipeline.work / "yolo-boxes-v1"),
+                   "--frame-clock", str(pipeline.work / "video-clock.json"),
+                   # Batches as a cleanup chunk's own detection forms them: same boxes.
+                   "--batch", str(YOLO_CHUNK_BATCH),
+                   "--chunk-frames", str(cleanup_frames(pipeline))),
             pipeline.logs / "yolo-track.log",
         )  # fmt: skip
     return {"track": pin(output)}
@@ -511,7 +641,8 @@ def provider_environment(namespace: Path) -> list[str]:
     for directory in (scratch, cache):
         directory.mkdir(mode=0o700, exist_ok=True)
     settings = {
-        "PYTHONPATH": checkout / "src",
+        # The package this step runs (src/, or its code snapshot).
+        "PYTHONPATH": Path(__file__).resolve().parents[1],
         "HF_HOME": models,
         "HF_HUB_CACHE": models / "hub",
         "HF_HUB_OFFLINE": "1",
@@ -592,14 +723,18 @@ def asr(pipeline: Pipeline, run: Runner) -> dict[str, object]:
 def silence_excluded(
     pipeline: Pipeline, run: Runner, prepared: Path, log: Path
 ) -> dict[str, object]:
-    """Recognition labels without those inside digital silence; the step's outputs."""
-    labels = prepared / "labels-silence-v1.json"
-    if not labels.exists():
+    """Recognition labels without those inside digital silence, then without Whisper's stock
+    credits phrases (ご視聴ありがとうございました mid-stream); the step's outputs."""
+    silence, labels = prepared / "labels-silence-v1.json", prepared / HALLUCINATION_LABELS
+    mono = str(prepared / "mono.wav")
+    if not silence.exists():
         run(
-            module(pipeline, "asr_silence_exclude", str(prepared / "labels.json"),
-                   str(prepared / "mono.wav"), str(labels), *SILENCE_ARGUMENTS),
+            module(pipeline, "asr_silence_exclude", str(prepared / "labels.json"), mono,
+                   str(silence), *SILENCE_ARGUMENTS),
             log,
         )  # fmt: skip
+    if not labels.exists():
+        run(module(pipeline, "asr_hallucination", str(silence), mono, str(labels)), log)
     return {"labels": pin(labels), "mono": pin(prepared / "mono.wav")}
 
 
@@ -618,10 +753,13 @@ def recognized(pipeline: Pipeline, run: Runner, config: Path, prepared: Path, lo
     ffmpeg = str(record(settings["ffmpeg"])["path"])
     run(module(pipeline, "asr_context_streams", "mono", str(vocals), ffmpeg,
                str(prepared / "mono.wav"), str(prepared / "mono-receipt.json")), log)  # fmt: skip
-    manifest.unlink(missing_ok=True)  # an interrupted publication left no labels
     model = record(settings["model"])
     directory = Path(str(record(model["config"])["path"])).parent
     pipeline_run = prepared / "context-streams"
+    store = pipeline_run / "chunks"
+    if manifest.exists() and store.is_dir():  # binds a legacy store to the inputs it decoded
+        os.replace(manifest, store / "previous-inputs.manifest")
+    manifest.unlink(missing_ok=True)  # an interrupted publication left no labels
     arguments = [str(prepared / "mono.wav"), str(directory), str(pipeline_run), str(labels),
                  str(manifest)]  # fmt: skip
     run(module(pipeline, "asr_context_streams", "publish", *arguments), log)
@@ -646,15 +784,19 @@ def retire_intermediates(pipeline: Pipeline, _run: Runner) -> dict[str, object]:
 
 # Each step's upstream steps; their receipts are the step's inputs.
 DEPENDENCIES: dict[str, tuple[str, ...]] = {
-    "clocks": (),
-    "separation": ("clocks",),
+    "audio-clock": (),
+    "clocks": ("audio-clock",),
+    "separation": ("audio-clock",),
     "cleanup-bootstrap": ("clocks",),
     "cleanup": ("cleanup-bootstrap",),
     "asr": ("separation",),
     "yolo-track": ("clocks",),
     "retire-intermediates": ("asr", "cleanup"),
 }
+# The bindings receipts written before ``audio-clock`` existed (2026-10-24) carry; still accepted.
+LEGACY_DEPENDENCIES: dict[str, tuple[str, ...]] = {"clocks": (), "separation": ("clocks",)}
 STEPS: dict[str, StepFunction] = {
+    "audio-clock": audio_clock,
     "clocks": clocks,
     "cleanup-bootstrap": cleanup_bootstrap,
     "cleanup": cleanup,
@@ -663,6 +805,19 @@ STEPS: dict[str, StepFunction] = {
     "asr": asr,
     "retire-intermediates": retire_intermediates,
 }
+
+
+def asr_outputs(work: Path) -> tuple[Path, ...]:
+    """What a forced asr removes. Context streams keep their input-keyed chunk results (and
+    the manifest binding a legacy store), so a re-run decodes only what changed."""
+    root = work / "asr-v1"
+    if ASR_METHOD != "context-streams":
+        return (root,)
+    prepared = root / "prepared"
+    names = ("mono.wav", "mono-receipt.json", "labels.json", "labels-silence-v1.json",
+             HALLUCINATION_LABELS)  # fmt: skip
+    return (root / "CONFIG-v1.json", *(prepared / name for name in names),
+            prepared / "context-streams" / "labels.json")  # fmt: skip
 
 
 def step_outputs(pipeline: Pipeline, step: str) -> tuple[Path, ...]:
@@ -674,7 +829,13 @@ def step_outputs(pipeline: Pipeline, step: str) -> tuple[Path, ...]:
         clean_work, media = cleanup_layout(pipeline.description)
         return (clean_work, media, pipeline.description)
     owned = {
-        "clocks": (work,),
+        "audio-clock": (work,),
+        "clocks": (
+            work / "video-clock.json",
+            work / "video-clock.producer.json",
+            work / "state" / "source-video-clock.json",
+            work / "source.sha256",
+        ),
         "cleanup-bootstrap": (
             work / "cleanup-preparation-v1",
             work / "cleanup-bootstrap-v1",
@@ -686,7 +847,7 @@ def step_outputs(pipeline: Pipeline, step: str) -> tuple[Path, ...]:
             work / "separation-config.json",
             work / "separation-template-gpu.json",
         ),
-        "asr": (work / "asr-v1",),
+        "asr": asr_outputs(work),
         "retire-intermediates": (),
     }
     return owned[step]
@@ -721,6 +882,13 @@ def finished(pipeline: Pipeline, step: str, graph: Graph = FRONT) -> bool:
     if not receipt.exists():
         return False
     recorded = record(json.loads(receipt.read_text(encoding="utf-8"))).get("inputs")
+    legacy = LEGACY_DEPENDENCIES.get(step)
+    if (
+        legacy is not None
+        and all((pipeline.steps / f"{name}.json").is_file() for name in legacy)
+        and recorded == inputs(pipeline, step, replace(graph, dependencies={step: legacy}))
+    ):
+        return True
     if recorded != inputs(pipeline, step, graph):
         raise ReplayError(f"The {step} receipt predates its inputs; force the step to redo it")
     return True
@@ -748,6 +916,8 @@ def execute(step: str, path: Path, *, run: Runner, graph: Graph = FRONT) -> Path
             "wallSeconds": round(ended - started, 1),
             "outputs": outputs,
             "qualityApproved": False,
+            # The code snapshot the step ran from (code_snapshot), when it ran from one.
+            **({"codeSnapshot": os.environ[SNAPSHOT]} if SNAPSHOT in os.environ else {}),
         },
     )
     return receipt

@@ -10,10 +10,17 @@ stale). Each runs the existing producers and keeps their checks:
 - ``paging``: ``caption_native_continuation`` from the reference paging configuration with this
   recording's source, voice PCM, audio clock and cuts, then its tempo and paging workflow;
 - ``placement``: ``caption_fixed_y_job`` over the whole output with the YOLO face track;
+- ``onsets``: ``replay.speech_onsets`` times each recognized character by CTC alignment against
+  the tempo voice track (the delivered audio), in the pinned CTC alignment environment;
 - ``caption-parts``: ``replay.caption_parts`` (Motion parts and their Compressor jobs);
 - ``caption-render``: ``compressor_batch`` renders every part's alpha movie;
 - ``compose``: ``replay.caption_compose plan/render`` over the cleaned source;
 - ``finish``: ``replay.caption_compose finish`` adds the tempo-matched voice and joins the groups.
+- ``upload-original``, ``excitement``, ``summarize``, ``summary`` and ``clips``: the viewer extras
+  (``replay.recording_viewer_steps``); ``summarize`` runs beside the upload, first passing the
+  completion gate and superseding incomplete older revisions;
+- ``retire-renders``: after the gate passed, deletes the render intermediates (``alpha/``,
+  ``compose/`` under the media root, ~43 GB a recording); ``final/`` is the delivery's hardlink;
 - ``upload``: the web viewer's ``sync`` (``web-viewer/src/bin/sync.ts``) uploads what changed,
   including the published delivery, to Cloudflare; one sync runs at a time on this checkout.
 
@@ -26,19 +33,21 @@ The style-20 calibration is the surviving envelope (``provisional``): receipts s
 """
 
 import csv
-import fcntl
 import json
 import shutil
 import sysconfig
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from replay import caption_gradient_audit as gradient_audit
-from replay import compressor_batch
+from replay import caption_palette, compressor_batch, compressor_guard, gpu_lease, r2_fetch
 from replay import pipeline_completion as completion
 from replay import recording_steps as front
-from replay.caption_compose import Part, load_parts, packet_count
+from replay import recording_viewer_steps as viewer
+from replay.candidate_publication import SELECTION_NAME
+from replay.caption_compose import Part, load_parts, packet_count, voice
 from replay.core import ReplayError
 from replay.recording_steps import Graph, Pipeline, Runner, module, pin, sha256, workflow
 from replay.recordings import record
@@ -64,7 +73,21 @@ ROLES = frozenset(
 )  # fmt: skip
 PLACEMENT_KEYS = frozenset({"regionTop", "regionBottom", "clearance", "maximumDrift"})
 COMPRESSOR_KEYS = frozenset({"preset", "inFlight", "submitWorkers"})
+# Runtime override of the Compressor jobs in flight, outside every hashed configuration (so no
+# finished receipt goes stale): ``{"inFlight": n}``, read at each caption-render launch.
+IN_FLIGHT_OVERRIDE = "in-flight.json"
+MAX_IN_FLIGHT_OVERRIDE = 4  # 2 in flight was chosen for Compressor stability; raise in steps
 COMPOSE_KEYS = frozenset({"server", "serverSha256", "workers"})
+# Optional, off when absent: caption-render draws the finished Motion parts natively
+# (``replay.caption_render_native``); parts it cannot verify, or all parts when the parity gate
+# on sampled parts fails, are rendered by Motion + Compressor instead.
+NATIVE_RENDER_KEYS = frozenset({"binary", "binarySha256", "floor", "sample", "workers"})
+# Optional, off when absent: the delivered voice gets one static gain from one EBU R128
+# measurement of the tempo PCM, toward the target, capped so its true peak stays at the ceiling.
+VOICE_LOUDNESS_KEYS = frozenset({"targetLufs", "truePeakDbtp"})
+OPTIONAL = frozenset({"palette", "nativeRender", "voiceLoudness"})
+# Settings the pipeline defaults may carry for every new recording (a palette is per recording).
+DEFAULT_OPTIONAL = OPTIONAL - {"palette"}
 SECTIONS = (
     ("placement", PLACEMENT_KEYS),
     ("compressor", COMPRESSOR_KEYS),
@@ -76,6 +99,9 @@ RATE = 30
 MAX_PAGE_LINES = 2  # the top-anchored Motion template has two text layers
 GRADIENT_LINES = 20  # rendered caption lines the gradient audit measures
 PAGING_MODULE, LINES_MODULE = "replay.caption_native_paging", "replay.caption_native_paging_lines"
+# The pinned CTC alignment environment (``--extra ctc-alignment``) and model, in the checkout.
+ALIGNER_PYTHON = Path("edits/.venv-ctc-alignment/bin/python")
+ALIGNER_MODEL = Path("edits/models/japanese-wav2vec2-large-rs35kh-2162c9ed")
 VERIFY_MODULE = "replay.caption_reflow_verify"
 UNKNOWN_PERSON = "region-top"
 CUT_TRANSFORMS = ("concatenate-decoded-frames", "duration-preserving-resample")
@@ -107,8 +133,19 @@ def captions_path(pipeline: Pipeline) -> Path:
 def load_captions(pipeline: Pipeline) -> Captions:
     path = captions_path(pipeline)
     data = record(json.loads(path.read_text(encoding="utf-8")))
-    if set(data) != KEYS or data["version"] != 1:
+    if set(data) - OPTIONAL != KEYS or data["version"] != 1:
         raise ReplayError("Unsupported caption pipeline settings")
+    if "palette" in data:
+        caption_palette.validated(data["palette"])
+    if "nativeRender" in data and set(record(data["nativeRender"])) != NATIVE_RENDER_KEYS:
+        raise ReplayError("Incomplete nativeRender settings")
+    if "voiceLoudness" in data:
+        level = record(data["voiceLoudness"])
+        if set(level) != VOICE_LOUDNESS_KEYS or not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in level.values()
+        ):
+            raise ReplayError("Incomplete voiceLoudness settings")
     if set(record(data["references"])) != REFERENCES:
         raise ReplayError("Incomplete caption references")
     for name, keys in SECTIONS:
@@ -172,6 +209,12 @@ def mono_receipt(prepared: Path) -> Path:
     return own if own.exists() else prepared / "state" / "mono.json"
 
 
+def asr_labels(prepared: Path) -> Path:
+    """The asr step's labels: without stock phrases since 2026-10-24, else the older ones."""
+    filtered = prepared / "labels-hallucination-v1.json"
+    return filtered if filtered.exists() else prepared / "labels-silence-v1.json"
+
+
 def cut_roles(pipeline: Pipeline, directory: Path) -> dict[str, Path]:
     """This recording's file for every role of the reference cut-plan workflow."""
     work, prepared = pipeline.work, pipeline.work / "asr-v1" / "prepared"
@@ -183,7 +226,7 @@ def cut_roles(pipeline: Pipeline, directory: Path) -> dict[str, Path]:
         "clock": work / "audio-clock.json",
         "clockReceipt": work / "state" / "source-audio-clock.json",
         "video": work / "video-clock.json",
-        "labels": prepared / "labels-silence-v1.json",
+        "labels": asr_labels(prepared),
         "asr": prepared / "asr" / "inputs.json",
         "source": pipeline.path_of("source"),
     }
@@ -274,9 +317,18 @@ def cut_plan(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     }
 
 
+def running_copy(name: str) -> str:
+    """``name`` under the package this process runs (src/replay, or its code snapshot)."""
+    parts = Path(name).parts
+    for at in range(len(parts) - 1):
+        if parts[at : at + 2] == ("src", "replay"):
+            return str(Path(__file__).resolve().parent.joinpath(*parts[at + 2 :]))
+    return name
+
+
 def refreshed_closure(reference: Path, output: Path) -> Path:
     """The reference closure's files plus the line-limit entry point, with current digests."""
-    files = [*record(read_json(reference).get("inputs")), *entry_modules()]
+    files = [*map(running_copy, record(read_json(reference).get("inputs"))), *entry_modules()]
     missing = [name for name in files if not Path(name).is_file()]
     if missing:
         raise ReplayError(f"Code closure files are missing: {', '.join(missing[:3])}")
@@ -352,7 +404,8 @@ def package_environment() -> list[str]:
     ``caption_native_continuation`` pins the base interpreter, not the virtual environment, so its
     stages find ``replay`` and its dependencies only through ``PYTHONPATH``.
     """
-    paths = (Path.cwd().resolve() / "src", Path(sysconfig.get_paths()["purelib"]))
+    # The package this step runs (src/, or its code snapshot), then the site packages.
+    paths = (Path(__file__).resolve().parents[1], Path(sysconfig.get_paths()["purelib"]))
     return [front.ENV, f"PYTHONPATH={':'.join(str(path) for path in paths)}"]
 
 
@@ -426,15 +479,42 @@ def placement(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     }
 
 
+def onsets(pipeline: Pipeline, run: Runner) -> dict[str, object]:
+    """Per-character speech onsets for the caption reveal (the file appears only when complete)."""
+    output, checkout = onsets_path(pipeline), Path.cwd().resolve()
+    if not output.exists():
+        scratch = pipeline.work / "speech-onsets-scratch"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        settings = {"PYTHONPATH": Path(__file__).resolve().parents[1], "HF_HUB_OFFLINE": "1",
+                    "TRANSFORMERS_OFFLINE": "1", "PYTHONDONTWRITEBYTECODE": "1",
+                    "HF_HOME": scratch, "TMPDIR": scratch, "XDG_CACHE_HOME": scratch}  # fmt: skip
+        run(
+            [front.ENV, *(f"{key}={value}" for key, value in settings.items()),
+             str(checkout / ALIGNER_PYTHON), "-B", "-m", "replay.speech_onsets",
+             str(pipeline.work / "cut-plan-v1" / "projected-tokens.json"),
+             str(tempo_audio(pipeline)), str(output), "--model", str(checkout / ALIGNER_MODEL)],
+            pipeline.logs / "onsets.log",
+        )  # fmt: skip
+    return {"onsets": pin(output)}
+
+
+def onsets_path(pipeline: Pipeline) -> Path:
+    return pipeline.work / "speech-onsets-v1.json"
+
+
 def caption_parts_step(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     captions, output = load_captions(pipeline), pipeline.work / "caption-parts-v1"
     if not (output / "jobs.json").exists():
         finish = [str(item) for item in record_list(captions.data["motionFinish"])]
+        colours = record(captions.data.get("palette", {}))
+        recoloured = [f"{colours[key]}" for key in ("gradientTop", "gradientBottom") if colours]
         run(
             module(pipeline, "caption_parts", str(pipeline.work / "placement-v1.json"),
                    str(output), str(captions.media(pipeline) / "alpha"),
                    "--template", str(captions.reference("motionTemplate")),
-                   "--preset", str(captions.section("compressor")["preset"]), "--", *finish),
+                   "--preset", str(captions.section("compressor")["preset"]),
+                   "--tokens", str(onsets_path(pipeline)),
+                   *(["--palette", *recoloured] if recoloured else []), "--", *finish),
             pipeline.logs / "caption-parts.log",
         )  # fmt: skip
     return {"parts": pin(output / "parts.json"), "jobs": pin(output / "jobs.json")}
@@ -446,24 +526,59 @@ def record_list(value: object) -> list[object]:
     return value
 
 
+def in_flight(configured: object, override: Path) -> int:
+    """The override file's ``inFlight`` (1-4) when present, else the configured value."""
+    if not override.is_file():
+        return int(str(configured))
+    value = record(json.loads(override.read_text(encoding="utf-8"))).get("inFlight")
+    if type(value) is not int or not 1 <= value <= MAX_IN_FLIGHT_OVERRIDE:
+        raise ReplayError(f"{override} needs an inFlight integer from 1 to 4")
+    return value
+
+
 def caption_render(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     """Render every part's alpha movie; Compressor continues from its recorded state."""
-    settings = load_captions(pipeline).section("compressor")
+    captions = load_captions(pipeline)
+    if "nativeRender" in captions.data:
+        return native_caption_render(pipeline, run, captions)
+    settings = captions.section("compressor")
     parts = pipeline.work / "caption-parts-v1"
     # Compressor fails CLI jobs ("job controller is down") unless its app is running, and nothing
     # reopens it after a restart; open it in the background (no-op when already running).
     app = compressor_batch.COMPRESSOR.parents[2]
-    run(["open", "-g", "-a", str(app)], pipeline.logs / "caption-render.log")
-    run(
-        module(pipeline, "compressor_batch", str(parts / "jobs.json"),
-               "--state", str(pipeline.work / "caption-render-v1" / "state"),
-               "--in-flight", str(settings["inFlight"]),
-               "--submit-workers", str(settings["submitWorkers"]),
-               "--retry-controller-failure"),
-        pipeline.logs / "caption-render.log",
-    )  # fmt: skip
+    log = pipeline.logs / "caption-render.log"
+    run(["open", "-g", "-a", str(app)], log)
+    batch = module(pipeline, "compressor_batch", str(parts / "jobs.json"),
+                   "--state", str(pipeline.work / "caption-render-v1" / "state"),
+                   "--in-flight", str(in_flight(settings["inFlight"], gpu_lease.root().parent
+                                                / "compressor-leases" / IN_FLIGHT_OVERRIDE)),
+                   "--submit-workers", str(settings["submitWorkers"]),
+                   "--retry-controller-failure")  # fmt: skip
+    since = log.stat().st_size if log.exists() else 0
+    try:
+        run(batch, log)
+    except ReplayError:
+        refused = compressor_guard.untracked(log, since, captions.media(pipeline))
+        if refused is not None:
+            # A Failed job's partial output whose state was retired: set it aside, submit again.
+            compressor_guard.set_aside(refused, time.time_ns())
+        elif compressor_guard.controller_down(log, since):
+            # Circuit breaker: stop submitting, restart Compressor, then resume the batch once.
+            compressor_guard.restart(app)
+        else:
+            raise
+        run(batch, log)
     states = pipeline.work / "caption-render-v1" / "state"
-    rendered = load_parts(parts / "parts.json", packet_count, states)  # recorded and complete
+    packets = remembered(packet_count)  # verification and loading read each render once
+    missing = compressor_guard.unverified(parts / "parts.json", states, packets)
+    if missing:
+        # "Success without output": those parts are submitted once more.
+        compressor_guard.retire(states, missing)
+        run(batch, log)
+    compressor_guard.record_hashes(
+        parts / "parts.json", states, pipeline.work / "caption-render-v1" / "verified-outputs.json"
+    )
+    rendered = load_parts(parts / "parts.json", packets, states)  # recorded and complete
     return {
         "parts": len(rendered),
         "frames": sum(part.frames for part in rendered),
@@ -471,15 +586,71 @@ def caption_render(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     }
 
 
+def remembered(count: compressor_guard.Packets) -> compressor_guard.Packets:
+    """``count`` once per file version (path, size, mtime), so a resubmitted render is counted
+    again but an unchanged one is read only once."""
+    seen: dict[tuple[str, int, int], int] = {}
+
+    def counted(path: Path) -> int:
+        try:
+            status = path.stat()
+        except OSError:
+            return count(path)
+        key = (str(path), status.st_size, status.st_mtime_ns)
+        if key not in seen:
+            seen[key] = count(path)
+        return seen[key]
+
+    return counted
+
+
+def native_caption_render(pipeline: Pipeline, run: Runner, captions: Captions) -> dict[str, object]:
+    """The same parts, alpha movies and job states, drawn natively from the finished ``.moti``.
+
+    ``replay.caption_render_native run`` gates on sampled parts first; a failed gate renders
+    every part with Motion + Compressor, and a part the native reader cannot verify is rendered
+    by them alone. Each fallback and its reason is in the receipt.
+    """
+    settings, compressor = captions.section("nativeRender"), captions.section("compressor")
+    parts, root = pipeline.work / "caption-parts-v1", pipeline.work / "caption-render-v1"
+    states, log = root / "state", pipeline.logs / "caption-render.log"
+    # The gate and any fallback render with Compressor, which needs its app running.
+    run(["open", "-g", "-a", str(compressor_batch.COMPRESSOR.parents[2])], log)
+    count = in_flight(
+        compressor["inFlight"], gpu_lease.root().parent / "compressor-leases" / IN_FLIGHT_OVERRIDE
+    )
+    run(
+        module(pipeline, "caption_render_native", "run", str(parts / "parts.json"),
+               str(parts / "jobs.json"), "--binary", str(settings["binary"]),
+               "--binary-sha256", str(settings["binarySha256"]),
+               "--work", str(root / "native"), "--floor-json", str(settings["floor"]),
+               "--sample", str(settings["sample"]), "--state", str(states),
+               "--workers", str(settings["workers"]), "--in-flight", str(count),
+               "--submit-workers", str(compressor["submitWorkers"])),
+        log,
+    )  # fmt: skip
+    compressor_guard.record_hashes(parts / "parts.json", states, root / "verified-outputs.json")
+    rendered = load_parts(parts / "parts.json", packet_count, states)  # recorded and complete
+    receipt = read_json(root / "native" / "receipt.json")
+    return {
+        "parts": len(rendered),
+        "frames": sum(part.frames for part in rendered),
+        "gradient": rendered_gradient(rendered),
+        "renderer": receipt["renderer"],
+        "fallback": receipt["fallback"],
+        "native": pin(root / "native" / "receipt.json"),
+    }
+
+
 def rendered_gradient(parts: Sequence[Part]) -> dict[str, object]:
     """The style gradient measured on the first parts' rendered pixels; missing raises."""
-    lifts: list[float] = []
+    measures: list[tuple[int, float]] = []
     for part in parts:
-        if len(lifts) >= GRADIENT_LINES:
+        if len(gradient_audit.full_lines(measures)) >= GRADIENT_LINES:
             break
         frames = gradient_audit.frames(str(part.render))
-        lifts += [lift for frame in frames for lift in gradient_audit.line_lifts(frame)]
-    return gradient_audit.audit(lifts)
+        measures += [line for frame in frames for line in gradient_audit.line_measures(frame)]
+    return gradient_audit.audit(gradient_audit.full_lines(measures))
 
 
 def clean_source(pipeline: Pipeline) -> Path:
@@ -500,35 +671,76 @@ def compose(pipeline: Pipeline, run: Runner) -> dict[str, object]:
                    str(pipeline.work / "caption-parts-v1" / "parts.json"),
                    str(clean_source(pipeline)), str(captions.media(pipeline) / "compose"),
                    str(requests), "--states",
-                   str(pipeline.work / "caption-render-v1" / "state")),
+                   str(pipeline.work / "caption-render-v1" / "state"),
+                   "--rate-source", str(pipeline.path_of("source")),
+                   "--frame-clock", str(pipeline.work / "video-clock.json")),
             log,
         )  # fmt: skip
+    final = final_movie(pipeline)
+    final.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     run(
         module(pipeline, "caption_compose", "render", str(requests),
                "--server", str(settings["server"]),
                "--server-sha256", str(settings["serverSha256"]),
-               "--workers", str(settings["workers"])),
+               "--workers", str(settings["workers"]),
+               "--tempo", str(tempo_audio(pipeline)), "--audio", str(voice(final)),
+               "--ffmpeg", pipeline.text("ffmpeg"), *level_arguments(captions)),
         log,
     )  # fmt: skip
-    return {"groups": pin(requests / "groups.json")}
+    first = requests / "g000.json"
+    video = record(record(read_json(first)["recipe"])["video"]) if first.exists() else {}
+    levelled = voice(final).with_name(f"{voice(final).name}.loudness.json")
+    return {
+        "groups": pin(requests / "groups.json"),
+        "averageBitRate": record(video.get("encoding", {})).get("averageBitRate"),
+        **({"voiceLoudness": pin(levelled)} if levelled.exists() else {}),
+    }
+
+
+def level_arguments(captions: Captions) -> list[str]:
+    """``caption_compose`` arguments of the recording's voice level policy, if it has one."""
+    if "voiceLoudness" not in captions.data:
+        return []
+    level = captions.section("voiceLoudness")
+    return ["--loudness-target", str(level["targetLufs"]),
+            "--true-peak-ceiling", str(level["truePeakDbtp"])]  # fmt: skip
 
 
 def final_movie(pipeline: Pipeline) -> Path:
     return load_captions(pipeline).media(pipeline) / "final" / "candidate.mp4"
 
 
+def tempo_audio(pipeline: Pipeline) -> Path:
+    return pipeline.work / "paging-v1" / "prepared" / "tempo" / "candidate.wav"
+
+
 def finish(pipeline: Pipeline, run: Runner) -> dict[str, object]:
     output = final_movie(pipeline)
-    if not output.exists():
-        output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        run(
-            module(pipeline, "caption_compose", "finish",
-                   str(pipeline.work / "compose-v1" / "requests"),
-                   str(pipeline.work / "paging-v1" / "prepared" / "tempo" / "candidate.wav"),
-                   str(output), "--ffmpeg", pipeline.text("ffmpeg")),
-            pipeline.logs / "finish.log",
-        )  # fmt: skip
-    return {"movie": pin(output), "packets": packet_count(output)}
+    r2_fetch.restore_if_offloaded(output, root=pipeline.path_of("editRoot"))  # an R2-only delivery
+    if output.exists():  # a movie from an earlier run: count it
+        return {"movie": pin(output), "packets": packet_count(output)}
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    run(
+        module(pipeline, "caption_compose", "finish",
+               str(pipeline.work / "compose-v1" / "requests"), str(tempo_audio(pipeline)),
+               str(output), "--ffmpeg", pipeline.text("ffmpeg"),
+               *level_arguments(load_captions(pipeline))),
+        pipeline.logs / "finish.log",
+    )  # fmt: skip
+    # caption_compose's join publishes the movie only after counting exactly the planned frames
+    # in it, so the count is the plan's: the groups file the compose receipt pins.
+    return {"movie": pin(output), "packets": planned_frames(pipeline)}
+
+
+def planned_frames(pipeline: Pipeline) -> int:
+    """Frames of the compose plan, read from the groups file only while it matches its pin."""
+    groups = record(record(read_json(pipeline.steps / "compose.json")["outputs"])["groups"])
+    path = Path(str(groups["path"]))
+    if sha256(path) != groups["sha256"]:
+        raise ReplayError(f"{path} differs from the compose receipt's pin")
+    return sum(
+        int(str(record(row)["frames"])) for row in record_list(json.loads(path.read_text("utf-8")))
+    )
 
 
 def publish(pipeline: Pipeline, _run: Runner) -> dict[str, object]:
@@ -543,56 +755,122 @@ def publish(pipeline: Pipeline, _run: Runner) -> dict[str, object]:
         revision=f"pipeline-{str(movie['sha256'])[:12]}",
     )
     source_probe(delivery.parents[3], str(read_json(index)["source"]))
+    retire_selection(delivery.parents[3])
+    # Before upload, excitement and summarize start: with an older revision still current the
+    # web viewer's catalog kept the old delivery and the upload sent no movie.
+    viewer.release_older(pipeline.path_of("editRoot"), delivery)
     return {"delivery": str(delivery), "evidence": pin(index)}
 
 
+def retire_selection(storage: Path) -> Path | None:
+    """Move an older flow's unverified candidate selection aside (never deleted).
+
+    The gate admits that selection as a current delivery: once its movie was retired the gate
+    failed on the missing file, and while it exists it outranks the pipeline's delivery.
+    """
+    selection = storage / "evidence" / SELECTION_NAME
+    if not selection.is_file() or read_json(selection).get("status") != "unverified-candidate":
+        return None
+    retired = storage / "evidence" / "retired" / f"{selection.stem}-retired-{time.time_ns()}.json"
+    retired.parent.mkdir(mode=0o700, exist_ok=True)
+    selection.rename(retired)
+    return retired
+
+
 def source_probe(storage: Path, source: str) -> None:
-    """Record the original for TranscriptViewer, which dates a replay from this probe."""
+    """Record the original for TranscriptViewer, which dates a replay from this probe.
+
+    A probe naming the same file (dated, replay-ID name) at another path predates a relocation of
+    the original and is rebound to the current path.
+    """
     probe = storage / "evidence" / "source-probe.json"
     if probe.exists():
-        if record(read_json(probe).get("format")).get("filename") != source:
+        recorded = str(record(read_json(probe).get("format")).get("filename"))
+        if recorded == source:
+            return
+        if Path(recorded).name != Path(source).name:
             raise ReplayError(f"{probe} belongs to a different original")
-        return
+        probe.unlink()
     probe.parent.mkdir(mode=0o700, exist_ok=True)
     write_json(probe, {"format": {"filename": source}})
 
 
-WEB_VIEWER = Path(__file__).resolve().parents[2] / "web-viewer"
-
-
 def upload(pipeline: Pipeline, run: Runner) -> dict[str, object]:
-    """Sync the web viewer (the new delivery and anything else not uploaded yet)."""
-    bun = shutil.which("bun")
-    if bun is None:
-        raise ReplayError("bun is required to upload to the web viewer")
-    with (WEB_VIEWER / "sync.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # concurrent recordings share one sync state
-        run([bun, str(WEB_VIEWER / "src" / "bin" / "sync.ts")], pipeline.logs / "upload.log")
-    return {"published": read_json(pipeline.steps / "publish.json")["outputs"]}
+    """Sync the web viewer: this delivery's movie, every changed data file and the catalog.
+
+    Other recordings' movies wait for their own upload steps (or a full sync); the catalog is
+    published only once no listed movie is missing from the bucket.
+    """
+    published = record(read_json(pipeline.steps / "publish.json")["outputs"])
+    movie = Path(str(published["delivery"]))
+    stem = movie.stem  # the web viewer's video ID
+    viewer.sync(run, pipeline.logs / "upload.log", "--only", stem)
+    viewer.require_uploaded(stem, movie, root=pipeline.path_of("editRoot"))
+    return {"published": published}
+
+
+def retire_renders(pipeline: Pipeline, _run: Runner) -> dict[str, object]:
+    """Delete the alpha and compose media once the gate passed and the delivery needs neither."""
+    gate = record(read_json(pipeline.steps / "summary.json").get("outputs")).get("gate")
+    if not isinstance(gate, dict) or gate.get("complete") is not True:
+        viewer.gate(pipeline)  # a summary from before the gate moved there; raises unless passed
+    media = load_captions(pipeline).media(pipeline)
+    published = record(read_json(pipeline.steps / "publish.json")["outputs"])
+    evidence = Path(str(record(published["evidence"])["path"])).read_text(encoding="utf-8")
+    delivered = Path(str(published["delivery"])).resolve()
+    # Siblings renamed aside (e.g. compose.groups300-20261023 after a regroup) retire with them.
+    targets = [
+        *(media / name for name in ("alpha", "compose")),
+        *sorted(media.glob("alpha.*")),
+        *sorted(media.glob("compose.*")),
+    ]
+    for target in targets:
+        if delivered.is_relative_to(target.resolve()) or str(target) in evidence:
+            raise ReplayError(f"The delivery still references {target}; renders are kept")
+    removed = [
+        {"path": str(target), "bytes": front.remove(target)}
+        for target in targets
+        if target.exists() and not target.is_symlink()
+    ]
+    return {"removed": removed, "bytes": sum(int(str(item["bytes"])) for item in removed)}
 
 
 # Each step's upstream steps (front-half steps included); their receipts are its inputs.
 DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "upload-original": ("clocks",),
     "cut-plan": ("clocks", "asr"),
     "paging": ("cut-plan",),
     "placement": ("paging", "yolo-track"),
-    "caption-parts": ("placement",),
+    "onsets": ("paging",),
+    "caption-parts": ("placement", "onsets"),
     "caption-render": ("caption-parts",),
     "compose": ("caption-render", "cleanup"),
     "finish": ("compose",),
     "publish": ("finish",),
-    "upload": ("publish",),
+    "excitement": ("publish",),
+    "upload": ("publish", "excitement"),
+    "summarize": ("publish",),
+    "summary": ("upload",),
+    "clips": ("upload", "summary"),
+    "retire-renders": ("summary",),
 }
 STEPS: dict[str, front.StepFunction] = {
+    "upload-original": viewer.upload_original,
     "cut-plan": cut_plan,
     "paging": paging,
     "placement": placement,
+    "onsets": onsets,
     "caption-parts": caption_parts_step,
     "caption-render": caption_render,
     "compose": compose,
     "finish": finish,
     "publish": publish,
+    "excitement": viewer.excitement,
     "upload": upload,
+    "summarize": viewer.summarize,
+    "summary": viewer.summary,
+    "clips": viewer.clips,
+    "retire-renders": retire_renders,
 }
 
 
@@ -600,9 +878,11 @@ def step_outputs(pipeline: Pipeline, step: str) -> tuple[Path, ...]:
     """What a forced re-run of ``step`` removes besides its receipt."""
     work, media = pipeline.work, load_captions(pipeline).media(pipeline)
     owned: dict[str, tuple[Path, ...]] = {
+        "upload-original": (),
         "cut-plan": (work / "cut-plan-v1",),
         "paging": (work / "paging-v1",),
         "placement": (work / "placement-v1.json",),
+        "onsets": (onsets_path(pipeline), work / "speech-onsets-scratch"),
         "caption-parts": (work / "caption-parts-v1", media / "alpha"),
         "caption-render": (
             work / "caption-render-v1",
@@ -611,7 +891,12 @@ def step_outputs(pipeline: Pipeline, step: str) -> tuple[Path, ...]:
         "compose": (work / "compose-v1", media / "compose"),
         "finish": (media / "final",),
         "publish": (),  # a published delivery is never deleted by a forced re-run
+        "excitement": (),  # sidecars beside a delivery stay with it
         "upload": (),
+        "summarize": (),
+        "summary": (),
+        "clips": (),
+        "retire-renders": (),
     }
     return owned[step]
 
