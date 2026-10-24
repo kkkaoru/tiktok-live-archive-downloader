@@ -370,17 +370,46 @@ the move need re-pinning, while content sha256 still verifies.
 
 ## Clip points
 
-The web viewer's Worker computes clip points (切り抜き) per video and stores them in R2 under
+The Mac computes clip points (切り抜き) per video by default and the Worker stores them in R2 under
 `clips/<movie key>.json` (same key as the excitement cache). Each clip lasts 10-30 s or 30-90 s in
 total and joins ranges of one stream in one of two stories: climax-first (the peak, then the
 lead-up to it) or hook-to-climax (a question or curious opening rising to the peak last). Its first
 3 s must be a strong hook (judged by `@cf/cloudflare/clef` for each possible opening; weak ones are
-dropped). Both viewers play the ranges back to back, once or in a loop, and list each clip's
-seconds, story, ranges and a title and summary from `@cf/zai-org/glm-5.3-flash`. Uploading a changed
-`data/<id>.json` (every sync that changes transcripts or excitement) queues the video through an R2
-event notification; unchanged inputs are never recomputed. TranscriptViewer reads them with
+dropped). A clip tells one topic only: the sync adds per-cue content nouns and clean-start hints
+(`python -m replay.clip_terms`, the pinned Vibrato dictionary) to `data/<id>.json`, noun cohesion
+proposes topic changes that clef confirms, and clef reads every assembled clip alone and rejects
+mixed topics (version 5: it also asks whether nothing unrelated is mixed in, whether the clip
+stands alone and ends on a punchline, and which utterances stray; strays are cut and the clip is
+read again, up to twice; version 6: a clip whose last sentence hangs on a particle (the sync's `closes` hint) is dropped,
+version 8: clef reads the 16 best remaining candidates again with the evaluation judge's own rubric,
+a logistic model fitted on 191 judged clips turns the answers into the chance the judge calls the clip
+good, and only clips at 0.7 or above ship; `@cf/zai-org/glm-5.3-flash` only titles them, one request
+per video and none when nothing new ships; version 9: `@cf/cloudflare/clairic` reads the same rubric as
+1-5 distributions plus a punchline span, and its means and no-punchline chance join the same logistic
+model, falling back to the clef-only fit when clairic fails. Every prompt comes from the
+`src/prompts.ts` catalog (Japanese and English side by side, Japanese sent, byte-identical to the
+version 9 requests), an identical clef request within one generation reuses its first answer, a region whose climax request
+holds no opening scoring 1.8 or more is not asked the rest, clef-flash plus clairic screen out gate
+candidates below 0.2 (none of the 44 clips clef would ship on 191 judged clips fall below), and each
+video logs a `clipsUsage` line with calls and input tokens per model). clef answers a repeated request
+identically but a question differently beside other questions, so shortening the wording or splitting a
+region's questions changes the clips; measure good clips per video with `bun run clips:eval` before
+changing either. Range edges sit on sentence boundaries, and a climax that stops
+mid-story is carried on to the unit that settles it. Clips of one video never overlap or share a start or end. Both viewers loop a clip by
+default (or play it once) and list each clip's seconds, story, ranges and a title and summary from
+`@cf/zai-org/glm-5.3-flash`. The sync needs the repository's `uv` environment for the noun step. Cloudflare AI runs only when a
+user asks (切り抜きを再計算 or `POST /api/clips/<id>/reload`): an uploaded `data/<id>.json` only
+updates the video's movie-key pointer, and opening a video without clips reads `missing`. The
+recording pipeline's `clips` step runs `bun run clips:mac` (one machine-wide, `clips-mac.lock`): it
+starts `python -m replay.clip_models` (clef-OptiQ-4bit and Ternary-Bonsai-2-9B from `edits/models/`,
+`uv run --isolated --locked --extra clips`, about 22 GB) unless one already answers on 8791, computes
+only videos with no record or changed data, stores through the bearer `PUT`, and stops the server.
+If the step fails with "Only N% of memory is free", wait for other model jobs to finish and retry;
+it never falls back to Cloudflare. TranscriptViewer reads them with
 `CLIPS_API_TOKEN` from `web-viewer/secrets.json` and the first `VIEWER_DOMAIN`; 切り抜きを再計算 in
-either viewer recomputes. Details: [web-viewer/README.md](../web-viewer/README.md#切り抜き).
+either viewer recomputes. `bun run clips:eval` (in `web-viewer/`) measures accuracy offline with
+the shipping code, a rule check and a separately calibrated judge model; run it on held-out videos
+before bumping `ALGORITHM`. Details: [web-viewer/README.md](../web-viewer/README.md#切り抜き).
 
 ## BGM library
 

@@ -9,7 +9,9 @@
     "test": "vitest run --coverage",
     "sync": "bun src/bin/sync.ts",
     "deploy": "bun src/bin/deploy.ts",
-    "debug": "bun src/bin/debug.ts"
+    "debug": "bun src/bin/debug.ts",
+    "clips:eval": "bun src/bin/clips-eval.ts",
+    "clips:mac": "bun src/bin/clips-mac.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",

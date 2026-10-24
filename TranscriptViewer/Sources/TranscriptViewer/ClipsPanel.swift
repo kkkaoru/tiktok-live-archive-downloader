@@ -17,7 +17,7 @@ struct ClipsPanel: View {
                 Button("切り抜きを再計算", action: model.reload)
                     .disabled(!model.canReload)
                     .frame(minHeight: Chrome.hit)
-                    .help("Cloudflareで切り抜き箇所と要約を計算し直します（数分かかります）")
+                    .help("Cloudflareで切り抜き箇所と要約を計算し直します（数分かかります。通常の作成はMacで行います）")
             }
             ForEach(model.clips) { clip in
                 ClipRow(clip: clip, cursor: model.cursor, play: play)
@@ -43,8 +43,8 @@ struct ClipsPanel: View {
         case .ready(let clips): clips.isEmpty ? "切り抜きに向く区間が見つかりませんでした" : "\(clips.count)件"
         case .pending: "計算中です（数分かかります）…"
         case .mismatch: "Web版の動画と内容が異なるため表示できません"
-        case .missing: "この動画の切り抜きはまだありません"
-        case .noExcitement: "盛り上がりデータがまだないため作成できません（計算して同期すると自動で作成されます）"
+        case .missing: "この動画の切り抜きはまだありません（Macで作成されると表示されます）"
+        case .noExcitement: "盛り上がりデータがまだないため作成できません（計算して同期した後、Macで作成されます）"
         case .unavailable: "Web版の接続設定がありません"
         case .failed(let message): "読み込めませんでした: \(message)"
         }

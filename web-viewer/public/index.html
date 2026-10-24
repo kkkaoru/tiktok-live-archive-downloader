@@ -498,8 +498,8 @@ function showExInfo(ev) {
   if (e.comments) parts.push(`コメント ${pct(e.comments.score[k])}（${e.comments.count[k]}件・${e.comments.characters[k]}文字）`);
   $("#exInfo").textContent = parts.join(" / ");
 }
-// Clips (切り抜き): computed and stored on Cloudflare per movie content (clef scores candidates,
-// GLM writes titles and summaries). A clip may join several ranges; playing it runs them in order.
+// Clips (切り抜き): computed on the Mac by default (local clef and Bonsai) and stored per movie
+// content; Cloudflare recomputes only on an admin's reload. A clip may join several ranges; playing it runs them in order.
 const secs = d => `${(Math.round(d * 10) / 10).toFixed(1)}秒`;
 const KIND = { short: "短尺 10〜30秒", long: "長尺 30〜90秒" };
 const PATTERN = { "climax-first": "山場→経緯", "hook-to-climax": "引き→山場" };
@@ -515,7 +515,7 @@ async function loadClips(v) {
 }
 function renderClips(status = state.clipStatus) {
   state.clipStatus = status;
-  const notes = { noExcitement: "盛り上がりデータがまだないため作成できません（盛り上がりを計算して同期すると自動で作成されます）。", pending: "切り抜きを計算中です（数分かかります）…", missing: "この動画の切り抜きはまだありません。", error: "切り抜きを読み込めませんでした。" };
+  const notes = { noExcitement: "盛り上がりデータがまだないため作成できません（盛り上がりを計算して同期した後、Macで作成されます）。", pending: "切り抜きを計算中です（数分かかります）…", missing: "この動画の切り抜きはまだありません（Macで作成されると表示されます）。", error: "切り抜きを読み込めませんでした。" };
   $("#clips").hidden = false;
   $("#clipNote").textContent = status === "ready" ? (state.clips.length ? `${state.clips.length}件` : "切り抜きに向く区間が見つかりませんでした。") : notes[status] ?? notes.error;
   $("#clipReload").hidden = SHARE || !state.admin;
