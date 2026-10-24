@@ -5,7 +5,10 @@ locations onto each line's text box, so stops placed on glyph fractions fell bel
 This audit reads a rendered alpha movie and measures, per text line, the fill colour (opaque,
 saturated pixels; the white band and black outlines are excluded) in the line's upper fifth and
 in its middle. The style's upper colour is the brighter one, so every measured line's upper
-fill must be brighter than its middle by ``MINIMUM_LIFT`` (sRGB luma, 0-255).
+fill must be brighter than its middle by ``MINIMUM_LIFT`` (sRGB luma, 0-255). Captions reveal one
+grapheme at a time, so a sampled line may hold only glyphs below the text box's top (ー, っ, 、);
+their fill spans the gradient's middle and is not measured: only lines at least ``FULL_LINE`` of
+the tallest measured line's height count.
 
     python -m replay.caption_gradient_audit ALPHA.mov
 """
@@ -27,6 +30,7 @@ SATURATION = 25  # max-min channel spread that separates the fill from white, gr
 LINE_GAP = 4  # rows without fill that separate two lines
 SAMPLE_STEP = 60
 MINIMUM_LINES = 3
+FULL_LINE = 0.85
 LUMA = np.array([0.2126, 0.7152, 0.0722])
 
 
@@ -60,6 +64,11 @@ def _lines(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 def line_lifts(frame: NDArray[np.uint8]) -> list[float]:
     """Per text line: luma of the upper fifth's fill minus the middle fifth's fill."""
+    return [lift for _, lift in line_measures(frame)]
+
+
+def line_measures(frame: NDArray[np.uint8]) -> list[tuple[int, float]]:
+    """Per text line: its fill height and its lift."""
     fill = fill_mask(frame)
     rows = np.nonzero(fill.sum(axis=1) > 3)[0]
     if not len(rows):
@@ -68,15 +77,21 @@ def line_lifts(frame: NDArray[np.uint8]) -> list[float]:
         (int(run[0]), int(run[-1]))
         for run in np.split(rows, np.nonzero(np.diff(rows) > LINE_GAP)[0] + 1)
     ]
-    lifts = []
+    lifts: list[tuple[int, float]] = []
     for top, bottom in _lines(spans):
         height = bottom - top + 1
         upper = frame[top : top + height // 5, :, :3][fill[top : top + height // 5]]
         middle_rows = slice(top + 2 * height // 5, top + 3 * height // 5)
         middle = frame[middle_rows, :, :3][fill[middle_rows]]
         if len(upper) and len(middle):
-            lifts.append(float((upper.mean(axis=0) - middle.mean(axis=0)) @ LUMA))
+            lifts.append((height, float((upper.mean(axis=0) - middle.mean(axis=0)) @ LUMA)))
     return lifts
+
+
+def full_lines(measures: Sequence[tuple[int, float]]) -> list[float]:
+    """The lifts of lines tall enough to hold the text box's top."""
+    tallest = max((height for height, _ in measures), default=0)
+    return [lift for height, lift in measures if height >= FULL_LINE * tallest]
 
 
 def frames(path: str, *, step: int = SAMPLE_STEP) -> Iterator[NDArray[np.uint8]]:
@@ -117,8 +132,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("movie")
     args = parser.parse_args(argv)
-    lifts = [lift for frame in frames(args.movie) for lift in line_lifts(frame)]
-    print(json.dumps(audit(lifts)))
+    measures = [measure for frame in frames(args.movie) for measure in line_measures(frame)]
+    print(json.dumps(audit(full_lines(measures))))
     return 0
 
 

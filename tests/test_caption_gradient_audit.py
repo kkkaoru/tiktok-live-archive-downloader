@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from replay import caption_gradient_audit as audit_module
-from replay.caption_gradient_audit import audit, frames, line_lifts, main
+from replay.caption_gradient_audit import audit, frames, full_lines, line_lifts, line_measures, main
 from replay.core import ReplayError
 
 
@@ -101,3 +101,13 @@ def test_a_detached_stroke_above_a_glyph_belongs_to_its_line() -> None:
     frame[50:54, 5:35] = (150, 80, 40, 255)  # a trailing fragment joins the last line
     lifts = line_lifts(frame)
     assert len(lifts) == 1 and lifts[0] > 12
+
+
+def test_a_line_of_glyphs_below_the_text_top_is_not_measured() -> None:
+    full = caption((151, 216, 247), (47, 176, 238))
+    partial = np.zeros((60, 40, 4), dtype=np.uint8)
+    partial[40:50, 5:20] = (47, 176, 238, 255)  # a lone っ, revealed before the rest of its line
+    measures = line_measures(full) + line_measures(partial)
+    assert [height for height, _ in measures] == [20, 20, 10]
+    assert [round(lift, 1) for lift in full_lines(measures)] == [51.4, 51.4]
+    assert full_lines([]) == []
