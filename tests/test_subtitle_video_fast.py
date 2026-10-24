@@ -2,7 +2,7 @@
 
 import hashlib
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from fractions import Fraction
 from pathlib import Path
 
@@ -486,6 +486,29 @@ def test_refill_replaces_only_supported_rows_and_keeps_the_frame_count(tmp_path:
     assert output.stat().st_size > 0
     with pytest.raises(FileExistsError):
         render_refilled_video(VideoRepairJob(source, output, SIZE, SIZE, 6, ()), store, refill)
+
+
+def test_refilled_bands_handed_over_in_order_encode_the_same_video(tmp_path: Path) -> None:
+    source = tmp_path / "source.mkv"
+    make_source(source, 6)
+    outputs = []
+    for streamed in (False, True):
+        store = SupportStore(SIZE, (10, 40))
+        for index in range(6):
+            mask = np.zeros((SIZE, SIZE), dtype=bool)
+            mask[20:30, 10:50] = True
+            store(mask, np.full((SIZE, SIZE, 3), index, dtype=np.uint8))
+
+        def refill(
+            bands: Iterator[Image], rows: tuple[int, int], streamed: bool = streamed
+        ) -> Iterable[Image]:
+            filled = np.stack([np.full_like(band, 40 * i) for i, band in enumerate(bands)])
+            return iter(list(filled)) if streamed else filled
+
+        output = tmp_path / f"refilled-{streamed}.mp4"
+        render_refilled_video(VideoRepairJob(source, output, SIZE, SIZE, 6, ()), store, refill)
+        outputs.append(output.read_bytes())
+    assert outputs[0] == outputs[1]
 
 
 def test_refill_needs_one_support_per_frame_and_some_repair(tmp_path: Path) -> None:

@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Protocol
 
 import numpy as np
-from numpy.typing import NDArray
 
 from replay import subtitle_band_audit as band_audit
 from replay import subtitle_colour_audit as colour_audit
@@ -39,7 +38,7 @@ from replay.subtitle_plan import repair_spans
 from replay.subtitle_region_fill import Region
 from replay.subtitle_repair_audit import Residual
 from replay.subtitle_stream import SubtitleSpan
-from replay.subtitle_sttn import refill_bands
+from replay.subtitle_sttn import refill_stream
 from replay.subtitle_video import VideoRepairJob
 from replay.subtitle_video_fast import (
     Schedule,
@@ -312,8 +311,8 @@ def real_collaborators(
             )  # fmt: skip
             painter = sttn
 
-            def refill(bands: Iterator[Image], rows: tuple[int, int]) -> NDArray[np.uint8]:
-                return refill_bands(bands, store.bands(*rows), painter)
+            def refill(bands: Iterator[Image], rows: tuple[int, int]) -> Iterator[Image]:
+                return refill_stream(bands, store.bands(*rows), painter)
 
             repaired = time.monotonic()
             render_refilled_video(job, store, refill)
@@ -466,6 +465,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         sttn_pins = {
             "sttn": str(settings_sttn["checkpointSHA256"]),
             "sttnAttention": subtitle_sttn.ATTENTION,
+            "sttnTiles": subtitle_sttn.TILES,
+            "sttnCompute": subtitle_sttn.compute(),
         }
     tools, pins = real_collaborators(
         config,

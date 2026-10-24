@@ -537,12 +537,13 @@ class SupportStore:
 def render_refilled_video(
     job: VideoRepairJob,
     supports: SupportStore,
-    refill: Callable[[Iterator[Image], tuple[int, int]], NDArray[np.uint8]],
+    refill: Callable[[Iterator[Image], tuple[int, int]], Iterable[Image]],
 ) -> int:
     """Encode the source with each frame's repaired pixels replaced by ``refill``.
 
     ``refill`` receives the stored source rows covering every support (one band per frame, in
-    order) and returns those rows refilled. Pixels outside the supports stay the source; the
+    order) and returns those rows refilled, as an array or as bands handed over in order (each
+    band is read once its frame is due). Pixels outside the supports stay the source; the
     encoder and presentation clock are the repair renderer's own.
     """
     if job.output.exists():
@@ -571,7 +572,7 @@ def render_refilled_video(
     if span is None:
         # The planned regions held no caption pixel: the source frames are the result.
         top = bottom = 0
-        bands: Iterator[Image] | NDArray[np.uint8] = (frame[0:0] for _ in range(job.frames))
+        bands: Iterable[Image] = (frame[0:0] for _ in range(job.frames))
     else:
         top, bottom = span
         bands = refill(supports.sources(top, bottom), (top, bottom))
