@@ -5,6 +5,13 @@ import Observation
 import SwiftUI
 import TranscriptCore
 
+/// What fills the detail's lower half under the always-visible player.
+enum DetailTab: Hashable {
+    case summary
+    case utterances
+    case clips
+}
+
 @MainActor
 @Observable
 final class PlaybackSession {
@@ -33,7 +40,7 @@ final class PlaybackSession {
     private(set) var usesDefaultLibraries = false
     var showsSearch = false
     var columnVisibility: NavigationSplitViewVisibility = .all
-    var showsSummary = true
+    var detailTab = DetailTab.summary
     var summaryBatchRun: UUID?
     var errorText = ""
     var showsError = false

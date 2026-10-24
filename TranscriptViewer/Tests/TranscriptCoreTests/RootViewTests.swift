@@ -120,7 +120,7 @@ struct RootViewTests {
         session.openSelection()
         await session.legibleSelection?.value
         session.stopObserving()
-        session.showsSummary = false
+        session.detailTab = .utterances
         let view = TranscriptRootView(session: session)
         #expect(
             try view.inspect().findAll(ViewType.Text.self).contains {
@@ -282,10 +282,12 @@ struct RootViewTests {
         let content = try view.inspect().find(ViewType.Picker.self) {
             try $0.labelView().text().string() == "表示内容"
         }
-        #expect(try content.selectedValue(Bool.self))
+        #expect(try content.selectedValue(DetailTab.self) == .summary)
         #expect(try view.inspect().findAll(NarrativeSummaryView.self).count == 1)
-        try content.select(value: false)
-        #expect(!session.showsSummary)
+        try content.select(value: DetailTab.clips)
+        #expect(try view.inspect().findAll(ClipsPanel.self).count == 1)
+        try content.select(value: DetailTab.utterances)
+        #expect(session.detailTab == .utterances)
         #expect(try view.inspect().findAll(UtteranceListView.self).count == 1)
         #expect(try view.inspect().find(text: "発話なし").string() == "発話なし")
         try view.inspect().find(button: "新しい順にすべて要約").tap()

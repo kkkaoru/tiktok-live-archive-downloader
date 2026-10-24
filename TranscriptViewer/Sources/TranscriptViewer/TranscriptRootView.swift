@@ -23,6 +23,8 @@ struct PlayerSurface: NSViewRepresentable {
         let native = context.coordinator.playerView
         native.controlsStyle = .inline
         native.showsFullScreenToggleButton = true
+        // Picture in Picture keeps the video in its own floating window above every app.
+        native.allowsPictureInPicturePlayback = true
         native.setAccessibilityLabel("動画プレーヤー")
         for diagnostic in context.coordinator.diagnostics {
             diagnostic.nativePlayerView = native
@@ -171,68 +173,76 @@ struct TranscriptRootView: View {
         } detail: {
             if let video = session.selectedVideo {
                 VStack(alignment: .leading, spacing: 12) {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 12) {
-                            PlayerSurface(player: session.player, selectedMovie: video.movieURL)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: Chrome.playerHeight)
-                                .clipped()
-                                .accessibilityLabel("動画プレーヤー \(video.title)")
-                            HStack {
-                                Picker("再生速度", selection: $session.playbackSpeed) {
-                                    ForEach(PlaybackSpeed.allCases, id: \.self) { speed in
-                                        Text(speed.label).tag(speed)
-                                    }
-                                }
-                                .pickerStyle(.segmented)
-                                .controlSize(.large)
-                                .frame(width: 300)
-                                .accessibilityLabel("再生速度")
-                                Button {
-                                    session.playbackSpeed = session.playbackSpeed.next
-                                } label: {
-                                    iconLabel("速度を切り替え", systemImage: "speedometer")
-                                }
-                                .buttonStyle(.borderless)
-                                .keyboardShortcut("s", modifiers: [])
-                                .help("S: 再生速度を 0.5x→1.0x→1.5x→2.0x の順に切り替え")
-                                Button {
-                                    session.skip(by: -10)
-                                } label: {
-                                    iconLabel("10秒戻す", systemImage: "gobackward.10")
-                                }
-                                .buttonStyle(.borderless)
-                                .keyboardShortcut(.leftArrow, modifiers: [])
-                                .help("←: 10秒戻す")
-                                Button {
-                                    session.skip(by: 10)
-                                } label: {
-                                    iconLabel("10秒送る", systemImage: "goforward.10")
-                                }
-                                .buttonStyle(.borderless)
-                                .keyboardShortcut(.rightArrow, modifiers: [])
-                                .help("→: 10秒送る")
-                                Spacer()
+                    // Pinned above everything that scrolls, so the video stays in sight while a
+                    // clip, the summary or the transcript is browsed.
+                    PlayerSurface(player: session.player, selectedMovie: video.movieURL)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: Chrome.playerHeight)
+                        .clipped()
+                        .accessibilityLabel("動画プレーヤー \(video.title)")
+                    HStack {
+                        Picker("再生速度", selection: $session.playbackSpeed) {
+                            ForEach(PlaybackSpeed.allCases, id: \.self) { speed in
+                                Text(speed.label).tag(speed)
                             }
-                            timeline
                         }
+                        .pickerStyle(.segmented)
+                        .controlSize(.large)
+                        .frame(width: 300)
+                        .accessibilityLabel("再生速度")
+                        Button {
+                            session.playbackSpeed = session.playbackSpeed.next
+                        } label: {
+                            iconLabel("速度を切り替え", systemImage: "speedometer")
+                        }
+                        .buttonStyle(.borderless)
+                        .keyboardShortcut("s", modifiers: [])
+                        .help("S: 再生速度を 0.5x→1.0x→1.5x→2.0x の順に切り替え")
+                        Button {
+                            session.skip(by: -10)
+                        } label: {
+                            iconLabel("10秒戻す", systemImage: "gobackward.10")
+                        }
+                        .buttonStyle(.borderless)
+                        .keyboardShortcut(.leftArrow, modifiers: [])
+                        .help("←: 10秒戻す")
+                        Button {
+                            session.skip(by: 10)
+                        } label: {
+                            iconLabel("10秒送る", systemImage: "goforward.10")
+                        }
+                        .buttonStyle(.borderless)
+                        .keyboardShortcut(.rightArrow, modifiers: [])
+                        .help("→: 10秒送る")
+                        Spacer()
+                    }
+                    ScrollView {
+                        timeline
                     }
                     // Outside the scroll area, so the BGM stays visible however short it gets.
                     VideoBGMControls(model: session.videoBGM)
-                    Picker("表示内容", selection: $session.showsSummary) {
-                        Text("要約").tag(true)
-                        Text("認識結果").tag(false)
+                    Picker("表示内容", selection: $session.detailTab) {
+                        Text("要約").tag(DetailTab.summary)
+                        Text("認識結果").tag(DetailTab.utterances)
+                        Text("切り抜き").tag(DetailTab.clips)
                     }
                     .pickerStyle(.segmented)
                     .controlSize(.large)
-                    if session.showsSummary {
+                    switch session.detailTab {
+                    case .summary:
                         NarrativeSummaryView(video: video, model: session.narrativeSummary) {
                             seconds in
                             session.resumeTimelineFollow()
                             session.seek(to: seconds)
                         }
                         .id(video.id)
-                    } else {
+                    case .clips:
+                        ScrollView {
+                            ClipsPanel(model: session.clips) { clip, index, loop in
+                                session.play(clip, range: index, loop: loop)
+                            }
+                        }
+                    case .utterances:
                         HStack(spacing: 8) {
                             Text("認識結果")
                                 .font(.title2)
@@ -356,9 +366,6 @@ struct TranscriptRootView: View {
                     session.resumeTimelineFollow()
                     session.seek(to: seconds)
                 }
-            }
-            ClipsPanel(model: session.clips) { clip, index, loop in
-                session.play(clip, range: index, loop: loop)
             }
             ScrollView(.horizontal) {
                 HStack(spacing: 12) {
