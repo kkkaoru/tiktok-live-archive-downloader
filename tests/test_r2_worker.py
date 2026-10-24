@@ -171,6 +171,17 @@ def test_head_returns_size_upload_time_and_metadata() -> None:
     assert store(worker).head("missing") is None
 
 
+def test_head_returns_the_etag_once_the_worker_reports_it() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        body = {"size": 3, "uploaded": "2026-10-17T03:00:00+00:00", "metadata": {}, "etag": "e-2"}
+        return httpx.Response(200, json=body)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert WorkerStore(client, URL, "token", lambda _seconds: None).head("k") == RemoteObject(
+        3, datetime(2026, 10, 17, 3, 0, tzinfo=UTC), {}, "e-2"
+    )
+
+
 def test_head_rejects_errors_and_malformed_answers() -> None:
     with pytest.raises(ReplayError, match="/head failed with HTTP 500"):
         store(FakeWorker(failing=frozenset({"/head"}))).head("k")
@@ -297,3 +308,14 @@ def test_run_cf_invokes_the_cli_without_a_shell(
     monkeypatch.setattr(subprocess, "run", run)
     assert r2_worker.run_cf(["workers", "list"], tmp_path).returncode == 0
     assert seen == [(["cf", "workers", "list"], tmp_path, 600, False)]
+
+
+def test_digest_reads_the_whole_object_back_without_storing_it() -> None:
+    worker = FakeWorker()
+    worker.objects["k"] = b"abcdefghij"
+    assert store(worker).digest("k") == (10, hashlib.sha256(b"abcdefghij").hexdigest())
+
+
+def test_digest_reports_a_missing_object() -> None:
+    with pytest.raises(ReplayError, match="/get failed with HTTP 404"):
+        store(FakeWorker()).digest("missing")

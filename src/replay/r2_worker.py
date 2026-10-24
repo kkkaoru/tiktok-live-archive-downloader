@@ -61,6 +61,7 @@ class RemoteObject:
     size: int
     uploaded: datetime
     metadata: dict[str, str]
+    etag: str | None = None  # reported once the upload Worker answers it
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +166,10 @@ def _remote(raw: object) -> RemoteObject:
     if type(size) is not int or not isinstance(uploaded, str) or not isinstance(metadata, dict):
         raise ReplayError("R2 Worker returned malformed object metadata")
     values = {str(key): value for key, value in metadata.items() if isinstance(value, str)}
-    return RemoteObject(size, datetime.fromisoformat(uploaded), values)
+    etag = data.get("etag")
+    return RemoteObject(
+        size, datetime.fromisoformat(uploaded), values, etag if isinstance(etag, str) else None
+    )
 
 
 def _is_ready(response: httpx.Response) -> bool:
@@ -258,6 +262,20 @@ class WorkerStore:
                     f"Upload of {path.name} failed and its abort failed: {aborted}"
                 ) from error
             raise
+
+    def digest(self, key: str) -> tuple[int, str]:
+        """Read an object back in full and return its byte count and SHA-256; nothing is stored."""
+        total = 0
+        hasher = hashlib.sha256()
+        with self.client.stream(
+            "GET", f"{self.url}/get", params={"key": key}, headers=self._headers()
+        ) as response:
+            if response.status_code >= HTTP_OK_LIMIT:
+                raise ReplayError(f"R2 Worker /get failed with HTTP {response.status_code}")
+            for block in response.iter_bytes(DOWNLOAD_BLOCK_BYTES):
+                hasher.update(block)
+                total += len(block)
+        return total, hasher.hexdigest()
 
     def get(self, key: str, destination: Path) -> int:
         """Stream an object into a new file and return its byte count; never overwrites."""
