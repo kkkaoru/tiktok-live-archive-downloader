@@ -46,6 +46,8 @@ youtube = [
     "mlx-whisper>=0.4.3",
     "yt-dlp[default]>=2026.8.19",
 ]
+# The web viewer's clip points on the Mac (replay.clip_models): clef's MLX backbone and Bonsai.
+clips = ["mlx-lm==0.32.2", "mlx-vlm==0.7.10", "numpy>=2.2,<3"]
 
 [dependency-groups]
 dev = [
@@ -92,6 +94,12 @@ conflicts = [
     [{ extra = "yolo" }, { extra = "separation" }],
     [{ extra = "yolo" }, { extra = "speaker-extraction" }],
     [{ extra = "yolo" }, { extra = "usef-extraction" }],
+    [{ extra = "clips" }, { extra = "roformer" }],
+    [{ extra = "clips" }, { extra = "dialogue-separation" }],
+    [{ extra = "clips" }, { extra = "device" }],
+    [{ extra = "clips" }, { extra = "separation" }],
+    [{ extra = "clips" }, { extra = "speaker-extraction" }],
+    [{ extra = "clips" }, { extra = "usef-extraction" }],
 ]
 
 [tool.hatch.build]
