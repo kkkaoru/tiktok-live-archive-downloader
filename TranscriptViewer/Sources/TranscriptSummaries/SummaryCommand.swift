@@ -16,7 +16,10 @@ public enum SummaryCommandError: Error, LocalizedError {
 
 /// CLI parsing and execution are testable without launching a GUI or a native model.
 public struct SummaryCommand: Sendable {
-    public enum Action: String, Sendable { case generate, inspect, preview }
+    public enum Action: String, Sendable {
+        case generate, inspect, preview
+        case cleanData = "clean-data"
+    }
     public enum ExcerptSelection: String, Sendable {
         case model, representative, topics
         case supportedProse = "supported-prose"
@@ -34,11 +37,14 @@ public struct SummaryCommand: Sendable {
     public let excerptsOutput: URL?
     public let excerptSelection: ExcerptSelection
     public let morphology: URL?
+    /// `clean-data`: a published viewer data JSON and where its original is kept first.
+    public let cleanData: (data: URL, backup: URL)?
 
     public static let usage = """
         transcript-summary generate --library DIRECTORY [--transcript FILE] [--limit N]
             [--force] [--diagnostics PRIVATE_DIRECTORY] [--include-text]
         transcript-summary inspect --library DIRECTORY [--transcript FILE] [--limit N]
+        transcript-summary clean-data --data VIEWER_DATA_JSON --backup NEW_FILE
         transcript-summary generate|inspect --source-labels JSON --source-media FILE
             --clock-domain source-presentation [--diagnostics DIRECTORY] [--force]
 
@@ -75,12 +81,26 @@ public struct SummaryCommand: Sendable {
         preview with --excerpt-selection supported-prose --morphology JSON compares legacy
         and context-aware candidate ranges/scores without calling a model or writing a summary.
         Omit --excerpts-output for this candidate-only preview.
+        clean-data drops exactly repeated sentences from a published data JSON's summary texts
+        (the same removal as saved summaries get), after copying the original to --backup.
         """
 
     public init(arguments: [String]) throws {
         guard let first = arguments.first, let action = Action(rawValue: first) else {
             throw SummaryCommandError.arguments
         }
+        if action == .cleanData {
+            guard arguments.count == 5, arguments[1] == "--data", arguments[3] == "--backup",
+                !arguments[2].isEmpty, !arguments[4].isEmpty
+            else { throw SummaryCommandError.arguments }
+            self.action = action
+            cleanData = (URL(fileURLWithPath: arguments[2]), URL(fileURLWithPath: arguments[4]))
+            (library, sourceLabels, captionTokens, transcript, limit) = (nil, nil, nil, nil, nil)
+            (force, diagnostics, includeText, repairSections) = (false, nil, false, [])
+            (excerptsOutput, excerptSelection, morphology) = (nil, .model, nil)
+            return
+        }
+        cleanData = nil
         var values: [String: String] = [:]
         var flags: Set<String> = []
         var index = 1
@@ -189,6 +209,13 @@ public struct SummaryCommand: Sendable {
         respond: @escaping NarrativeSummaryGenerator.Respond = AppleSummaryService.respond,
         output: @escaping @Sendable (String) -> Void = { print($0) }
     ) async throws -> Int32 {
+        if let cleanData {
+            let removed = try await SummaryStore.io {
+                try PublishedSummaryCleaner.clean(data: cleanData.data, backup: cleanData.backup)
+            }
+            output("CLEANED removed_characters=\(removed)")
+            return 0
+        }
         let scan = try await SummaryStore.io {
             if let sourceLabels {
                 return (videos: [try sourceLabels.load()], issueCount: 0)
