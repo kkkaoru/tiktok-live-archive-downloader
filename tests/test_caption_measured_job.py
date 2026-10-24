@@ -69,6 +69,9 @@ def isolated_execution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     monkeypatch.setattr(job, "execute_command", fake_native)
     monkeypatch.setattr(job, "ROOT", tmp_path)
+    # The real pinned dictionary stays reachable from tmp_path (over-wide words are tokenized).
+    dictionary = caption_linguistics.DICTIONARY_PATH.resolve()
+    monkeypatch.setattr(caption_linguistics, "DICTIONARY_PATH", dictionary)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         caption_linguistics,
