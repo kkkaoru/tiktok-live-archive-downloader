@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 
 /// Generated narrative, separate from source material and never substituted with excerpts.
 public struct NarrativeSummary: Equatable, Sendable {
@@ -73,6 +74,8 @@ public struct SummaryRequest: Sendable {
         case fragment
         case section
         case overview
+        /// Shortens already-summarized prose; the fragment prompt keeps short text intact.
+        case combine
     }
     public let kind: Kind
     public let source: String
@@ -154,6 +157,13 @@ public struct SummaryRequest: Sendable {
                 "時系列に並んだ各区間の内容を統合し、動画全体の要約を250字以内の一〜二段落にしてください。"
                 + "明確な主題を一〜三文で説明します。区間ごとの文章を連結するだけにせず、"
                 + "重要な内容を選び、時刻は書かないでください。"
+        case .combine:
+            // The on-device model copies summarized prose under a character limit,
+            // but measurably follows a sentence count (1.8 KB -> 0.3-0.7 KB).
+            task =
+                "この資料全体の要点を、\(max(2, source.utf8.count / 600))文以内で要約してください。"
+                + "資料の文をそのまま写さず、各話題を短く言い換えてまとめてください。"
+                + "仮定・未定・話者を保ち、時刻は書かないでください。"
         }
         return "<source>\n\(source)\n</source>\n\n\(task)"
     }
@@ -163,6 +173,8 @@ public struct SummaryRequest: Sendable {
         case .fragment: 120
         case .section: 200
         case .overview: 250
+        // About half of the source's Japanese characters (three UTF-8 bytes each).
+        case .combine: max(120, source.utf8.count / 6)
         }
     }
 
@@ -180,10 +192,17 @@ public struct SummaryRequest: Sendable {
 /// per request. Calls are sequential, cancellable, and compression must progress.
 public struct NarrativeSummaryGenerator: Sendable {
     public typealias Respond = @Sendable (SummaryRequest) async throws -> String
+    public typealias Note = @Sendable (String) -> Void
     private let respond: Respond
+    private let note: Note
 
-    public init(respond: @escaping Respond) {
+    /// `note` receives diagnostic lines that name positions and sizes only, never text.
+    public init(
+        respond: @escaping Respond,
+        note: @escaping Note = { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
+    ) {
         self.respond = respond
+        self.note = note
     }
 
     public func generate(
@@ -220,7 +239,7 @@ public struct NarrativeSummaryGenerator: Sendable {
         await progress(sections.count, transcript.sections.count)
         let overviewSource = sections.map { "\($0.source.startLabel)\n\($0.text)" }
             .joined(separator: "\n\n")
-        let source = try await condense(overviewSource)
+        let source = try await condense(overviewSource, summarized: true)
         let overview = try await response(SummaryRequest(kind: .overview, source: source))
         return NarrativeSummary(overview: overview, sections: sections)
     }
@@ -286,37 +305,152 @@ public struct NarrativeSummaryGenerator: Sendable {
         throw SummaryGenerationError.nonNarrativeResponse
     }
 
-    private func condense(_ source: String, sectionStartSeconds: Double? = nil) async throws
-        -> String
-    {
+    /// Only raw speech uses fragment requests. Summaries (section texts and every later
+    /// round) are combined in full-size chunks, since the model barely shortens such prose.
+    private func condense(
+        _ source: String, sectionStartSeconds: Double? = nil, summarized: Bool = false
+    ) async throws -> String {
         var text = source
+        var summarized = summarized
         while text.utf8.count > SummaryRequest.inputByteLimit {
             try Task.checkCancellation()
             var fragments: [String] = []
-            for chunk in try Self.chunks(text) {
-                let fragment = try await response(
-                    SummaryRequest(
-                        kind: .fragment, source: chunk, sectionStartSeconds: sectionStartSeconds))
-                fragments.append(fragment)
+            var extractive: [String] = []
+            for (index, chunk) in try Self.chunks(text, balanced: !summarized).enumerated() {
+                // The on-device model sometimes echoes or loops (often as an oversized list)
+                // instead of shortening; then keep whole source sentences chosen for coverage
+                // in this intermediate input, never a cut text.
+                let budget = chunk.utf8.count / 2
+                var selected = Self.selectSentences(chunk, budget: budget, phrases: false)
+                if selected == nil {
+                    // No sentence fits (a long unpunctuated speech run): whole phrases do.
+                    selected = Self.selectSentences(chunk, budget: budget)
+                    let start = sectionStartSeconds.map { String(Int($0)) } ?? "overview"
+                    note(
+                        "SUMMARY_PHRASE_SELECTION section=\(start) chunk=\(index) "
+                            + "bytes=\(chunk.utf8.count) selected=\(selected?.utf8.count ?? 0)")
+                }
+                let fragment: String
+                do {
+                    fragment = try await response(
+                        SummaryRequest(
+                            kind: summarized ? .combine : .fragment, source: chunk,
+                            sectionStartSeconds: sectionStartSeconds))
+                } catch SummaryGenerationError.nonNarrativeResponse {
+                    guard let selected else { throw SummaryGenerationError.nonNarrativeResponse }
+                    fragments.append(selected)
+                    extractive.append(selected)
+                    continue
+                }
+                let shortened = Double(fragment.utf8.count) <= Double(chunk.utf8.count) * 0.85
+                fragments.append(shortened ? fragment : selected ?? fragment)
+                extractive.append(selected ?? fragment)
             }
-            let reduced = fragments.joined(separator: "\n\n")
+            var reduced = fragments.joined(separator: "\n\n")
+            // Fragments each just under the chunk threshold (or beside an unshrinking tail)
+            // can still miss it as a whole; selected sentences halve every chunk they cover.
+            if Double(reduced.utf8.count) > Double(text.utf8.count) * 0.85 {
+                reduced = extractive.joined(separator: "\n\n")
+            }
             // Require material progress, not an arbitrary character count from the model.
             guard Double(reduced.utf8.count) <= Double(text.utf8.count) * 0.85 else {
                 throw SummaryGenerationError.insufficientCompression
             }
             text = reduced
+            summarized = true
         }
         return text
     }
 
+    /// Greedy extractive selection: repeatedly takes the whole sentence adding the most
+    /// unseen character pairs within the byte budget, then restores source order.
+    /// Exact or near repeats add nothing and are skipped. With `phrases`, a sentence over the
+    /// budget is offered as its whole clauses or words instead, so only empty text yields nil.
+    static func selectSentences(_ text: String, budget: Int, phrases: Bool = true) -> String? {
+        var sentences: [String] = []
+        var sentence = ""
+        for character in text {
+            sentence.append(character)
+            if "。！？\n".contains(character) {
+                sentences.append(sentence)
+                sentence = ""
+            }
+        }
+        sentences.append(sentence)
+        let candidates = sentences.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap {
+                phrases && $0.utf8.count + 1 > budget ? Self.phrases($0, budget: budget) : [$0]
+            }
+        func pairs(_ text: String) -> Set<String> {
+            let characters = Array(text)
+            return Set(zip(characters, characters.dropFirst()).map { String([$0, $1]) })
+        }
+        var covered: Set<String> = []
+        var chosen: Set<Int> = []
+        var used = 0
+        while true {
+            // Earliest index wins ties, so the result is deterministic.
+            var best: (index: Int, gain: Int)?
+            for index in candidates.indices where !chosen.contains(index) {
+                let bytes = candidates[index].utf8.count
+                guard bytes > 0, used + bytes + 1 <= budget else { continue }
+                let gain = pairs(candidates[index]).subtracting(covered).count
+                if gain > (best?.gain ?? 0) { best = (index, gain) }
+            }
+            guard let best else { break }
+            chosen.insert(best.index)
+            covered.formUnion(pairs(candidates[best.index]))
+            used += candidates[best.index].utf8.count + 1
+        }
+        guard !chosen.isEmpty else { return nil }
+        return chosen.sorted().map { candidates[$0] }.joined(separator: "\n")
+    }
+
+    /// Whole clauses (split after 、，, or spaces), and an oversized clause as runs of whole
+    /// words (NLTokenizer) under the budget; the pieces concatenate back to the sentence.
+    static func phrases(_ sentence: String, budget: Int) -> [String] {
+        var clauses: [String] = []
+        var clause = ""
+        for character in sentence {
+            clause.append(character)
+            if "、，, 　".contains(character) {
+                clauses.append(clause)
+                clause = ""
+            }
+        }
+        clauses.append(clause)
+        return clauses.filter { !$0.isEmpty }.flatMap { clause -> [String] in
+            guard clause.utf8.count + 1 > budget else { return [clause] }
+            let tokenizer = NLTokenizer(unit: .word)
+            tokenizer.string = clause
+            var runs: [String] = []
+            var run = ""
+            var last = clause.startIndex
+            for range in tokenizer.tokens(for: clause.startIndex..<clause.endIndex) + [
+                clause.endIndex..<clause.endIndex
+            ] {
+                // Each word keeps the gap before it, so nothing between words is lost.
+                let word = String(clause[last..<range.upperBound])
+                last = range.upperBound
+                if !run.isEmpty, run.utf8.count + word.utf8.count + 1 > budget {
+                    runs.append(run)
+                    run = ""
+                }
+                run += word
+            }
+            runs.append(run)
+            return runs.filter { !$0.isEmpty }
+        }
+    }
+
     /// Lossless Unicode partitioning at grapheme boundaries; never truncate input.
-    static func chunks(_ text: String) throws -> [String] {
+    static func chunks(_ text: String, balanced: Bool = true) throws -> [String] {
         guard !text.isEmpty else { return [] }
         var chunks: [String] = []
         var chunk = ""
         var size = 0
         var remaining = text.utf8.count
-        var target = balancedChunkSize(bytes: remaining)
+        var target = balanced ? balancedChunkSize(bytes: remaining) : SummaryRequest.inputByteLimit
         for character in text {
             let count = String(character).utf8.count
             guard count <= SummaryRequest.inputByteLimit else {
@@ -325,7 +459,7 @@ public struct NarrativeSummaryGenerator: Sendable {
             if size >= target || size + count > SummaryRequest.inputByteLimit {
                 chunks.append(chunk)
                 remaining -= size
-                target = balancedChunkSize(bytes: remaining)
+                target = balanced ? balancedChunkSize(bytes: remaining) : target
                 chunk = ""
                 size = 0
             }

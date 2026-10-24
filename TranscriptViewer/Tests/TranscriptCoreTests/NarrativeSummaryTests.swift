@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 
 @testable import TranscriptCore
@@ -13,9 +14,25 @@ actor SummaryRecorder {
         case .fragment: return "旅行の準備について説明している。"
         case .section: return "この区間では、旅行の予定と準備について話している。"
         case .overview: return "動画では旅行の計画を紹介し、準備の手順を説明している。"
+        case .combine: return "各区間で旅行の準備を説明している。"
         }
     }
     func track(_ completed: Int) { progress.append(completed) }
+}
+
+actor UnshorteningModel {
+    var requests: [SummaryRequest] = []
+
+    func respond(_ request: SummaryRequest) -> String {
+        requests.append(request)
+        let budget = min(request.source.utf8.count, 1300)
+        var text = ""
+        while true {
+            let sentence = "話題\(requests.count)の\(text.count)番目を説明している。"
+            guard text.utf8.count + sentence.utf8.count <= budget else { return text }
+            text += sentence
+        }
+    }
 }
 
 struct NarrativeSummaryTests {
@@ -68,7 +85,8 @@ struct NarrativeSummaryTests {
         let requests = await recorder.requests
         #expect(result.sections.count == 40)
         #expect(requests.filter { $0.kind == .section }.count == 40)
-        #expect(requests.contains { $0.kind == .fragment })
+        #expect(!requests.contains { $0.kind == .fragment })
+        #expect(requests.contains { $0.kind == .combine })
         #expect(requests.allSatisfy { $0.source.utf8.count <= 1800 })
     }
 
@@ -77,7 +95,11 @@ struct NarrativeSummaryTests {
         let generator = NarrativeSummaryGenerator { await recorder.respond($0) }
         _ = try await generator.generate(transcript([String(repeating: "資料。", count: 10_000)]))
         let requests = await recorder.requests
-        #expect(requests.filter { $0.kind == .fragment }.count > 50)
+        #expect(requests.filter { $0.kind == .fragment }.count == 50)
+        // Rounds after the first condense summaries, never the raw speech again.
+        let combined = try #require(requests.firstIndex { $0.kind == .combine })
+        #expect(requests[combined...].allSatisfy { $0.kind != .fragment })
+        #expect(requests[combined].sectionStartSeconds == 0)
         #expect(requests.allSatisfy { $0.source.utf8.count <= 1800 })
     }
 
@@ -218,6 +240,129 @@ struct NarrativeSummaryTests {
         await #expect(throws: SummaryGenerationError.insufficientCompression) {
             try await generator.generate(transcript([String(repeating: "x", count: 1801)]))
         }
+    }
+
+    /// Measured on-device behaviour for summarized prose: it returns about its input length,
+    /// capped near 1.3 KB, whatever character limit is requested.
+    @Test func combinesSummarizedSectionsThatTheModelBarelyShortens() async throws {
+        let model = UnshorteningModel()
+        let generator = NarrativeSummaryGenerator { await model.respond($0) }
+        let sections = (0..<14).map { index in
+            (0..<25).map { "区間\(index)の出来事\($0)。" }.joined()
+        }
+        let result = try await generator.generate(transcript(sections))
+        let requests = await model.requests
+        #expect(result.sections.count == 14)
+        #expect(requests.filter { $0.kind == .section }.map(\.source) == sections)
+        #expect(requests.allSatisfy { $0.source.utf8.count <= 1800 })
+        let combined = requests.filter { $0.kind == .combine }.map { $0.source.utf8.count }
+        #expect(combined.count > 3)
+        // Most chunks are full-size; balanced ~1.3 KB chunks would come back unshortened.
+        #expect(combined.filter { $0 > 1700 }.count > combined.count / 2)
+        #expect(requests.last?.kind == .overview)
+    }
+
+    @Test func echoingModelFallsBackToWholeSourceSentences() async throws {
+        let generator = NarrativeSummaryGenerator { request in
+            request.kind == .overview ? "全体では旅行の話をしている。" : request.source
+        }
+        let source = (0..<200).map { "旅行\($0)日目は別の町を歩いた。" }.joined()
+        let result = try await generator.generate(transcript([source]))
+        let kept = result.sections[0].text.split(separator: "\n").map(String.init)
+        #expect(kept.count > 10)
+        // Whole sentences (or chunk-edge pieces) of the source, in source order.
+        var rest = Substring(source)
+        for piece in kept {
+            let found = try #require(rest.range(of: piece))
+            rest = rest[found.upperBound...]
+        }
+    }
+
+    @Test func roundOfBarelyShortenedFragmentsFallsBackToSourceSentences() async throws {
+        let generator = NarrativeSummaryGenerator { request in
+            switch request.kind {
+            // Each fragment passes its own threshold; with separators the round misses it.
+            case .fragment:
+                String(repeating: "y", count: Int(Double(request.source.utf8.count) * 0.85))
+            case .section, .overview, .combine: "旅行の準備について説明している。"
+            }
+        }
+        let source = (0..<100).map { "旅行\($0)日目は別の町を歩いた。" }.joined()
+        let result = try await generator.generate(transcript([source]))
+        #expect(result.sections[0].text == "旅行の準備について説明している。")
+    }
+
+    @Test func oversizedListInACondenseRoundFallsBackToSourceSentences() async throws {
+        let generator = NarrativeSummaryGenerator { request in
+            switch request.kind {
+            case .fragment: "- " + String(repeating: "長い下書き。", count: 200)
+            case .section, .overview, .combine: "旅行の準備について説明している。"
+            }
+        }
+        let source = (0..<200).map { "旅行\($0)日目は別の町を歩いた。" }.joined()
+        let result = try await generator.generate(transcript([source]))
+        #expect(result.sections[0].text == "旅行の準備について説明している。")
+        // Without a whole sentence to select, the model's own error is reported.
+        await #expect(throws: SummaryGenerationError.nonNarrativeResponse) {
+            try await generator.generate(transcript([String(repeating: "x", count: 1801)]))
+        }
+    }
+
+    @Test func selectionPrefersCoverageAndKeepsOrder() throws {
+        let loop = "参加者は新しい道具で作業を短くできることを知った。"
+        let text = "会場では料理の手順が紹介された。\(loop)\(loop)\n雨の日の予定も相談した。"
+        let selected = try #require(NarrativeSummaryGenerator.selectSentences(text, budget: 200))
+        #expect(selected == "会場では料理の手順が紹介された。\n\(loop)\n雨の日の予定も相談した。")
+        #expect(
+            NarrativeSummaryGenerator.selectSentences(text, budget: 120)?.utf8.count ?? 0 <= 120)
+        #expect(
+            NarrativeSummaryGenerator.selectSentences(loop, budget: 10, phrases: false) == nil)
+        let words = try #require(NarrativeSummaryGenerator.selectSentences(loop, budget: 10))
+        #expect(words.utf8.count <= 10)
+        #expect(words.split(separator: "\n").allSatisfy { loop.contains($0) })
+        #expect(NarrativeSummaryGenerator.selectSentences("", budget: 100) == nil)
+    }
+
+    @Test func phrasesSplitAtClausesThenWholeWordsWithoutLosingText() {
+        let clauses = "雨が降ったので、予定を変えて、家で映画を見た。"
+        #expect(
+            NarrativeSummaryGenerator.phrases(clauses, budget: 30)
+                == ["雨が降ったので、", "予定を変えて、", "家で映画を見た。"])
+        let run = "今日は駅前の新しい店で友達と昼ご飯を食べてから公園をゆっくり散歩して帰った"
+        let pieces = NarrativeSummaryGenerator.phrases(run, budget: 40)
+        #expect(pieces.count > 2)
+        #expect(pieces.joined() == run)
+        #expect(pieces.allSatisfy { $0.utf8.count < 40 })
+        #expect(NarrativeSummaryGenerator.phrases("短い", budget: 40) == ["短い"])
+    }
+
+    /// A long ASR run with no sentence end once left no whole sentence under the budget, so an
+    /// echoing model ended the summary with insufficient_compression.
+    @Test func unpunctuatedSpeechFallsBackToWholePhrasesAndNotesOnlySizes() async throws {
+        let notes = Mutex<[String]>([])
+        let generator = NarrativeSummaryGenerator(
+            respond: { request in
+                request.kind == .section || request.kind == .overview
+                    ? "旅行の話をしている。" : request.source
+            },
+            note: { line in notes.withLock { $0.append(line) } })
+        let source = (0..<120).map { "旅行\($0)日目は別の町を歩いた、" }.joined()
+        let result = try await generator.generate(transcript([source]))
+        #expect(result.sections.count == 1)
+        let lines = notes.withLock { $0 }
+        #expect(lines.first?.hasPrefix("SUMMARY_PHRASE_SELECTION section=0 chunk=0 bytes=") == true)
+        #expect(lines.allSatisfy { !$0.contains("旅行") && !$0.contains("selected=0") })
+    }
+
+    @Test func combineBudgetScalesWithItsSource() {
+        let short = SummaryRequest(kind: .combine, source: "要約。")
+        let long = SummaryRequest(kind: .combine, source: String(repeating: "語", count: 600))
+        #expect(short.requestedCharacterLimit == 120)
+        #expect(long.requestedCharacterLimit == 300)
+        #expect(long.maximumResponseTokens == 664)
+        #expect(long.prompt.contains("3文以内で要約"))
+        #expect(short.prompt.contains("2文以内で要約"))
+        #expect(!long.prompt.contains("無理に言い換えたり"))
     }
 
     @Test func providerFailureIsNotReplacedByExcerpts() async {
