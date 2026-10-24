@@ -64,10 +64,12 @@ def quiet_cut_frames(
     previous_end = 0.0
     index = 0
     for span in quiet:
-        if span.start < previous_end or span.end > source_frames / fps:
+        # Decoded audio may outlast the last video frame by under a frame (14 ms on a YouTube
+        # source); quiet there has no frame to cut.
+        if span.start < previous_end or span.end > (source_frames + 1) / fps:
             raise ValueError("Quiet evidence must be ordered and inside the planned clock")
         previous_end = span.end
-        cursor, end = ceil(span.start * fps), floor(span.end * fps)
+        cursor, end = ceil(span.start * fps), min(floor(span.end * fps), source_frames)
         while index < len(protected) and protected[index][1] <= cursor:
             index += 1
         while index < len(protected) and protected[index][0] < end:

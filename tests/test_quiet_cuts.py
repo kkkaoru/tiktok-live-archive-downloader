@@ -86,6 +86,12 @@ def test_bad_quiet_clock(quiet: tuple[MeasuredQuietSpan, ...]) -> None:
         quiet_cut_frames(quiet, (), source_frames=120)
 
 
+def test_quiet_under_a_frame_past_the_video_end_is_clipped() -> None:
+    assert quiet_cut_frames((MeasuredQuietSpan(3, 4.014),), (), source_frames=120) == (
+        CutSpan(0, 90, 0),
+    )
+
+
 def test_bad_label_clock() -> None:
     with pytest.raises(ValueError, match="Recognition"):
         quiet_cut_frames((), (ClockLabel("声", 3, 5, "raw"),), source_frames=120)
