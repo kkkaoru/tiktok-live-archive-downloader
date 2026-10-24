@@ -291,7 +291,7 @@ uv run replay refresh-session --login
 
 ## TranscriptViewer
 
-`bash TranscriptViewer/build-app.sh` でmacOSアプリをビルドします。動画と対応するCSV/SRTを
+`bash TranscriptViewer/build-app.sh` でmacOSアプリをビルドします。キーチェーンにある失効していないApple Development証明書で署名するため、外部ボリュームへのアクセス許可は一度許可すれば再ビルド後も維持されます（`TRANSCRIPT_VIEWER_SIGN_IDENTITY` で証明書を指定可能。証明書が無いとad-hoc署名になり、ビルドごとに許可を求められます）。動画と対応するCSV/SRTを
 読み込み、既存ライブラリにも次の機能を利用できます。
 
 - 再生速度を **1.0x / 1.5x / 2.0x** から選択。一時停止・再開、動画切替、時刻ジャンプでも選択速度を維持します。

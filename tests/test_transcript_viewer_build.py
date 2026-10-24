@@ -33,7 +33,17 @@ def viewer_build(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     )
     (binaries / "codesign").write_text(
         '#!/bin/sh\nprintf "codesign %s\\n" "$1" >> "$TRACE"\n'
+        'if [ "$1" = "--sign" ]; then printf "%s\\n" "$2" >> "$IDENTITY_CAPTURE"; fi\n'
         'if [ "$1" = "--sign" ] && [ "${FAIL_SIGN:-}" = 1 ]; then exit 9; fi\n',
+        encoding="utf-8",
+    )
+    (binaries / "security").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        '  find-identity) if [ -n "${IDENTITIES:-}" ]; then printf "%s\\n" "$IDENTITIES"; fi ;;\n'
+        '  find-certificate) printf "%s\\n" "${CERTIFICATES:-}" ;;\n'
+        '  verify-cert) grep -q valid "$4" && ! grep -q revoked "$4" ;;\n'
+        "esac\n",
         encoding="utf-8",
     )
     (binaries / "ps").write_text(
@@ -55,6 +65,7 @@ def viewer_build(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     )
     (binaries / "swift").chmod(0o755)
     (binaries / "codesign").chmod(0o755)
+    (binaries / "security").chmod(0o755)
     (binaries / "ps").chmod(0o755)
     (binaries / "open").chmod(0o755)
     app = root / "dist/TranscriptViewer.app"
@@ -70,6 +81,7 @@ def viewer_build(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         "BASH_ENV": str(tmp_path / "bash_env"),
         "ARGS_CAPTURE": str(tmp_path / "swift-args"),
         "ENV_CAPTURE": str(tmp_path / "swift-environment"),
+        "IDENTITY_CAPTURE": str(tmp_path / "identity"),
     }
 
 
@@ -96,6 +108,49 @@ def test_signed_upgrade_replaces_old_app_and_restarts_only_matching_process(
         "codesign --verify\nopen -g -a " + str(root / "dist/TranscriptViewer.app") + "\n"
     )
     assert result.stdout.strip() == str(root / "dist/TranscriptViewer.app")
+    assert Path(environ["IDENTITY_CAPTURE"]).read_text(encoding="utf-8") == "-\n"
+    assert "signing ad hoc" in result.stderr
+
+
+def test_signs_with_an_unrevoked_apple_development_identity_so_privacy_grants_persist(
+    viewer_build: tuple[Path, dict[str, str]],
+) -> None:
+    root, environ = viewer_build
+    identities = (
+        '  1) AAAA "Developer ID Application: Someone (X)"\n'
+        '  2) BBBB "Apple Development: someone (Y)"\n'
+        '  3) CCCC "Apple Development: someone (Y)"\n'
+        "     3 valid identities found"
+    )
+    certificates = (
+        "SHA-256 hash: 1111\nSHA-1 hash: AAAA\n-----BEGIN CERTIFICATE-----\nvalid\n"
+        "-----END CERTIFICATE-----\n"
+        "SHA-256 hash: 2222\nSHA-1 hash: BBBB\n-----BEGIN CERTIFICATE-----\nrevoked valid\n"
+        "-----END CERTIFICATE-----\n"
+        "SHA-256 hash: 3333\nSHA-1 hash: CCCC\n-----BEGIN CERTIFICATE-----\nvalid\n"
+        "-----END CERTIFICATE-----"
+    )
+    signing = environ | {"IDENTITIES": identities, "CERTIFICATES": certificates}
+    result = subprocess.run(
+        ["bash", str(root / "build-app.sh")],
+        env=signing,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    # BBBB is listed first but revoked; macOS would move an app signed with it to the Trash.
+    assert Path(environ["IDENTITY_CAPTURE"]).read_text(encoding="utf-8") == "CCCC\n"
+    assert "ad hoc" not in result.stderr
+    assert not tuple(root.parent.glob("**/sign-identity.pem"))
+    subprocess.run(
+        ["bash", str(root / "build-app.sh")],
+        env=signing | {"TRANSCRIPT_VIEWER_SIGN_IDENTITY": "DDDD"},
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert Path(environ["IDENTITY_CAPTURE"]).read_text(encoding="utf-8") == "CCCC\nDDDD\n"
 
 
 def test_build_does_not_launch_when_checkout_app_was_not_running(

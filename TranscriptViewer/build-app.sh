@@ -53,7 +53,33 @@ cp "$bin" "$staged_app/Contents/MacOS/TranscriptViewer"
 cp App/Info.plist "$staged_app/Contents/Info.plist"
 cp App/AppIcon.icns "$staged_app/Contents/Resources/AppIcon.icns"
 chmod +x "$staged_app/Contents/MacOS/TranscriptViewer"
-codesign --sign - "$staged_app" >/dev/null
+# A certificate signature keeps macOS privacy grants (external volumes) across rebuilds;
+# an ad-hoc one is bound to this build's hash, so macOS would ask again after each build.
+identity="${TRANSCRIPT_VIEWER_SIGN_IDENTITY:-}"
+certificate="$work/tmp/sign-identity.pem"
+if [[ -z "$identity" ]]; then
+    # find-identity lists revoked certificates as valid, and macOS moves an app signed
+    # with one to the Trash as malware, so each certificate is checked online first.
+    for hash in $(security find-identity -v -p codesigning 2>/dev/null \
+        | awk '/"Apple Development: / {print $2}' || true); do
+        security find-certificate -a -Z -p 2>/dev/null | awk -v hash="$hash" '
+            /^SHA-1 hash: / { found = ($3 == hash) }
+            found && /BEGIN CERTIFICATE/ { pem = 1 }
+            found && pem { print }
+            found && /END CERTIFICATE/ { exit }' > "$certificate" || true
+        if [[ -s "$certificate" ]] && security verify-cert -q -c "$certificate" -p codeSign \
+            -R ocsp -R require >/dev/null 2>&1; then
+            identity="$hash"
+            break
+        fi
+    done
+    rm -f "$certificate"
+fi
+if [[ -z "$identity" ]]; then
+    identity=-
+    printf 'No Apple Development identity; signing ad hoc, so macOS will ask for access again.\n' >&2
+fi
+codesign --sign "$identity" "$staged_app" >/dev/null
 codesign --verify --deep --strict "$staged_app"
 
 # Stop only the process executing this checkout's old bundle, after the new one is signed.
