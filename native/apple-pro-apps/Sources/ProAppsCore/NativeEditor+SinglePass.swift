@@ -18,6 +18,13 @@ extension NativeEditor {
     let overlays = try await overlays(video)
     let foreground = try await prepareForeground(video, frames: expectedFrames)
     defer { foreground?.cancel() }
+    // With no per-frame effects the composed frame is final: hand the reader's
+    // IOSurface buffer to the encoder instead of a Core Image copy that blocks on
+    // the GPU every frame.
+    let passthrough =
+      video.color == nil && (video.masks ?? []).isEmpty && overlays.isEmpty
+      && (video.captionAppearance == nil || (video.styledCaptions ?? []).isEmpty)
+      && foreground == nil
     // A mutable composition's tracks are in memory; no asynchronous load is needed.
     let tracks = prepared.composition.tracks(withMediaType: .video)
     let reader = try AVAssetReader(asset: prepared.composition)
@@ -95,6 +102,14 @@ extension NativeEditor {
         let source = try Self.required(
           sample.flatMap(CMSampleBufferGetImageBuffer), "The composed video produced no frame")
         let presentation = CMTime(value: CMTimeValue(slot), timescale: CMTimeScale(video.frameRate))
+        if passthrough {
+          // Core Image render targets carry no color or chroma tags, so the encoder reads
+          // them as the output's BT.709; untagging keeps the encoded bytes identical.
+          CVBufferRemoveAllAttachments(source)
+          try await append(source, at: presentation, input: input, adaptor: adaptor)
+          frames += 1
+          continue
+        }
         let seconds = Double(slot) / rate
         var image = try Self.composite(
           CIImage(cvPixelBuffer: source), settings: video, seconds: seconds, overlays: overlays)
@@ -114,13 +129,7 @@ extension NativeEditor {
           status == kCVReturnSuccess ? allocated : nil, "Cannot allocate an encoder frame")
         context.render(
           image.cropped(to: bounds), to: target, bounds: bounds, colorSpace: colorSpace)
-        while !input.isReadyForMoreMediaData {
-          try Task.checkCancellation()
-          try await Task.sleep(for: Self.writerPollInterval)
-        }
-        try Self.require(
-          adaptor.append(target, withPresentationTime: presentation),
-          "The native encoder rejected a frame")
+        try await append(target, at: presentation, input: input, adaptor: adaptor)
         frames += 1
       }
       try foreground?.finish()
@@ -136,6 +145,19 @@ extension NativeEditor {
     await writer.finishWriting()
     try Self.require(writer.status == .completed, "The native encoder did not finish the file")
     return frames
+  }
+
+  private func append(
+    _ buffer: CVPixelBuffer, at presentation: CMTime, input: AVAssetWriterInput,
+    adaptor: AVAssetWriterInputPixelBufferAdaptor
+  ) async throws {
+    while !input.isReadyForMoreMediaData {
+      try Task.checkCancellation()
+      try await Task.sleep(for: Self.writerPollInterval)
+    }
+    try Self.require(
+      adaptor.append(buffer, withPresentationTime: presentation),
+      "The native encoder rejected a frame")
   }
 
   /// Native framework refusals become explicit, non-retryable errors.

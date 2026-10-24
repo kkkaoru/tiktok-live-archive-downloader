@@ -101,6 +101,57 @@ struct SinglePassRenderTests {
     #expect(fcpxml.unrepresented.contains("caption outer rim (FCP text has one stroke)"))
   }
 
+  @Test func passesComposedFramesThroughExactlyAsTheCoreImagePathEncodesThem() async throws {
+    let root = try directory()
+    defer { do { try FileManager.default.removeItem(at: root) } catch { Issue.record(error) } }
+    func recipe(masks: [EditMask]?) throws -> EditRecipe {
+      EditRecipe(
+        clips: [
+          EditClip(
+            sourcePath: try fixture("quadrants-30"),
+            selection: EditSelection(startSeconds: 0, durationSeconds: 1, rate: 1))
+        ],
+        video: EditVideoSettings(
+          width: 320, height: 240, frameRate: 30, resizeMode: .fit, masks: masks,
+          encoding: EditEncoding(
+            codec: .h264, averageBitRate: 2_000_000, allowFrameReordering: false)))
+    }
+    // A zero-opacity mask draws nothing but keeps the Core Image render path.
+    let invisible = EditMask(region: EditCrop(x: 0, y: 0, width: 8, height: 8), opacity: 0)
+    let passed = try await NativeEditor().render(
+      recipe(masks: nil), directory: root.path, name: "passed.mp4")
+    let rendered = try await NativeEditor().render(
+      recipe(masks: [invisible]), directory: root.path, name: "rendered.mp4")
+    let frames = try await decodedFrames(passed.outputPath)
+    #expect(frames.count == 30)
+    #expect(frames == (try await decodedFrames(rendered.outputPath)))
+  }
+
+  /// Decoded BGRA pixels per frame (hardware encoders need not repeat their bytes).
+  private func decodedFrames(_ path: String) async throws -> [Data] {
+    let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+    let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+    let reader = try AVAssetReader(asset: asset)
+    let output = AVAssetReaderTrackOutput(
+      track: track, outputSettings: VideoWriterSettings.readerPixels())
+    reader.add(output)
+    #expect(reader.startReading())
+    var frames: [Data] = []
+    while let sample = output.copyNextSampleBuffer() {
+      let buffer = try #require(CMSampleBufferGetImageBuffer(sample))
+      CVPixelBufferLockBaseAddress(buffer, .readOnly)
+      defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+      let base = try #require(CVPixelBufferGetBaseAddress(buffer))
+      let row = CVPixelBufferGetBytesPerRow(buffer)
+      var frame = Data()
+      for y in 0..<CVPixelBufferGetHeight(buffer) {
+        frame.append(Data(bytes: base + y * row, count: CVPixelBufferGetWidth(buffer) * 4))
+      }
+      frames.append(frame)
+    }
+    return frames
+  }
+
   @Test func failuresDuringTheFrameLoopPublishNothing() async throws {
     let root = try directory()
     defer { do { try FileManager.default.removeItem(at: root) } catch { Issue.record(error) } }
