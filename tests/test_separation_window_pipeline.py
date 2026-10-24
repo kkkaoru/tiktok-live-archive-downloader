@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import wave
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict
 from pathlib import Path
@@ -543,3 +544,54 @@ def test_an_unknown_device_is_refused(plan: Path) -> None:
     replace_json(plan, data)
     with pytest.raises(ReplayError, match="Unsupported pipeline plan"):
         pipeline.load_plan(plan)
+
+
+def test_an_over_range_blend_gets_one_static_gain_instead_of_flat_tops() -> None:
+    rate = MODEL_SAMPLE_RATE
+    samples = 3 * rate
+    bounds = ((0, 2 * rate), (rate, samples))
+    wave_ = (1.6 * np.sin(np.arange(samples) * 0.01)).astype(np.float32)
+
+    def prediction(index: int) -> NDArray[np.float32]:
+        start, end = bounds[index]
+        return np.stack((wave_[start:end], wave_[start:end] * np.float32(0.5)))
+
+    scale = pipeline.output_scale(
+        pipeline.blended(bounds, samples=samples, overlap=rate, prediction=prediction)
+    )
+    assert scale == pytest.approx(pipeline.OUTPUT_PEAK / float(np.abs(wave_).max()))
+    pcm = np.frombuffer(
+        b"".join(pipeline.pcm_blocks(bounds, samples=samples, overlap=rate,
+                                     prediction=prediction, scale=scale)),
+        dtype="<i2",
+    ).reshape(-1, 2)  # fmt: skip
+    assert int(np.abs(pcm).max()) == 32766
+    assert int((np.abs(pcm) >= 32766).sum()) <= 4  # the crest, not a clipped plateau
+
+
+def test_a_blend_within_full_scale_keeps_unit_gain() -> None:
+    assert pipeline.output_scale(iter([np.full((4, 2), 0.5, dtype=np.float32)])) == 1.0
+    assert pipeline.output_scale(iter([np.zeros((0, 2), dtype=np.float32)])) == 1.0
+
+
+def test_a_plan_with_over_range_vocals_records_and_verifies_its_gain(
+    plan: Path, setup: tuple[Path, window.Execute], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work, execute = setup
+    monkeypatch.setattr(
+        Synthetic, "forward", lambda self, value: np.asarray(value, dtype=np.float32) * 8
+    )
+    receipt = pipeline.run(plan, execute=execute)
+    result = read(receipt)
+    assert 0 < float(str(result["outputScale"])) < 1
+    assert float(str(result["outputGainDB"])) < 0
+    with wave.open(str(work / "pipeline/vocals.wav"), "rb") as stream:
+        stem = np.frombuffer(stream.readframes(stream.getnframes()), dtype="<i2")
+    assert int(np.abs(stem.astype(np.int32)).max()) <= 32766
+    pipeline.verify(plan)
+    replace_json(receipt, {**result, "outputScale": 1.0})
+    with pytest.raises(ReplayError, match="Final PCM differs"):
+        pipeline.verify(plan)
+    replace_json(receipt, {**result, "outputScale": 2.0})
+    with pytest.raises(ReplayError, match="output gain is invalid"):
+        pipeline.verify(plan)

@@ -347,6 +347,7 @@ def test_extract_one_call_and_no_retry(prepared: Path, monkeypatch: pytest.Monke
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(bridge, "input_peak_db", lambda source, *, ffmpeg: -6.0)
     assert bridge.main(["extract", str(prepared)]) == 0
     assert bridge.verify(prepared)["inputSampleCount"] == 44100
     with pytest.raises(ReplayError, match="attempted"):
@@ -364,6 +365,7 @@ def test_extract_failure_is_preserved(prepared: Path, monkeypatch: pytest.Monkey
         raise subprocess.CalledProcessError(1, command)
 
     monkeypatch.setattr(subprocess, "run", fail)
+    monkeypatch.setattr(bridge, "input_peak_db", lambda source, *, ffmpeg: -6.0)
     assert bridge.main(["extract", str(prepared)]) == 1
     assert (directory / "extraction-attempt.json").is_file()
     assert not (directory / "pcm-preparation.json").exists()
@@ -476,3 +478,89 @@ def test_reject_plan_scope_and_changed_plan(prepared: Path, template: Path) -> N
     output.write_text("{}", encoding="utf-8")
     with pytest.raises(ReplayError, match="changed"):
         bridge.prepare_plan(prepared, template, output, verify_only=True)
+
+
+def extraction_ready(prepared: Path) -> tuple[Path, bytes]:
+    config = read(prepared)
+    config["completedExtraction"] = None
+    prepared.write_text(json.dumps(config), encoding="utf-8")
+    pcm = Path(str(config["directory"])) / "model-input.wav"
+    content = pcm.read_bytes()
+    pcm.unlink()
+    return pcm, content
+
+
+def test_an_over_range_source_is_extracted_with_a_measured_static_gain(
+    prepared: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pcm, content = extraction_ready(prepared)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        pcm.write_bytes(content)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(bridge, "input_peak_db", lambda source, *, ffmpeg: 2.9)
+    bridge.extract(prepared)
+    gain = read(pcm.with_name("input-gain.json"))
+    assert (gain["peakDB"], gain["gainDB"]) == (2.9, -3.0)
+    assert "asetpts=N/SR/TB,aresample=44100,volume=-3.000000dB" in commands[0]
+    receipt = bridge.verify(prepared)
+    assert (receipt["gainDB"], receipt["gainPolicy"]) == (
+        -3.0, "measured decoded float peak; one static gain keeps it below full scale",
+    )  # fmt: skip
+    assert receipt["expectedExtractionCommand"] == commands[0]
+
+
+def test_a_source_within_full_scale_keeps_the_fixed_gain(
+    prepared: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pcm, content = extraction_ready(prepared)
+
+    def run(command: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        pcm.write_bytes(content)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(bridge, "input_peak_db", lambda source, *, ffmpeg: -6.0)
+    bridge.extract(prepared)
+    assert read(pcm.with_name("input-gain.json"))["gainDB"] == -0.1
+
+
+def test_a_changed_gain_record_is_refused(prepared: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pcm, content = extraction_ready(prepared)
+
+    def run(command: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        pcm.write_bytes(content)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(bridge, "input_peak_db", lambda source, *, ffmpeg: 2.9)
+    bridge.extract(prepared)
+    record_path = pcm.with_name("input-gain.json")
+    data = read(record_path)
+    record_path.unlink()
+    durable(record_path, {**data, "gainDB": 0.5})
+    with pytest.raises(ReplayError, match="Invalid measured extraction gain"):
+        bridge.verify(prepared)
+
+
+def test_the_input_peak_is_read_from_a_float_measurement(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+
+    def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "Overall\nPeak level dB: 2.890329\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert bridge.input_peak_db(Path("/s.mp4"), ffmpeg="ff") == 2.890329
+    assert "aformat=sample_fmts=flt" in seen[0][seen[0].index("-af") + 1]
+
+    def silent(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, "", "Peak level dB: -inf\n")
+
+    monkeypatch.setattr(subprocess, "run", silent)
+    with pytest.raises(ReplayError, match="no measurable peak"):
+        bridge.input_peak_db(Path("/s.mp4"), ffmpeg="ff")

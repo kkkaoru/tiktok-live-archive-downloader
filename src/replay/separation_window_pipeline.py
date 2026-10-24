@@ -74,6 +74,9 @@ CHUNK = 600 * MODEL_SAMPLE_RATE
 OVERLAP = 5 * MODEL_SAMPLE_RATE
 MAX_SAMPLES = 21600 * MODEL_SAMPLE_RATE
 MAX_COMPARISON_SAMPLES = 90 * MODEL_SAMPLE_RATE
+# The blend's largest magnitude after the static output gain: 32766 of 32767, so no sample of
+# the 16-bit stem is written at full scale.
+OUTPUT_PEAK = 32766 / 32767
 Prediction = Callable[[int], NDArray[np.float32]]
 
 
@@ -387,10 +390,11 @@ def run_chunk(
     verify_chunk(plan, index=index, bound=bound, device=device)
 
 
-def pcm_blocks(
+def blended(
     bounds: tuple[tuple[int, int], ...], *, samples: int, overlap: int, prediction: Prediction
-) -> Iterator[bytes]:
-    """Keep original float32 head blend; defer only the next-overlapped tail."""
+) -> Iterator[NDArray[np.float32]]:
+    """The original float32 head blend in order (frames x channels); only the next-overlapped
+    tail is deferred."""
     require(
         bool(bounds) and bounds[0][0] == 0 and bounds[-1][1] == samples and overlap > 0,
         "Invalid outer clock",
@@ -414,16 +418,39 @@ def pcm_blocks(
             if tail is None:
                 raise ReplayError("Missing outer overlap tail")
             require(current.shape[1] > overlap, "Missing outer overlap tail")
-            head = tail * weights[0] + current[:, :overlap] * weights[1]
-            yield (np.clip(head.T, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+            yield (tail * weights[0] + current[:, :overlap] * weights[1]).T
             retained += overlap
         low = overlap if index else 0
         high = current.shape[1] - overlap if index + 1 < len(bounds) else current.shape[1]
         require(high >= low, "Invalid deferred outer tail")
-        yield (np.clip(current[:, low:high].T, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        yield current[:, low:high].T
         retained += high - low
         tail = current[:, -overlap:].copy() if index + 1 < len(bounds) else None
     require(retained == samples, "Outer assembly changed sample count")
+
+
+def output_scale(blocks: Iterator[NDArray[np.float32]]) -> float:
+    """One static gain that keeps the whole blend below full scale (1 when it already is).
+
+    The model reproduces the source's over-range peaks; clipping them to 16 bits would flatten
+    them. The gain is measured on the complete blend, so it is the same for every sample.
+    """
+    peak = max((float(np.abs(block).max()) for block in blocks if block.size), default=0.0)
+    return min(1.0, OUTPUT_PEAK / peak) if peak > 0 else 1.0
+
+
+def pcm_blocks(
+    bounds: tuple[tuple[int, int], ...],
+    *,
+    samples: int,
+    overlap: int,
+    prediction: Prediction,
+    scale: float = 1.0,
+) -> Iterator[bytes]:
+    """The blend as 16-bit PCM, scaled by the static output gain (clipping stays a guard)."""
+    gain = np.float32(scale)
+    for block in blended(bounds, samples=samples, overlap=overlap, prediction=prediction):
+        yield (np.clip(block * gain, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
 
 
 def write_pcm(path: Path, *, samples: int, blocks: Iterator[bytes]) -> None:
@@ -497,6 +524,10 @@ def verify(plan_path: Path) -> None:
         and result.get("resourceCapsAreHardLimits") is False,
         "Pipeline receipt/clock changed",
     )
+    recorded = result.get("outputScale", 1.0)  # stems written before the gain have none
+    if type(recorded) is not float or not (0 < recorded <= 1 and math.isfinite(recorded)):
+        raise ReplayError("Pipeline receipt output gain is invalid")
+    scale = recorded
     with (plan.directory / "vocals.wav").open("rb") as stream, wave.open(stream, "rb") as audio:
         for expected in pcm_blocks(
             plan.bounds,
@@ -505,6 +536,7 @@ def verify(plan_path: Path) -> None:
             prediction=lambda index: verify_chunk(
                 plan, index=index, bound=bound, device=plan.device
             ),
+            scale=scale,
         ):
             require(
                 audio.readframes(len(expected) // 4) == expected,
@@ -549,14 +581,18 @@ def run(plan_path: Path, *, resume: bool = False, execute: Execute = execute_chi
             not destination.exists() and not partial.exists(),
             "Final write outcome uncertain; preserve and reconcile",
         )
-        blocks = pcm_blocks(
-            plan.bounds,
-            samples=plan.samples,
-            overlap=OVERLAP,
-            prediction=lambda index: load_array(
+
+        def saved(index: int) -> NDArray[np.float32]:
+            return load_array(
                 chunk_proxy(plan, index).directory / "vocals.npy",
                 samples=plan.bounds[index][1] - plan.bounds[index][0],
-            ),
+            )
+
+        scale = output_scale(
+            blended(plan.bounds, samples=plan.samples, overlap=OVERLAP, prediction=saved)
+        )
+        blocks = pcm_blocks(
+            plan.bounds, samples=plan.samples, overlap=OVERLAP, prediction=saved, scale=scale
         )
         write_pcm(partial, samples=plan.samples, blocks=blocks)
         os.link(partial, destination)
@@ -581,6 +617,8 @@ def run(plan_path: Path, *, resume: bool = False, execute: Execute = execute_chi
                 "timestampCorrection": False,
                 "loudnessNormalization": False,
                 "deliveryComplete": False,
+                "outputScale": scale,
+                "outputGainDB": 20 * math.log10(scale),
                 "inputSampleCount": plan.samples,
                 "outputSampleCount": plan.samples,
                 "sampleRate": MODEL_SAMPLE_RATE,

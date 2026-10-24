@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import wave
@@ -21,7 +23,7 @@ from replay.audio_clock import AudioFrameClock
 from replay.bgm_separation import MODEL_SAMPLE_RATE
 from replay.code_dependency_inventory import capture
 from replay.core import ReplayError
-from replay.delivery_audio import input_command
+from replay.delivery_audio import PEAK_HEADROOM_DB, input_command
 from replay.input_hash_snapshot import InputHashSnapshot
 from replay.native_invocation import canonical, durable, identity, pin, read, require
 from replay.recordings import record
@@ -34,6 +36,10 @@ MAX_CLOCK_BYTES = 128 * 1024 * 1024
 EXTRACTION_TIMEOUT = 7200
 MAX_HASH_OUTPUT_BYTES = 256
 MAX_HASH_ERROR_BYTES = 8192
+# The source's decoded float peak, measured before the 16-bit extraction: AAC decodes beyond
+# full scale, and a fixed gain would clip those samples into flat tops.
+PEAK_LEVEL = re.compile(r"Peak level dB:\s*(-?[0-9]+(?:\.[0-9]+)?|-inf)")
+INPUT_GAIN_NAME = "input-gain.json"
 CONFIG_FIELDS = frozenset(
     {
         "version",
@@ -68,6 +74,10 @@ class Preparation:
     @property
     def receipt(self) -> Path:
         return self.directory / "pcm-preparation.json"
+
+    @property
+    def input_gain(self) -> Path:
+        return self.directory / INPUT_GAIN_NAME
 
 
 class Arguments(argparse.Namespace):
@@ -190,13 +200,52 @@ def _clock(config: Preparation) -> AudioFrameClock:
     return AudioFrameClock.from_probe(json.loads(path.read_bytes()))
 
 
-def _completed(config: Preparation) -> dict[str, object]:
-    command = input_command(
+def input_peak_db(source: Path, *, ffmpeg: str) -> float:
+    """The largest decoded sample (dBFS, float, may exceed 0) on the extraction's own filters."""
+    done = subprocess.run(
+        [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-i", str(source), "-map", "0:a:0",
+         "-vn", "-af", "asetpts=N/SR/TB,aresample=44100,aformat=sample_fmts=flt,"
+         "astats=measure_overall=Peak_level:measure_perchannel=none", "-f", "null", "-"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True,
+        timeout=EXTRACTION_TIMEOUT,
+    )  # fmt: skip
+    found = PEAK_LEVEL.findall(done.stderr)
+    require(bool(found) and found[-1] != "-inf", "The source audio has no measurable peak")
+    return float(found[-1])
+
+
+def gain_of(config: Preparation) -> float:
+    """The extraction gain: measured once (``input-gain.json``) to keep the decoded peak below
+    full scale, never above the fixed preparation gain. Extractions made before the
+    measurement have no record and keep the fixed gain."""
+    if not config.input_gain.exists():
+        return GAIN_DB
+    data = read(config.input_gain)
+    source, digest = config.references["source"]
+    gain = data.get("gainDB")
+    if (
+        set(data) != {"version", "source", "peakDB", "gainDB"}
+        or data.get("version") != 1
+        or data.get("source") != {"path": str(source), "sha256": digest}
+        or type(gain) is not float
+        or not math.isfinite(gain)
+        or gain > GAIN_DB
+    ):
+        raise ReplayError("Invalid measured extraction gain")
+    return gain
+
+
+def _command(config: Preparation) -> list[str]:
+    return input_command(
         config.references["source"][0],
         config.pcm,
-        gain=GAIN_DB,
+        gain=gain_of(config),
         ffmpeg=str(config.references["ffmpeg"][0]),
     )
+
+
+def _completed(config: Preparation) -> dict[str, object]:
+    command = _command(config)
     if config.completion is None:
         complete = read(config.directory / "extraction-complete.json")
         require(
@@ -262,8 +311,7 @@ def _pcm_detail(config: Preparation) -> dict[str, object]:
         "sourceProjectionApplications": 0,
         "timestampCorrection": False,
         "loudnessNormalization": False,
-        "gainDB": GAIN_DB,
-        "gainPolicy": "explicit fixed preparation gain; no peak measurement claimed",
+        **_gain_detail(config),
         "pcmPayloadSHA256": payload.hexdigest(),
         "expectedFFmpegPCM16SHA256": expected_digest,
         "currentSourceContentEquivalent": True,
@@ -273,14 +321,22 @@ def _pcm_detail(config: Preparation) -> dict[str, object]:
     }
 
 
+def _gain_detail(config: Preparation) -> dict[str, object]:
+    if not config.input_gain.exists():
+        return {
+            "gainDB": GAIN_DB,
+            "gainPolicy": "explicit fixed preparation gain; no peak measurement claimed",
+        }
+    return {
+        "gainDB": gain_of(config),
+        "gainPolicy": "measured decoded float peak; one static gain keeps it below full scale",
+        "inputGain": pin(config.input_gain),
+    }
+
+
 def expected_pcm_digest(config: Preparation) -> str:
     """Decode to the hash muxer, without creating a WAV or running inference."""
-    command = input_command(
-        config.references["source"][0],
-        config.pcm,
-        gain=GAIN_DB,
-        ffmpeg=str(config.references["ffmpeg"][0]),
-    )[:-1]
+    command = _command(config)[:-1]
     command.extend(("-f", "hash", "-hash", "sha256", "-"))
     result = subprocess.run(
         command,
@@ -323,12 +379,7 @@ def seal(config_path: Path) -> Path:
             "kind": "verified-separation-pcm-preparation",
             "inputs": inputs,
             "output": output,
-            "expectedExtractionCommand": input_command(
-                config.references["source"][0],
-                config.pcm,
-                gain=GAIN_DB,
-                ffmpeg=str(config.references["ffmpeg"][0]),
-            ),
+            "expectedExtractionCommand": _command(config),
             "completedExtraction": completed,
             "externalExecutedArgvAttested": False,
             "externalPreExtractionSnapshotAttested": False,
@@ -353,12 +404,7 @@ def verify(config_path: Path) -> dict[str, object]:
         "kind": "verified-separation-pcm-preparation",
         "inputs": inputs,
         "output": output,
-        "expectedExtractionCommand": input_command(
-            config.references["source"][0],
-            config.pcm,
-            gain=GAIN_DB,
-            ffmpeg=str(config.references["ffmpeg"][0]),
-        ),
+        "expectedExtractionCommand": _command(config),
         "completedExtraction": completed,
         "externalExecutedArgvAttested": False,
         "externalPreExtractionSnapshotAttested": False,
@@ -383,6 +429,7 @@ def extract(config_path: Path) -> Path:
             for path in (
                 config.pcm,
                 config.receipt,
+                config.input_gain,
                 attempt,
                 log,
                 config.directory / "extraction-complete.json",
@@ -392,12 +439,13 @@ def extract(config_path: Path) -> Path:
     )
     snapshot = _snapshot(config)
     _clock(config)
-    command = input_command(
-        config.references["source"][0],
-        config.pcm,
-        gain=GAIN_DB,
-        ffmpeg=str(config.references["ffmpeg"][0]),
-    )
+    source, digest = config.references["source"]
+    peak = input_peak_db(source, ffmpeg=str(config.references["ffmpeg"][0]))
+    durable(config.input_gain, {
+        "version": 1, "source": {"path": str(source), "sha256": digest}, "peakDB": peak,
+        "gainDB": round(min(GAIN_DB, -PEAK_HEADROOM_DB - peak), 6),
+    })  # fmt: skip
+    command = _command(config)
     durable(attempt, {"version": 1, "command": command, "status": "reserved"})
     with log.open("xb") as stream:
         os.fchmod(stream.fileno(), 0o600)
